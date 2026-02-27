@@ -99,9 +99,11 @@ ask_default() {
 
 normalize_domain() {
   local input="$1"
+  input="$(echo -n "${input}" | xargs)"
   input="${input#http://}"
   input="${input#https://}"
   input="${input%%/*}"
+  input="${input,,}"
   printf '%s' "${input}"
 }
 
@@ -291,9 +293,7 @@ services:
       - traefik.http.routers.portainer.entrypoints=websecure
       - traefik.http.routers.portainer.tls.certresolver=le
       - traefik.http.routers.portainer.middlewares=auth@file
-      - traefik.http.routers.portainer.service=portainer
-      - traefik.http.services.portainer.loadbalancer.server.port=9443
-      - traefik.http.services.portainer.loadbalancer.server.scheme=https
+      - traefik.http.services.portainer.loadbalancer.server.port=9000
 
   postgres-evolution:
     image: postgres:16-alpine
