@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.0
+## SETUP PERSONALIZADO HUBLABEL v1.1
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -145,28 +145,70 @@ stack_editavel() {
         return 1
     fi
 
-    sed -i 's|Dominio do portainer: https://||' "$arquivo"
-    sed -i 's|Dominio do portainer: ||' "$arquivo"
-    PORTAINER_URL=$(grep "Dominio do portainer:" "$arquivo" | awk -F': ' '{print $2}' | tr -d ' ')
-    USUARIO=$(grep "Usuario:" "$arquivo" | awk -F': ' '{print $2}')
-    SENHA=$(grep "Senha:" "$arquivo" | awk -F': ' '{print $2}')
+    ## Extrair variáveis ANTES de modificar o arquivo (igual SetupOrion)
+    PORTAINER_URL=$(grep "Dominio do portainer:" "$arquivo" 2>/dev/null | sed 's/.*Dominio do portainer: *//' | sed 's|https://||' | tr -d ' \r\n')
+    USUARIO=$(grep "Usuario:" "$arquivo" 2>/dev/null | sed 's/.*Usuario: *//' | tr -d '\r\n')
+    SENHA=$(grep "Senha:" "$arquivo" 2>/dev/null | sed 's/.*Senha: *//' | tr -d '\r\n')
+
+    ## Remove https:// do arquivo (igual SetupOrion) - preserva o restante
+    sed -i 's|Dominio do portainer: https://|Dominio do portainer: |' "$arquivo" 2>/dev/null
+
+    [ -z "$PORTAINER_URL" ] && { echo "Erro: Dominio do Portainer vazio em dados_portainer"; return 1; }
+    [ -z "$USUARIO" ] && { echo "Erro: Usuario vazio em dados_portainer"; return 1; }
+    [ -z "$SENHA" ] && { echo "Erro: Senha vazia em dados_portainer"; return 1; }
 
     TOKEN=""
-    for i in $(seq 1 15); do
-        TOKEN=$(curl -k -s -X POST -H "Content-Type: application/json" -H "Host: $PORTAINER_URL" \
+    for i in $(seq 1 6); do
+        ## Tenta via 127.0.0.1 (evita hairpin NAT) e via URL direta (igual SetupOrion)
+        TOKEN=$(curl -k -s -m 15 -X POST -H "Content-Type: application/json" -H "Host: $PORTAINER_URL" \
             -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
             "https://127.0.0.1/api/auth" | jq -r .jwt 2>/dev/null)
+        if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            TOKEN=$(curl -k -s -m 15 -X POST -H "Content-Type: application/json" \
+                -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
+                "https://$PORTAINER_URL/api/auth" | jq -r .jwt 2>/dev/null)
+        fi
         [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && break
-        echo "Tentativa $i - Aguardando Portainer..."
-        sleep 10
+        echo "Tentativa $i/6 - Aguardando Portainer..."
+        sleep 5
     done
 
-    [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ] && { echo "Erro ao obter token Portainer"; return 1; }
+    ## Fallback: se não obteve token, pede credenciais manualmente (igual SetupOrion)
+    if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+        echo ""
+        echo -e "${amarelo}Não foi possível obter o token automaticamente. Informe as credenciais do Portainer:${reset}"
+        echo ""
+        read -p "URL do Portainer (ex: painel.$dominio_base) [$PORTAINER_URL]: " input_url
+        PORTAINER_URL="${input_url:-$PORTAINER_URL}"
+        PORTAINER_URL="${PORTAINER_URL#https://}"
+        PORTAINER_URL="${PORTAINER_URL%%/*}"
+        read -p "Usuário do Portainer [$USUARIO]: " input_user
+        USUARIO="${input_user:-$USUARIO}"
+        echo -e "${amarelo}Senha não aparecerá ao digitar${reset}"
+        read -s -p "Senha do Portainer: " SENHA
+        echo ""
+        echo -e "[ PORTAINER ]\nDominio do portainer: https://$PORTAINER_URL\nUsuario: $USUARIO\nSenha: $SENHA\nToken: " > "$arquivo"
+        for i in 1 2 3; do
+            TOKEN=$(curl -k -s -m 15 -X POST -H "Content-Type: application/json" -H "Host: $PORTAINER_URL" \
+                -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
+                "https://127.0.0.1/api/auth" | jq -r .jwt 2>/dev/null)
+            [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ] && TOKEN=$(curl -k -s -m 15 -X POST -H "Content-Type: application/json" \
+                -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
+                "https://$PORTAINER_URL/api/auth" | jq -r .jwt 2>/dev/null)
+            [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && break
+            echo "Tentativa $i/3 com novas credenciais..."
+            sleep 3
+        done
+        [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ] && { echo "Erro ao obter token Portainer. Verifique as credenciais."; return 1; }
+        echo "Token obtido com sucesso!"
+    fi
 
-    echo -e "[ PORTAINER ]\nDominio do portainer: $PORTAINER_URL\nUsuario: $USUARIO\nSenha: $SENHA\nToken: $TOKEN" > "$arquivo"
+    echo -e "[ PORTAINER ]\nDominio do portainer: https://$PORTAINER_URL\nUsuario: $USUARIO\nSenha: $SENHA\nToken: $TOKEN" > "$arquivo"
 
-    ENDPOINT_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
-    SWARM_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
+    ENDPOINT_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
+    [ -z "$ENDPOINT_ID" ] || [ "$ENDPOINT_ID" = "null" ] && ENDPOINT_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
+    SWARM_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
+    [ -z "$SWARM_ID" ] || [ "$SWARM_ID" = "null" ] && SWARM_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
 
     if [ ! -f "$(pwd)/${STACK_NAME}.yaml" ]; then
         echo "Erro: ${STACK_NAME}.yaml não encontrado"
@@ -197,7 +239,7 @@ stack_editavel() {
 coletar_informacoes() {
     clear
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.0 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
+    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.1 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
@@ -477,7 +519,7 @@ PYEOF
     done
 
     mkdir -p dados_vps
-    echo -e "[ PORTAINER ]\nDominio do portainer: $url_portainer\nUsuario: $user_portainer\nSenha: $pass_portainer\nToken: $token" > dados_vps/dados_portainer
+    echo -e "[ PORTAINER ]\nDominio do portainer: https://$url_portainer\nUsuario: $user_portainer\nSenha: $pass_portainer\nToken: $token" > dados_vps/dados_portainer
 
     dados
     echo -e "${verde}✓ Traefik e Portainer instalados${reset}"
