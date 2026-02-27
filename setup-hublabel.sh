@@ -1,595 +1,791 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-# ==================================================
-# Setup Hublabel - VPS
-# Instala: Traefik, Portainer, Evolution API, MinIO e n8n
-# Uso recomendado: sudo bash setup-hublabel.sh
-# ==================================================
+## ============================================================================
+## SETUP PERSONALIZADO HUBLABEL
+## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
+## Baseado exatamente no SetupOrion - sem Basic Auth
+##
+## COMANDO PARA INICIAR A INSTALAÇÃO:
+##   sudo bash setuppersonalizado-hublabel.sh
+##
+## Ou torne executável e rode:
+##   chmod +x setuppersonalizado-hublabel.sh
+##   sudo ./setuppersonalizado-hublabel.sh
+## ============================================================================
 
-GREEN="\e[32m"
-YELLOW="\e[33m"
-RED="\e[31m"
-BLUE="\e[34m"
-RESET="\e[0m"
+amarelo="\e[33m"
+verde="\e[32m"
+branco="\e[97m"
+vermelho="\e[91m"
+reset="\e[0m"
 
-BASE_DIR="/opt/setup-hublabel"
-COMPOSE_FILE="${BASE_DIR}/docker-compose.yml"
-TRAEFIK_DIR="${BASE_DIR}/traefik"
-TRAEFIK_DYNAMIC_DIR="${TRAEFIK_DIR}/dynamic"
-ENV_FILE="${BASE_DIR}/.env"
-LOG_FILE="${BASE_DIR}/setup.log"
+home_directory="$HOME"
+dados_vps="${home_directory}/dados_vps/dados_vps"
 
-print_header() {
-  clear || true
-  echo -e "${BLUE}==============================================================${RESET}"
-  echo -e "${BLUE}                 SETUP HUBLABEL - VPS COMPLETO                ${RESET}"
-  echo -e "${BLUE}==============================================================${RESET}"
-  echo
+dados() {
+    nome_servidor=$(grep "Nome do Servidor:" "$dados_vps" 2>/dev/null | awk -F': ' '{print $2}')
+    nome_rede_interna=$(grep "Rede interna:" "$dados_vps" 2>/dev/null | awk -F': ' '{print $2}')
 }
 
-log() {
-  mkdir -p "${BASE_DIR}"
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_FILE}"
-}
+validar_senha() {
+    senha=$1
+    tamanho_minimo=$2
+    tem_erro=0
+    mensagem_erro=""
 
-ok() {
-  echo -e "${GREEN}✔ $*${RESET}"
-  log "OK: $*"
-}
-
-warn() {
-  echo -e "${YELLOW}⚠ $*${RESET}"
-  log "WARN: $*"
-}
-
-die() {
-  echo -e "${RED}✖ $*${RESET}"
-  log "ERROR: $*"
-  exit 1
-}
-
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    die "Execute como root: sudo bash setup-hublabel.sh"
-  fi
-}
-
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $1"
-}
-
-initial_checks() {
-  print_header
-  echo -e "${YELLOW}Verificando ambiente da VPS...${RESET}"
-
-  # Verifica se é uma distro baseada em Debian/Ubuntu
-  if [[ ! -f /etc/debian_version ]]; then
-    die "Este instalador foi preparado para sistemas baseados em Debian/Ubuntu (apt)."
-  fi
-
-  # Verifica comandos mínimos para seguir
-  if ! command -v apt-get >/dev/null 2>&1; then
-    die "apt-get não encontrado. Verifique se sua distro usa apt."
-  fi
-
-  if ! command -v systemctl >/dev/null 2>&1; then
-    warn "systemctl não encontrado. Tentarei prosseguir, mas pode haver problemas para gerenciar serviços."
-  fi
-
-  ok "Ambiente básico verificado"
-}
-
-ask() {
-  local prompt="$1"
-  local var_name="$2"
-  local value
-  while true; do
-    read -r -p "$prompt" value
-    if [[ -n "${value}" ]]; then
-      printf -v "$var_name" '%s' "$value"
-      break
+    if [ ${#senha} -lt $tamanho_minimo ]; then
+        mensagem_erro+="\n- Senha precisa ter no mínimo $tamanho_minimo caracteres"
+        tem_erro=1
     fi
-    echo "Valor obrigatório. Tente novamente."
-  done
-}
-
-ask_secret() {
-  local prompt="$1"
-  local var_name="$2"
-  local value
-  while true; do
-    read -r -s -p "$prompt" value
-    echo
-    if [[ -n "${value}" ]]; then
-      printf -v "$var_name" '%s' "$value"
-      break
+    if ! [[ $senha =~ [A-Z] ]]; then
+        mensagem_erro+="\n- Falta pelo menos uma letra maiúscula"
+        tem_erro=1
     fi
-    echo "Valor obrigatório. Tente novamente."
-  done
+    if ! [[ $senha =~ [a-z] ]]; then
+        mensagem_erro+="\n- Falta pelo menos uma letra minúscula"
+        tem_erro=1
+    fi
+    if ! [[ $senha =~ [0-9] ]]; then
+        mensagem_erro+="\n- Falta pelo menos um número"
+        tem_erro=1
+    fi
+    if ! [[ $senha =~ [@_] ]]; then
+        mensagem_erro+="\n- Falta pelo menos um caractere especial (@ ou _)"
+        tem_erro=1
+    fi
+    if [[ $senha =~ [^A-Za-z0-9@_] ]]; then
+        mensagem_erro+="\n- Contém caracteres especiais não permitidos (use apenas @ ou _)"
+        tem_erro=1
+    fi
+
+    if [ $tem_erro -eq 1 ]; then
+        echo -e "Senha inválida! Corrija os seguintes problemas:$mensagem_erro"
+        return 1
+    fi
+    return 0
 }
 
-ask_default() {
-  local prompt="$1"
-  local var_name="$2"
-  local default_value="$3"
-  local value
-  read -r -p "${prompt} [${default_value}]: " value
-  value="${value:-${default_value}}"
-  printf -v "$var_name" '%s' "$value"
+wait_stack() {
+    echo "Este processo pode demorar um pouco. Se levar mais de 10 minutos, cancele."
+    for service in "$@"; do
+        while ! docker service ls --filter "name=$service" 2>/dev/null | grep -q "1/1"; do
+            sleep 10
+        done
+        echo -e "🟢 O serviço ${verde}$service${reset} está online."
+    done
 }
 
-normalize_domain() {
-  local input="$1"
-  input="$(echo -n "${input}" | xargs)"
-  input="${input#http://}"
-  input="${input#https://}"
-  input="${input%%/*}"
-  input="${input,,}"
-  printf '%s' "${input}"
+wait_30_sec() { sleep 30; }
+
+pull() {
+    for image in "$@"; do
+        while ! docker pull "$image" >/dev/null 2>&1; do
+            echo "Erro ao baixar $image. Tentando novamente..."
+            sleep 5
+        done
+    done
 }
 
-generate_secret() {
-  openssl rand -base64 36 | tr -dc 'A-Za-z0-9@#%+=._-' | head -c 28
+verificar_container_postgres() {
+    docker ps -q --filter "name=postgres_postgres" 2>/dev/null | grep -q . && return 0 || return 1
 }
 
-collect_inputs() {
-  print_header
-  echo -e "${YELLOW}Etapa 1/5 - Coleta de informações (tudo no início)${RESET}"
-  echo -e "${BLUE}Informe domínios e senhas principais. Segredos internos serão gerados automaticamente.${RESET}"
-  echo
-
-  SERVER_NAME="$(hostname)"
-  TZ_VALUE="America/Sao_Paulo"
-
-  ask "E-mail para Let's Encrypt (Traefik): " LETSENCRYPT_EMAIL
-
-  echo
-  ask "Domínio base (ex: victoreder.com.br): " BASE_DOMAIN
-  BASE_DOMAIN="$(normalize_domain "${BASE_DOMAIN}")"
-
-  echo
-  echo "Subdomínios para cada serviço (será usado: subdominio.${BASE_DOMAIN}):"
-  ask_default "- Portainer" PORTAINER_SUBDOMAIN "painel"
-  ask_default "- Evolution API" EVOLUTION_SUBDOMAIN "evolution"
-  ask_default "- MinIO Console" MINIO_CONSOLE_SUBDOMAIN "minio"
-  ask_default "- MinIO S3/API" MINIO_S3_SUBDOMAIN "s3"
-  ask_default "- n8n Editor" N8N_EDITOR_SUBDOMAIN "n8n"
-  ask_default "- n8n Webhook" N8N_WEBHOOK_SUBDOMAIN "hook"
-
-  # Remove espaços e converte para minúsculas
-  PORTAINER_SUBDOMAIN="${PORTAINER_SUBDOMAIN,,}"
-  PORTAINER_SUBDOMAIN="${PORTAINER_SUBDOMAIN// /}"
-  EVOLUTION_SUBDOMAIN="${EVOLUTION_SUBDOMAIN,,}"
-  EVOLUTION_SUBDOMAIN="${EVOLUTION_SUBDOMAIN// /}"
-  MINIO_CONSOLE_SUBDOMAIN="${MINIO_CONSOLE_SUBDOMAIN,,}"
-  MINIO_CONSOLE_SUBDOMAIN="${MINIO_CONSOLE_SUBDOMAIN// /}"
-  MINIO_S3_SUBDOMAIN="${MINIO_S3_SUBDOMAIN,,}"
-  MINIO_S3_SUBDOMAIN="${MINIO_S3_SUBDOMAIN// /}"
-  N8N_EDITOR_SUBDOMAIN="${N8N_EDITOR_SUBDOMAIN,,}"
-  N8N_EDITOR_SUBDOMAIN="${N8N_EDITOR_SUBDOMAIN// /}"
-  N8N_WEBHOOK_SUBDOMAIN="${N8N_WEBHOOK_SUBDOMAIN,,}"
-  N8N_WEBHOOK_SUBDOMAIN="${N8N_WEBHOOK_SUBDOMAIN// /}"
-
-  # Monta domínios completos
-  PORTAINER_DOMAIN="${PORTAINER_SUBDOMAIN}.${BASE_DOMAIN}"
-  EVOLUTION_DOMAIN="${EVOLUTION_SUBDOMAIN}.${BASE_DOMAIN}"
-  MINIO_CONSOLE_DOMAIN="${MINIO_CONSOLE_SUBDOMAIN}.${BASE_DOMAIN}"
-  MINIO_S3_DOMAIN="${MINIO_S3_SUBDOMAIN}.${BASE_DOMAIN}"
-  N8N_EDITOR_DOMAIN="${N8N_EDITOR_SUBDOMAIN}.${BASE_DOMAIN}"
-  N8N_WEBHOOK_DOMAIN="${N8N_WEBHOOK_SUBDOMAIN}.${BASE_DOMAIN}"
-
-  echo
-  echo "Acessos principais (você define):"
-  ask_default "- Usuário admin para Basic Auth (Traefik/Portainer)" ADMIN_USER "admin"
-  ask_secret "- Senha admin do Basic Auth: " ADMIN_PASSWORD
-  ask_default "- E-mail login do n8n (Basic Auth)" N8N_ADMIN_EMAIL "admin@${N8N_EDITOR_DOMAIN}"
-  ask_secret "- Senha login do n8n (Basic Auth): " N8N_ADMIN_PASSWORD
-  ask_default "- MinIO Root User" MINIO_ROOT_USER "minioadmin"
-  ask_secret "- MinIO Root Password: " MINIO_ROOT_PASSWORD
-
-  # Segredos internos gerados automaticamente
-  N8N_ENCRYPTION_KEY="$(generate_secret)$(generate_secret)"
-  EVOLUTION_API_KEY="$(generate_secret)$(generate_secret)"
-  EVOLUTION_DB_PASSWORD="$(generate_secret)"
-  EVOLUTION_REDIS_PASSWORD="$(generate_secret)"
-
-  echo
-  echo -e "${BLUE}Resumo rápido:${RESET}"
-  cat <<SUMMARY
-Servidor: ${SERVER_NAME}
-Timezone: ${TZ_VALUE}
-Email LE: ${LETSENCRYPT_EMAIL}
-Portainer: ${PORTAINER_DOMAIN}
-Evolution: ${EVOLUTION_DOMAIN}
-MinIO Console: ${MINIO_CONSOLE_DOMAIN}
-MinIO S3/API: ${MINIO_S3_DOMAIN}
-n8n Editor: ${N8N_EDITOR_DOMAIN}
-n8n Webhook: ${N8N_WEBHOOK_DOMAIN}
-Usuário Basic Auth: ${ADMIN_USER}
-Usuário MinIO: ${MINIO_ROOT_USER}
-SUMMARY
-  echo
-  read -r -p "Confirmar e seguir instalação? (y/N): " confirm
-  [[ "${confirm,,}" == "y" ]] || die "Instalação cancelada pelo usuário."
+pegar_senha_postgres() {
+    while :; do
+        if [ -f /root/postgres.yaml ]; then
+            senha_postgres=$(grep "POSTGRES_PASSWORD" /root/postgres.yaml | sed 's/.*: *//' | tr -d ' ')
+            [ -n "$senha_postgres" ] && break
+        fi
+        sleep 2
+    done
 }
 
-install_dependencies() {
-  echo
-  echo -e "${YELLOW}Etapa 2/5 - Instalando dependências do sistema${RESET}"
-
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y \
-    curl wget git jq unzip openssl ca-certificates gnupg lsb-release \
-    ufw apache2-utils software-properties-common
-
-  if command -v timedatectl >/dev/null 2>&1; then
-    timedatectl set-timezone "${TZ_VALUE}" || warn "Não foi possível ajustar timezone via timedatectl"
-  else
-    warn "timedatectl não encontrado. Ajuste de timezone não realizado automaticamente."
-  fi
-
-  if ! command -v docker >/dev/null 2>&1; then
-    curl -fsSL https://get.docker.com | bash
-    ok "Docker instalado"
-  else
-    ok "Docker já estava instalado"
-  fi
-
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl enable docker || warn "Não foi possível habilitar o serviço docker no boot"
-    systemctl start docker || warn "Não foi possível iniciar o serviço docker"
-  fi
-
-  if ! docker compose version >/dev/null 2>&1; then
-    local arch
-    arch="$(uname -m)"
-    case "${arch}" in
-      x86_64|amd64) arch="x86_64" ;;
-      aarch64|arm64) arch="aarch64" ;;
-      *) die "Arquitetura não suportada para docker compose plugin automático: ${arch}" ;;
-    esac
-
-    local compose_plugin_path="/usr/local/lib/docker/cli-plugins"
-    mkdir -p "${compose_plugin_path}"
-    curl -SL "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-${arch}" -o "${compose_plugin_path}/docker-compose"
-    chmod +x "${compose_plugin_path}/docker-compose"
-  fi
-
-  require_cmd docker
-  docker compose version >/dev/null 2>&1 || die "docker compose plugin não disponível"
-  require_cmd htpasswd
-  ok "Dependências prontas"
+criar_banco_postgres_da_stack() {
+    local db_name="$1"
+    while :; do
+        if docker ps -q --filter "name=^postgres_postgres" 2>/dev/null | grep -q .; then
+            CONTAINER_ID=$(docker ps -q --filter "name=^postgres_postgres" | head -1)
+            if docker exec "$CONTAINER_ID" psql -U postgres -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$db_name"; then
+                break
+            fi
+            docker exec "$CONTAINER_ID" psql -U postgres -c "CREATE DATABASE $db_name;" 2>/dev/null
+            if docker exec "$CONTAINER_ID" psql -U postgres -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$db_name"; then
+                break
+            fi
+        fi
+        sleep 3
+    done
 }
 
-prepare_files() {
-  echo
-  echo -e "${YELLOW}Etapa 3/5 - Gerando arquivos de configuração${RESET}"
+recursos() {
+    vcpu_requerido=$1
+    ram_requerido=$2
+    if command -v neofetch >/dev/null 2>&1; then
+        vcpu_disponivel=$(neofetch --stdout 2>/dev/null | grep "CPU" | grep -oP '\(\d+\)' | tr -d '()')
+        ram_disponivel=$(neofetch --stdout 2>/dev/null | grep "Memory" | awk '{print $4}' | tr -d 'MiB' | awk '{print int($1/1024 + 0.5)}')
+    else
+        vcpu_disponivel=$(nproc 2>/dev/null || echo 2)
+        ram_disponivel=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}')
+    fi
+    vcpu_disponivel=${vcpu_disponivel:-2}
+    ram_disponivel=${ram_disponivel:-2}
+    if [[ $vcpu_disponivel -ge $vcpu_requerido && $ram_disponivel -ge $ram_requerido ]]; then
+        return 0
+    else
+        echo -e "${vermelho}Recursos insuficientes. Requer: ${vcpu_requerido}vCPU e ${ram_requerido}GB RAM${reset}"
+        return 1
+    fi
+}
 
-  mkdir -p "${TRAEFIK_DYNAMIC_DIR}" "${BASE_DIR}/data" "${BASE_DIR}/certs" \
-    "${BASE_DIR}/portainer" "${BASE_DIR}/minio" "${BASE_DIR}/n8n" \
-    "${BASE_DIR}/evolution/postgres" "${BASE_DIR}/evolution/redis"
+stack_editavel() {
+    sudo apt install -y jq >/dev/null 2>&1
+    arquivo="/root/dados_vps/dados_portainer"
+    if [ ! -f "$arquivo" ]; then
+        echo "Erro: dados_portainer não encontrado. Execute primeiro Traefik+Portainer."
+        return 1
+    fi
 
-  mkdir -p "${TRAEFIK_DIR}"
-  touch "${TRAEFIK_DIR}/acme.json"
-  chmod 600 "${TRAEFIK_DIR}/acme.json"
+    sed -i 's|Dominio do portainer: https://||' "$arquivo"
+    sed -i 's|Dominio do portainer: ||' "$arquivo"
+    PORTAINER_URL=$(grep "Dominio do portainer:" "$arquivo" | awk -F': ' '{print $2}' | tr -d ' ')
+    USUARIO=$(grep "Usuario:" "$arquivo" | awk -F': ' '{print $2}')
+    SENHA=$(grep "Senha:" "$arquivo" | awk -F': ' '{print $2}')
 
-  BASIC_AUTH_HASH=$(htpasswd -nbB "${ADMIN_USER}" "${ADMIN_PASSWORD}" | sed -e 's/\$/\$\$/g')
+    TOKEN=""
+    for i in $(seq 1 10); do
+        TOKEN=$(curl -k -s -X POST -H "Content-Type: application/json" \
+            -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
+            "https://$PORTAINER_URL/api/auth" | jq -r .jwt 2>/dev/null)
+        [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && break
+        echo "Tentativa $i - Aguardando Portainer..."
+        sleep 10
+    done
 
-  cat > "${ENV_FILE}" <<ENV
-SERVER_NAME=${SERVER_NAME}
-TZ=${TZ_VALUE}
-LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
+    [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ] && { echo "Erro ao obter token Portainer"; return 1; }
 
-PORTAINER_DOMAIN=${PORTAINER_DOMAIN}
-EVOLUTION_DOMAIN=${EVOLUTION_DOMAIN}
-MINIO_CONSOLE_DOMAIN=${MINIO_CONSOLE_DOMAIN}
-MINIO_S3_DOMAIN=${MINIO_S3_DOMAIN}
-N8N_EDITOR_DOMAIN=${N8N_EDITOR_DOMAIN}
-N8N_WEBHOOK_DOMAIN=${N8N_WEBHOOK_DOMAIN}
+    echo -e "[ PORTAINER ]\nDominio do portainer: $PORTAINER_URL\nUsuario: $USUARIO\nSenha: $SENHA\nToken: $TOKEN" > "$arquivo"
 
-ADMIN_USER=${ADMIN_USER}
-BASIC_AUTH_HASH=${BASIC_AUTH_HASH}
+    ENDPOINT_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
+    SWARM_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
 
-N8N_ADMIN_EMAIL=${N8N_ADMIN_EMAIL}
-N8N_ADMIN_PASSWORD=${N8N_ADMIN_PASSWORD}
-N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+    if [ ! -f "$(pwd)/${STACK_NAME}.yaml" ]; then
+        echo "Erro: ${STACK_NAME}.yaml não encontrado"
+        return 1
+    fi
 
-MINIO_ROOT_USER=${MINIO_ROOT_USER}
-MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+    http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X POST \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "Name=$STACK_NAME" \
+        -F "file=@$(pwd)/${STACK_NAME}.yaml" \
+        -F "SwarmID=$SWARM_ID" \
+        -F "endpointId=$ENDPOINT_ID" \
+        "https://$PORTAINER_URL/api/stacks/create/swarm/file")
 
-EVOLUTION_API_KEY=${EVOLUTION_API_KEY}
-EVOLUTION_DB_PASSWORD=${EVOLUTION_DB_PASSWORD}
-EVOLUTION_REDIS_PASSWORD=${EVOLUTION_REDIS_PASSWORD}
-ENV
+    if [ "$http_code" -eq 200 ]; then
+        echo -e "10/10 - [ OK ] - Deploy da stack ${verde}$STACK_NAME${reset} feito com sucesso!"
+    else
+        echo "10/10 - [ OFF ] - Erro ao fazer deploy. HTTP $http_code"
+        return 1
+    fi
+}
 
-  cat > "${COMPOSE_FILE}" <<'YAML'
+## ============================================================================
+## COLETA DE INFORMAÇÕES - TUDO NO INÍCIO
+## ============================================================================
+
+coletar_informacoes() {
+    clear
+    echo -e "${amarelo}====================================================================================================${reset}"
+    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
+    echo -e "${amarelo}====================================================================================================${reset}"
+    echo ""
+    echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
+    echo ""
+
+    ## Email e domínio base
+    read -p "Email para Let's Encrypt (ex: contato@seudominio.com): " email_ssl
+    read -p "Domínio base (ex: victoreder.com.br): " dominio_base
+    dominio_base="${dominio_base#https://}"
+    dominio_base="${dominio_base#http://}"
+    dominio_base="${dominio_base%%/*}"
+    dominio_base="${dominio_base,,}"
+    dominio_base="${dominio_base#www.}"
+    echo ""
+    echo -e "${branco}Agora informe apenas o subdomínio para cada serviço. Será usado: subdominio.$dominio_base${reset}"
+    echo ""
+
+    ## Traefik + Portainer
+    echo -e "${verde}[1/4] Traefik e Portainer${reset}"
+    read -p "Subdomínio do Portainer (ex: painel): " sub_portainer
+    sub_portainer="${sub_portainer:-painel}"
+    url_portainer="${sub_portainer}.${dominio_base}"
+    read -p "Usuário do Portainer (ex: admin): " user_portainer
+    while true; do
+        echo -e "${amarelo}Mínimo 12 caracteres. Letras maiúsculas, minúsculas, número e @ ou _${reset}"
+        read -p "Senha do Portainer: " pass_portainer
+        validar_senha "$pass_portainer" 12 && break
+    done
+    read -p "Nome do servidor (ex: Hublabel): " nome_servidor
+    read -p "Nome da rede interna (ex: HublabelNet): " nome_rede_interna
+    echo ""
+
+    ## Evolution API
+    echo -e "${verde}[2/4] Evolution API${reset}"
+    read -p "Subdomínio da Evolution API (ex: evolution): " sub_evolution
+    sub_evolution="${sub_evolution:-evolution}"
+    url_evolution="${sub_evolution}.${dominio_base}"
+    echo ""
+
+    ## MinIO
+    echo -e "${verde}[3/4] MinIO${reset}"
+    read -p "Subdomínio do painel MinIO (ex: minio): " sub_minio
+    sub_minio="${sub_minio:-minio}"
+    url_minio="${sub_minio}.${dominio_base}"
+    read -p "Subdomínio da API S3 (ex: s3): " sub_s3
+    sub_s3="${sub_s3:-s3}"
+    url_s3="${sub_s3}.${dominio_base}"
+    read -p "Usuário MinIO (ex: minioadmin): " user_minio
+    while true; do
+        echo -e "${amarelo}Mínimo 8 caracteres. Letras, números e @ ou _${reset}"
+        read -p "Senha MinIO: " senha_minio
+        validar_senha "$senha_minio" 8 && break
+    done
+    minio_version="RELEASE.2024-01-13T07-53-03Z-cpuv1"
+    echo ""
+
+    ## N8N
+    echo -e "${verde}[4/4] N8N${reset}"
+    read -p "Subdomínio do N8N Editor (ex: n8n): " sub_n8n
+    sub_n8n="${sub_n8n:-n8n}"
+    url_editorn8n="${sub_n8n}.${dominio_base}"
+    read -p "Subdomínio do Webhook N8N (ex: hook): " sub_webhook
+    sub_webhook="${sub_webhook:-hook}"
+    url_webhookn8n="${sub_webhook}.${dominio_base}"
+    read -p "Email SMTP (ex: contato@$dominio_base): " email_smtp_n8n
+    read -p "Usuário SMTP (ou o mesmo email): " usuario_smtp_n8n
+    read -p "Senha SMTP: " senha_smtp_n8n
+    read -p "Host SMTP (ex: smtp.hostinger.com): " host_smtp_n8n
+    read -p "Porta SMTP (ex: 465): " porta_smtp_n8n
+    [ "$porta_smtp_n8n" = "465" ] && smtp_secure_smtp_n8n=true || smtp_secure_smtp_n8n=false
+    echo ""
+
+    ## Remover barras ou caracteres extras
+    url_portainer="${url_portainer%%/*}"
+    url_evolution="${url_evolution%%/*}"
+    url_minio="${url_minio%%/*}"
+    url_s3="${url_s3%%/*}"
+    url_editorn8n="${url_editorn8n%%/*}"
+    url_webhookn8n="${url_webhookn8n%%/*}"
+
+    ## Confirmação
+    clear
+    echo -e "${amarelo}====================================================================================================${reset}"
+    echo -e "${branco}Verifique os dados:${reset}"
+    echo "Portainer: https://$url_portainer | User: $user_portainer"
+    echo "Evolution: https://$url_evolution"
+    echo "MinIO: https://$url_minio | S3: https://$url_s3 | User: $user_minio"
+    echo "N8N: https://$url_editorn8n | Webhook: https://$url_webhookn8n"
+    echo -e "${amarelo}====================================================================================================${reset}"
+    read -p "Confirmar e iniciar instalação? (Y/N): " conf
+    [[ "${conf^^}" != "Y" ]] && { echo "Cancelado."; exit 1; }
+}
+
+## ============================================================================
+## VERIFICAÇÕES INICIAIS (igual SetupOrion)
+## ============================================================================
+
+verificacoes_iniciais() {
+    clear
+    echo -e "${amarelo}Verificando ambiente...${reset}"
+
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${vermelho}Execute como root: sudo bash setuppersonalizado-hublabel.sh${reset}"
+        exit 1
+    fi
+
+    if [ ! -f /etc/debian_version ]; then
+        echo -e "${vermelho}Este instalador foi preparado para sistemas baseados em Debian/Ubuntu.${reset}"
+        exit 1
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "${vermelho}apt-get não encontrado.${reset}"
+        exit 1
+    fi
+
+    recursos 1 1 || exit 1
+    echo -e "${verde}✓ Verificações concluídas${reset}"
+    echo ""
+}
+
+## ============================================================================
+## INSTALAÇÃO TRAEFIK + PORTAINER
+## ============================================================================
+
+instalar_traefik_portainer() {
+    echo -e "${amarelo}• Instalando Traefik e Portainer...${reset}"
+    cd /root
+
+    mkdir -p dados_vps
+    cat > dados_vps/dados_vps <<EOL
+[DADOS DA VPS]
+Nome do Servidor: $nome_servidor
+Rede interna: $nome_rede_interna
+Email para SSL: $email_ssl
+Link do Portainer: $url_portainer
+EOL
+
+    ## Atualizar VPS
+    apt-get update -qq && apt upgrade -y -qq
+    timedatectl set-timezone America/Sao_Paulo 2>/dev/null || true
+    apt-get install -y -qq apt-utils apparmor-utils
+    hostnamectl set-hostname "$nome_servidor" 2>/dev/null || true
+    sed -i "s/127.0.0.1[[:space:]]localhost/127.0.0.1 $nome_servidor/" /etc/hosts 2>/dev/null || true
+
+    ## Docker
+    if ! command -v docker >/dev/null 2>&1; then
+        curl -fsSL https://get.docker.com | bash
+    fi
+    systemctl enable docker
+    systemctl start docker
+
+    ## Swarm
+    ip=$(hostname -I | awk '{print $1}')
+    docker swarm init --advertise-addr "$ip" 2>/dev/null || true
+
+    ## Rede e Volumes
+    docker network create --driver=overlay "$nome_rede_interna" 2>/dev/null || true
+    docker volume create volume_swarm_shared 2>/dev/null || true
+    docker volume create volume_swarm_certificates 2>/dev/null || true
+    docker volume create portainer_data 2>/dev/null || true
+
+    ## Traefik
+    cat > traefik.yaml <<EOL
+version: "3.7"
 services:
   traefik:
     image: traefik:v3.5.3
-    container_name: traefik
-    restart: unless-stopped
     command:
-      - --api.dashboard=true
-      - --providers.docker=true
-      - --providers.docker.endpoint=unix:///var/run/docker.sock
-      - --providers.docker.exposedbydefault=false
-      - --providers.docker.network=proxy
-      - --providers.file.directory=/etc/traefik/dynamic
-      - --entrypoints.web.address=:80
-      - --entrypoints.websecure.address=:443
-      - --entrypoints.web.http.redirections.entrypoint.to=websecure
-      - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      - --certificatesresolvers.le.acme.httpchallenge=true
-      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
-      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
-      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
-      - --log.level=INFO
-    environment:
-      - DOCKER_API_VERSION=1.44
-    ports:
-      - "80:80"
-      - "443:443"
+      - "--api.dashboard=true"
+      - "--providers.swarm=true"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=$nome_rede_interna"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.letsencryptresolver.acme.storage=/etc/traefik/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencryptresolver.acme.email=$email_ssl"
+      - "--log.level=INFO"
     volumes:
+      - vol_certificates:/etc/traefik/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./traefik/acme.json:/letsencrypt/acme.json
-      - ./traefik/dynamic:/etc/traefik/dynamic:ro
-    networks:
-      - proxy
+    networks: [ $nome_rede_interna ]
+    ports:
+      - target: 80
+        published: 80
+        mode: host
+      - target: 443
+        published: 443
+        mode: host
+    deploy:
+      placement: { constraints: [node.role == manager] }
+      labels:
+        - traefik.enable=true
+        - traefik.http.middlewares.redirect-https.redirectscheme.scheme=https
+        - traefik.http.middlewares.redirect-https.redirectscheme.permanent=true
+        - traefik.http.routers.http-catchall.rule=Host(\`{host:.+}\`)
+        - traefik.http.routers.http-catchall.entrypoints=web
+        - traefik.http.routers.http-catchall.middlewares=redirect-https@docker
+        - traefik.http.routers.http-catchall.priority=1
+volumes:
+  vol_shared: { external: true, name: volume_swarm_shared }
+  vol_certificates: { external: true, name: volume_swarm_certificates }
+networks:
+  $nome_rede_interna: { external: true, attachable: true, name: $nome_rede_interna }
+EOL
 
+    pull traefik:v3.5.3
+    docker stack deploy --prune --resolve-image always -c traefik.yaml traefik
+    wait_stack traefik_traefik
+    wait_30_sec
+
+    ## Portainer
+    cat > portainer.yaml <<EOL
+version: "3.7"
+services:
+  agent:
+    image: portainer/agent:latest
+    volumes: [ /var/run/docker.sock:/var/run/docker.sock, /var/lib/docker/volumes:/var/lib/docker/volumes ]
+    networks: [ $nome_rede_interna ]
+    deploy: { mode: global, placement: { constraints: [node.platform.os == linux] } }
   portainer:
     image: portainer/portainer-ce:latest
-    container_name: portainer
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./portainer:/data
-    networks:
-      - proxy
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.portainer.rule=Host(`${PORTAINER_DOMAIN}`)
-      - traefik.http.routers.portainer.entrypoints=websecure
-      - traefik.http.routers.portainer.tls.certresolver=le
-      - traefik.http.routers.portainer.middlewares=auth@file
-      - traefik.http.services.portainer.loadbalancer.server.port=9000
+    command: -H tcp://tasks.agent:9001 --tlsskipverify
+    volumes: [ portainer_data:/data ]
+    networks: [ $nome_rede_interna ]
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement: { constraints: [node.role == manager] }
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.portainer.rule=Host(\`$url_portainer\`)
+        - traefik.http.services.portainer.loadbalancer.server.port=9000
+        - traefik.http.routers.portainer.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.portainer.service=portainer
+        - traefik.docker.network=$nome_rede_interna
+        - traefik.http.routers.portainer.entrypoints=websecure
+        - traefik.http.routers.portainer.priority=1
+volumes:
+  portainer_data: { external: true, name: portainer_data }
+networks:
+  $nome_rede_interna: { external: true, attachable: true, name: $nome_rede_interna }
+EOL
 
-  postgres-evolution:
-    image: postgres:16-alpine
-    container_name: postgres-evolution
-    restart: unless-stopped
+    pull portainer/agent:latest portainer/portainer-ce:latest
+    docker stack deploy --prune --resolve-image always -c portainer.yaml portainer
+    wait_stack portainer_portainer
+    sleep 30
+
+    ## Criar conta Portainer
+    for i in 1 2 3 4; do
+        resp=$(curl -k -s -X POST "https://$url_portainer/api/users/admin/init" \
+            -H "Content-Type: application/json" \
+            -d "{\"Username\": \"$user_portainer\", \"Password\": \"$pass_portainer\"}")
+        if echo "$resp" | grep -q "\"Username\":\"$user_portainer\""; then
+            break
+        fi
+        sleep 15
+    done
+
+    token=$(curl -k -s -X POST "https://$url_portainer/api/auth" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\":\"$user_portainer\",\"password\":\"$pass_portainer\"}" | jq -r .jwt)
+
+    mkdir -p dados_vps
+    echo -e "[ PORTAINER ]\nDominio do portainer: $url_portainer\nUsuario: $user_portainer\nSenha: $pass_portainer\nToken: $token" > dados_vps/dados_portainer
+
+    dados
+    echo -e "${verde}✓ Traefik e Portainer instalados${reset}"
+}
+
+## ============================================================================
+## INSTALAÇÃO POSTGRESQL
+## ============================================================================
+
+instalar_postgres() {
+    echo -e "${amarelo}• Instalando PostgreSQL...${reset}"
+    cd /root
+    dados
+
+    senha_postgres=$(openssl rand -hex 16)
+    docker volume create postgres_data 2>/dev/null || true
+
+    cat > postgres.yaml <<EOL
+version: "3.7"
+services:
+  postgres:
+    image: postgres:14
+    command: postgres -c max_connections=500 -c timezone=America/Sao_Paulo
+    volumes: [ postgres_data:/var/lib/postgresql/data ]
+    networks: [ $nome_rede_interna ]
     environment:
-      POSTGRES_DB: evolution
-      POSTGRES_USER: evolution
-      POSTGRES_PASSWORD: ${EVOLUTION_DB_PASSWORD}
-      TZ: ${TZ}
-    volumes:
-      - ./evolution/postgres:/var/lib/postgresql/data
-    networks:
-      - proxy
+      POSTGRES_PASSWORD: $senha_postgres
+      TZ: America/Sao_Paulo
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement: { constraints: [node.role == manager] }
+volumes:
+  postgres_data: { external: true, name: postgres_data }
+networks:
+  $nome_rede_interna: { external: true, name: $nome_rede_interna }
+EOL
 
-  redis-evolution:
-    image: redis:7-alpine
-    container_name: redis-evolution
-    restart: unless-stopped
-    command: redis-server --appendonly yes --requirepass ${EVOLUTION_REDIS_PASSWORD}
-    volumes:
-      - ./evolution/redis:/data
-    networks:
-      - proxy
+    STACK_NAME="postgres"
+    stack_editavel
+    wait_stack postgres_postgres
+    echo "$senha_postgres" > /root/.senha_postgres_tmp
+    echo -e "${verde}✓ PostgreSQL instalado${reset}"
+}
 
-  evolution:
-    image: atendai/evolution-api:latest
-    container_name: evolution
-    restart: unless-stopped
+## ============================================================================
+## INSTALAÇÃO EVOLUTION API
+## ============================================================================
+
+instalar_evolution() {
+    echo -e "${amarelo}• Instalando Evolution API...${reset}"
+    cd /root
+    dados
+
+    pegar_senha_postgres
+    apikeyglobal=$(openssl rand -hex 16)
+
+    docker volume create evolution_instances 2>/dev/null || true
+    docker volume create evolution_redis 2>/dev/null || true
+
+    criar_banco_postgres_da_stack evolution
+
+    cat > evolution.yaml <<EOL
+version: "3.7"
+services:
+  evolution_api:
+    image: evoapicloud/evolution-api:latest
+    volumes: [ evolution_instances:/evolution/instances ]
+    networks: [ $nome_rede_interna ]
     environment:
-      SERVER_URL: https://${EVOLUTION_DOMAIN}
-      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      SERVER_URL: https://$url_evolution
+      AUTHENTICATION_API_KEY: $apikeyglobal
       AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
       LANGUAGE: pt-BR
       DATABASE_ENABLED: "true"
       DATABASE_PROVIDER: postgresql
-      DATABASE_CONNECTION_URI: postgresql://evolution:${EVOLUTION_DB_PASSWORD}@postgres-evolution:5432/evolution
+      DATABASE_CONNECTION_URI: postgresql://postgres:$senha_postgres@postgres:5432/evolution
       DATABASE_CONNECTION_CLIENT_NAME: evolution
       CACHE_REDIS_ENABLED: "true"
-      CACHE_REDIS_URI: redis://:${EVOLUTION_REDIS_PASSWORD}@redis-evolution:6379/1
-      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_URI: redis://evolution_redis:6379/1
       CACHE_LOCAL_ENABLED: "false"
       N8N_ENABLED: "true"
-      TZ: ${TZ}
-    depends_on:
-      - postgres-evolution
-      - redis-evolution
-    networks:
-      - proxy
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.evolution.rule=Host(`${EVOLUTION_DOMAIN}`)
-      - traefik.http.routers.evolution.entrypoints=websecure
-      - traefik.http.routers.evolution.tls.certresolver=le
-      - traefik.http.services.evolution.loadbalancer.server.port=8080
+      TZ: America/Sao_Paulo
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement: { constraints: [node.role == manager] }
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.evolution.rule=Host(\`$url_evolution\`)
+        - traefik.http.routers.evolution.entrypoints=websecure
+        - traefik.http.routers.evolution.tls.certresolver=letsencryptresolver
+        - traefik.http.services.evolution.loadbalancer.server.port=8080
+  evolution_redis:
+    image: redis:latest
+    command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
+    volumes: [ evolution_redis:/data ]
+    networks: [ $nome_rede_interna ]
+    deploy: { placement: { constraints: [node.role == manager] } }
+volumes:
+  evolution_instances: { external: true, name: evolution_instances }
+  evolution_redis: { external: true, name: evolution_redis }
+networks:
+  $nome_rede_interna: { external: true, name: $nome_rede_interna }
+EOL
 
+    STACK_NAME="evolution"
+    stack_editavel
+    echo -e "${verde}✓ Evolution API instalada | API Key: $apikeyglobal${reset}"
+}
+
+## ============================================================================
+## INSTALAÇÃO MINIO
+## ============================================================================
+
+instalar_minio() {
+    echo -e "${amarelo}• Instalando MinIO...${reset}"
+    cd /root
+    dados
+
+    docker volume create minio_data 2>/dev/null || true
+
+    cat > minio.yaml <<EOL
+version: "3.7"
+services:
   minio:
-    image: minio/minio:latest
-    container_name: minio
-    restart: unless-stopped
+    image: quay.io/minio/minio:$minio_version
     command: server /data --console-address ":9001"
+    volumes: [ minio_data:/data ]
+    networks: [ $nome_rede_interna ]
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_BROWSER_REDIRECT_URL: https://${MINIO_CONSOLE_DOMAIN}
-      MINIO_SERVER_URL: https://${MINIO_S3_DOMAIN}
-      TZ: ${TZ}
-    volumes:
-      - ./minio:/data
-    networks:
-      - proxy
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.minio-console.rule=Host(`${MINIO_CONSOLE_DOMAIN}`)
-      - traefik.http.routers.minio-console.entrypoints=websecure
-      - traefik.http.routers.minio-console.tls.certresolver=le
-      - traefik.http.routers.minio-console.service=minio-console
-      - traefik.http.services.minio-console.loadbalancer.server.port=9001
-      - traefik.http.routers.minio-s3.rule=Host(`${MINIO_S3_DOMAIN}`)
-      - traefik.http.routers.minio-s3.entrypoints=websecure
-      - traefik.http.routers.minio-s3.tls.certresolver=le
-      - traefik.http.routers.minio-s3.service=minio-s3
-      - traefik.http.services.minio-s3.loadbalancer.server.port=9000
+      MINIO_ROOT_USER: $user_minio
+      MINIO_ROOT_PASSWORD: $senha_minio
+      MINIO_BROWSER_REDIRECT_URL: https://$url_minio
+      MINIO_SERVER_URL: https://$url_s3
+      MINIO_REGION_NAME: eu-south
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement: { constraints: [node.role == manager] }
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.minio_public.rule=Host(\`$url_s3\`)
+        - traefik.http.routers.minio_public.entrypoints=websecure
+        - traefik.http.routers.minio_public.tls.certresolver=letsencryptresolver
+        - traefik.http.services.minio_public.loadbalancer.server.port=9000
+        - traefik.http.routers.minio_console.rule=Host(\`$url_minio\`)
+        - traefik.http.routers.minio_console.entrypoints=websecure
+        - traefik.http.routers.minio_console.tls.certresolver=letsencryptresolver
+        - traefik.http.services.minio_console.loadbalancer.server.port=9001
+volumes:
+  minio_data: { external: true, name: minio_data }
+networks:
+  $nome_rede_interna: { external: true, name: $nome_rede_interna }
+EOL
 
-  n8n:
+    STACK_NAME="minio"
+    stack_editavel
+    echo -e "${verde}✓ MinIO instalado${reset}"
+}
+
+## ============================================================================
+## INSTALAÇÃO N8N
+## ============================================================================
+
+instalar_n8n() {
+    echo -e "${amarelo}• Instalando N8N...${reset}"
+    cd /root
+    dados
+
+    pegar_senha_postgres
+    encryption_key=$(openssl rand -hex 16)
+    criar_banco_postgres_da_stack n8n_queue
+
+    docker volume create n8n_redis 2>/dev/null || true
+
+    cat > n8n.yaml <<EOL
+version: "3.7"
+services:
+  n8n_editor:
     image: n8nio/n8n:latest
-    container_name: n8n
-    restart: unless-stopped
+    command: start
+    networks: [ $nome_rede_interna ]
     environment:
-      N8N_HOST: ${N8N_EDITOR_DOMAIN}
-      N8N_PORT: 5678
+      N8N_FIX_MIGRATIONS: "true"
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_DATABASE: n8n_queue
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_USER: postgres
+      DB_POSTGRESDB_PASSWORD: $senha_postgres
+      N8N_ENCRYPTION_KEY: $encryption_key
+      N8N_HOST: $url_editorn8n
+      N8N_EDITOR_BASE_URL: https://$url_editorn8n/
+      WEBHOOK_URL: https://$url_webhookn8n/
       N8N_PROTOCOL: https
       N8N_PROXY_HOPS: 1
-      WEBHOOK_URL: https://${N8N_WEBHOOK_DOMAIN}/
-      N8N_EDITOR_BASE_URL: https://${N8N_EDITOR_DOMAIN}/
-      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       N8N_ONBOARDING_FLOW_DISABLED: "true"
-      N8N_RUNNERS_ENABLED: "true"
-      N8N_SECURE_COOKIE: "true"
-      N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_ADMIN_EMAIL}
-      N8N_BASIC_AUTH_PASSWORD: ${N8N_ADMIN_PASSWORD}
-      GENERIC_TIMEZONE: ${TZ}
-      TZ: ${TZ}
-    volumes:
-      - ./n8n:/home/node/.n8n
-    networks:
-      - proxy
-    labels:
-      - traefik.enable=true
-      - traefik.http.routers.n8n-editor.rule=Host(`${N8N_EDITOR_DOMAIN}`)
-      - traefik.http.routers.n8n-editor.entrypoints=websecure
-      - traefik.http.routers.n8n-editor.tls.certresolver=le
-      - traefik.http.routers.n8n-editor.service=n8n
-      - traefik.http.routers.n8n-webhook.rule=Host(`${N8N_WEBHOOK_DOMAIN}`)
-      - traefik.http.routers.n8n-webhook.entrypoints=websecure
-      - traefik.http.routers.n8n-webhook.tls.certresolver=le
-      - traefik.http.routers.n8n-webhook.service=n8n
-      - traefik.http.services.n8n.loadbalancer.server.port=5678
-
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: n8n_redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      N8N_SMTP_SENDER: $email_smtp_n8n
+      N8N_SMTP_USER: $usuario_smtp_n8n
+      N8N_SMTP_PASS: $senha_smtp_n8n
+      N8N_SMTP_HOST: $host_smtp_n8n
+      N8N_SMTP_PORT: $porta_smtp_n8n
+      N8N_SMTP_SSL: $smtp_secure_smtp_n8n
+      TZ: America/Sao_Paulo
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement: { constraints: [node.role == manager] }
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.n8n_editor.rule=Host(\`$url_editorn8n\`)
+        - traefik.http.routers.n8n_editor.entrypoints=websecure
+        - traefik.http.routers.n8n_editor.tls.certresolver=letsencryptresolver
+        - traefik.http.services.n8n_editor.loadbalancer.server.port=5678
+  n8n_webhook:
+    image: n8nio/n8n:latest
+    command: webhook
+    networks: [ $nome_rede_interna ]
+    environment:
+      N8N_FIX_MIGRATIONS: "true"
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_DATABASE: n8n_queue
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_USER: postgres
+      DB_POSTGRESDB_PASSWORD: $senha_postgres
+      N8N_ENCRYPTION_KEY: $encryption_key
+      N8N_HOST: $url_editorn8n
+      WEBHOOK_URL: https://$url_webhookn8n/
+      N8N_PROTOCOL: https
+      QUEUE_BULL_REDIS_HOST: n8n_redis
+      N8N_SMTP_SENDER: $email_smtp_n8n
+      N8N_SMTP_USER: $usuario_smtp_n8n
+      N8N_SMTP_PASS: $senha_smtp_n8n
+      N8N_SMTP_HOST: $host_smtp_n8n
+      N8N_SMTP_PORT: $porta_smtp_n8n
+      N8N_SMTP_SSL: $smtp_secure_smtp_n8n
+      TZ: America/Sao_Paulo
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement: { constraints: [node.role == manager] }
+      labels:
+        - traefik.enable=true
+        - traefik.http.routers.n8n_webhook.rule=Host(\`$url_webhookn8n\`)
+        - traefik.http.routers.n8n_webhook.entrypoints=websecure
+        - traefik.http.routers.n8n_webhook.tls.certresolver=letsencryptresolver
+        - traefik.http.services.n8n_webhook.loadbalancer.server.port=5678
+  n8n_worker:
+    image: n8nio/n8n:latest
+    command: worker --concurrency=10
+    networks: [ $nome_rede_interna ]
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_DATABASE: n8n_queue
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PASSWORD: $senha_postgres
+      N8N_ENCRYPTION_KEY: $encryption_key
+      QUEUE_BULL_REDIS_HOST: n8n_redis
+      TZ: America/Sao_Paulo
+    deploy: { mode: replicated, replicas: 1, placement: { constraints: [node.role == manager] } }
+  n8n_redis:
+    image: redis:latest
+    command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
+    volumes: [ n8n_redis:/data ]
+    networks: [ $nome_rede_interna ]
+    deploy: { placement: { constraints: [node.role == manager] } }
+volumes:
+  n8n_redis: { external: true, name: n8n_redis }
 networks:
-  proxy:
-    name: proxy
-YAML
+  $nome_rede_interna: { external: true, name: $nome_rede_interna }
+EOL
 
-  cat > "${TRAEFIK_DYNAMIC_DIR}/middlewares.yml" <<YAML
-http:
-  middlewares:
-    auth:
-      basicAuth:
-        users:
-          - "${BASIC_AUTH_HASH}"
-YAML
-
-  ok "Arquivos criados em ${BASE_DIR}"
+    STACK_NAME="n8n"
+    stack_editavel
+    echo -e "${verde}✓ N8N instalado${reset}"
 }
 
-run_installation() {
-  echo
-  echo -e "${YELLOW}Etapa 4/5 - Subindo serviços${RESET}"
+## ============================================================================
+## RESUMO FINAL
+## ============================================================================
 
-  cd "${BASE_DIR}"
-  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
-  ok "Containers iniciados"
+resumo_final() {
+    clear
+    echo -e "${verde}====================================================================================================${reset}"
+    echo -e "${verde}                    INSTALAÇÃO CONCLUÍDA COM SUCESSO!                                                ${reset}"
+    echo -e "${verde}====================================================================================================${reset}"
+    echo ""
+    echo "Acessos:"
+    echo "  • Portainer:    https://$url_portainer  (User: $user_portainer)"
+    echo "  • Evolution:    https://$url_evolution"
+    echo "  • MinIO:        https://$url_minio  |  S3: https://$url_s3  (User: $user_minio)"
+    echo "  • N8N Editor:   https://$url_editorn8n"
+    echo "  • N8N Webhook:  https://$url_webhookn8n"
+    echo ""
+    echo "Arquivos de configuração em /root/"
+    echo "Dados da VPS em /root/dados_vps/"
+    echo ""
 }
 
-verify_installation() {
-  echo
-  echo -e "${YELLOW}Etapa 5/5 - Verificações automáticas${RESET}"
-
-  local failed=0
-  local services=(traefik portainer postgres-evolution redis-evolution evolution minio n8n)
-
-  for service in "${services[@]}"; do
-    if docker ps --format '{{.Names}}' | grep -qx "${service}"; then
-      ok "Container ${service} está em execução"
-    else
-      warn "Container ${service} não está em execução"
-      failed=1
-    fi
-  done
-
-  sleep 8
-
-  if docker logs traefik --tail 200 2>&1 | grep -q "client version 1.24 is too old"; then
-    warn "Traefik detectou API Docker antiga (1.24). Aplicando fallback com DOCKER_API_VERSION=1.44."
-    failed=1
-  fi
-
-  for url in \
-    "https://${PORTAINER_DOMAIN}" \
-    "https://${EVOLUTION_DOMAIN}" \
-    "https://${MINIO_CONSOLE_DOMAIN}" \
-    "https://${MINIO_S3_DOMAIN}" \
-    "https://${N8N_EDITOR_DOMAIN}" \
-    "https://${N8N_WEBHOOK_DOMAIN}"; do
-    local status
-    status="$(curl -kIsS --max-time 20 -o /dev/null -w '%{http_code}' "${url}" || true)"
-
-    if [[ "${status}" =~ ^(200|301|302|307|308|401|403)$ ]]; then
-      ok "URL respondeu (${status}): ${url}"
-    elif [[ "${status}" == "404" ]]; then
-      warn "URL respondeu com 404 (roteamento/domínio incorreto): ${url}"
-      failed=1
-    else
-      warn "URL não acessível ou inesperada (HTTP ${status:-erro}): ${url}"
-      failed=1
-    fi
-  done
-
-  echo
-  echo -e "${BLUE}======================== RESULTADO ========================${RESET}"
-  if [[ ${failed} -eq 0 ]]; then
-    echo -e "${GREEN}Instalação concluída com sucesso.${RESET}"
-  else
-    echo -e "${YELLOW}Instalação concluída com alertas. Verifique logs:${RESET} ${LOG_FILE}"
-    echo "Use: docker logs <container> --tail 100"
-  fi
-
-  cat <<ACCESS
-
-Acessos:
-- Portainer: https://${PORTAINER_DOMAIN}
-- Evolution: https://${EVOLUTION_DOMAIN}
-- MinIO Console: https://${MINIO_CONSOLE_DOMAIN}
-- MinIO S3/API: https://${MINIO_S3_DOMAIN}
-- n8n Editor: https://${N8N_EDITOR_DOMAIN}
-- n8n Webhook: https://${N8N_WEBHOOK_DOMAIN}
-
-Credenciais definidas por você:
-- BASIC AUTH (Traefik/Portainer): ${ADMIN_USER} / ${ADMIN_PASSWORD}
-- n8n BASIC AUTH: ${N8N_ADMIN_EMAIL} / ${N8N_ADMIN_PASSWORD}
-- MinIO: ${MINIO_ROOT_USER} / ${MINIO_ROOT_PASSWORD}
-
-Segredos gerados automaticamente:
-- Evolution API KEY: ${EVOLUTION_API_KEY}
-- Evolution PostgreSQL PASSWORD: ${EVOLUTION_DB_PASSWORD}
-- Evolution Redis PASSWORD: ${EVOLUTION_REDIS_PASSWORD}
-- n8n ENCRYPTION KEY: ${N8N_ENCRYPTION_KEY}
-
-Arquivos:
-- Compose: ${COMPOSE_FILE}
-- Ambiente: ${ENV_FILE}
-- Logs setup: ${LOG_FILE}
-ACCESS
-}
+## ============================================================================
+## MAIN
+## ============================================================================
 
 main() {
-  require_root
-  initial_checks
-  collect_inputs
-  install_dependencies
-  prepare_files
-  run_installation
-  verify_installation
+    coletar_informacoes
+    verificacoes_iniciais
+    instalar_traefik_portainer
+    instalar_postgres
+    instalar_evolution
+    instalar_minio
+    instalar_n8n
+    resumo_final
 }
 
 main "$@"
-
