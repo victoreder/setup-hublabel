@@ -4,6 +4,11 @@ set -euo pipefail
 # ==================================================
 # Setup Personalizado VPS
 # Instala: Traefik, Portainer, Evolution API, MinIO e n8n
+# Ajustes aplicados:
+# - Traefik fixado em v2.11 (evita erro API Docker "client version 1.24")
+# - Portainer via 9443 (HTTPS) no Traefik
+# - n8n com URL de editor + webhook separados
+# - Rede proxy external (cria se não existir)
 # ==================================================
 
 GREEN="\e[32m"
@@ -141,7 +146,7 @@ collect_inputs() {
   echo "Acessos principais (você define):"
   ask_default "- Usuário admin para Basic Auth (Traefik/Portainer)" ADMIN_USER "admin"
   ask_secret "- Senha admin do Basic Auth: " ADMIN_PASSWORD
-  ask_default "- E-mail login do n8n (Basic Auth)" N8N_ADMIN_EMAIL "admin@${N8N_EDITOR_DOMAIN}"
+  ask_default "- Login do n8n (Basic Auth) (pode ser email ou user)" N8N_ADMIN_USER "admin@${N8N_EDITOR_DOMAIN}"
   ask_secret "- Senha login do n8n (Basic Auth): " N8N_ADMIN_PASSWORD
   ask_default "- MinIO Root User" MINIO_ROOT_USER "minioadmin"
   ask_secret "- MinIO Root Password: " MINIO_ROOT_PASSWORD
@@ -172,7 +177,6 @@ SUMMARY
   [[ "${confirm,,}" == "y" ]] || die "Instalação cancelada pelo usuário."
 }
 
-
 install_dependencies() {
   echo
   echo -e "${YELLOW}Etapa 2/5 - Instalando dependências do sistema${RESET}"
@@ -195,6 +199,7 @@ install_dependencies() {
   systemctl enable docker
   systemctl start docker
 
+  # Compose plugin (se necessário)
   if ! docker compose version >/dev/null 2>&1; then
     local arch
     arch="$(uname -m)"
@@ -220,14 +225,14 @@ prepare_files() {
   echo
   echo -e "${YELLOW}Etapa 3/5 - Gerando arquivos de configuração${RESET}"
 
-  mkdir -p "${TRAEFIK_DYNAMIC_DIR}" "${BASE_DIR}/data" "${BASE_DIR}/certs" \
+  mkdir -p "${TRAEFIK_DYNAMIC_DIR}" "${BASE_DIR}/data" \
     "${BASE_DIR}/portainer" "${BASE_DIR}/minio" "${BASE_DIR}/n8n" \
     "${BASE_DIR}/evolution/postgres" "${BASE_DIR}/evolution/redis"
 
   touch "${TRAEFIK_DIR}/acme.json"
   chmod 600 "${TRAEFIK_DIR}/acme.json"
 
-  BASIC_AUTH_HASH=$(htpasswd -nbB "${ADMIN_USER}" "${ADMIN_PASSWORD}" | sed -e 's/\$/\$\$/g')
+  BASIC_AUTH_HASH="$(htpasswd -nbB "${ADMIN_USER}" "${ADMIN_PASSWORD}" | sed -e 's/\$/\$\$/g')"
 
   cat > "${ENV_FILE}" <<ENV
 SERVER_NAME=${SERVER_NAME}
@@ -244,7 +249,7 @@ N8N_WEBHOOK_DOMAIN=${N8N_WEBHOOK_DOMAIN}
 ADMIN_USER=${ADMIN_USER}
 BASIC_AUTH_HASH=${BASIC_AUTH_HASH}
 
-N8N_ADMIN_EMAIL=${N8N_ADMIN_EMAIL}
+N8N_ADMIN_USER=${N8N_ADMIN_USER}
 N8N_ADMIN_PASSWORD=${N8N_ADMIN_PASSWORD}
 N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
 
@@ -256,14 +261,16 @@ EVOLUTION_DB_PASSWORD=${EVOLUTION_DB_PASSWORD}
 EVOLUTION_REDIS_PASSWORD=${EVOLUTION_REDIS_PASSWORD}
 ENV
 
+  # Traefik v2.11 (estável e compatível com provider docker sem esse bug de API version)
   cat > "${COMPOSE_FILE}" <<'YAML'
 services:
   traefik:
-    image: traefik:v3.5.3
+    image: traefik:v2.11
     container_name: traefik
     restart: unless-stopped
     command:
       - --api.dashboard=true
+      - --api.insecure=false
       - --providers.docker=true
       - --providers.docker.endpoint=unix:///var/run/docker.sock
       - --providers.docker.exposedbydefault=false
@@ -278,8 +285,6 @@ services:
       - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
       - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
       - --log.level=INFO
-    environment:
-      - DOCKER_API_VERSION=1.44
     ports:
       - "80:80"
       - "443:443"
@@ -289,6 +294,14 @@ services:
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
     networks:
       - proxy
+    labels:
+      - traefik.enable=true
+      # Dashboard do Traefik (opcional). Se não quiser expor, remova.
+      # - traefik.http.routers.traefik.rule=Host(`traefik.${SERVER_NAME}`)
+      # - traefik.http.routers.traefik.entrypoints=websecure
+      # - traefik.http.routers.traefik.tls.certresolver=le
+      # - traefik.http.routers.traefik.service=api@internal
+      # - traefik.http.routers.traefik.middlewares=auth@file
 
   portainer:
     image: portainer/portainer-ce:latest
@@ -305,7 +318,9 @@ services:
       - traefik.http.routers.portainer.entrypoints=websecure
       - traefik.http.routers.portainer.tls.certresolver=le
       - traefik.http.routers.portainer.middlewares=auth@file
-      - traefik.http.services.portainer.loadbalancer.server.port=9000
+      # Portainer UI moderna em 9443 (HTTPS)
+      - traefik.http.services.portainer.loadbalancer.server.port=9443
+      - traefik.http.services.portainer.loadbalancer.server.scheme=https
 
   postgres-evolution:
     image: postgres:16-alpine
@@ -395,19 +410,27 @@ services:
     container_name: n8n
     restart: unless-stopped
     environment:
+      # Editor
       N8N_HOST: ${N8N_EDITOR_DOMAIN}
       N8N_PORT: 5678
       N8N_PROTOCOL: https
       N8N_PROXY_HOPS: 1
-      WEBHOOK_URL: https://${N8N_WEBHOOK_DOMAIN}/
+
+      # URLs (editor e webhook separados)
       N8N_EDITOR_BASE_URL: https://${N8N_EDITOR_DOMAIN}/
+      WEBHOOK_URL: https://${N8N_WEBHOOK_DOMAIN}/
+
+      # Segurança
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       N8N_ONBOARDING_FLOW_DISABLED: "true"
       N8N_RUNNERS_ENABLED: "true"
       N8N_SECURE_COOKIE: "true"
+
+      # Basic Auth (n8n)
       N8N_BASIC_AUTH_ACTIVE: "true"
-      N8N_BASIC_AUTH_USER: ${N8N_ADMIN_EMAIL}
+      N8N_BASIC_AUTH_USER: ${N8N_ADMIN_USER}
       N8N_BASIC_AUTH_PASSWORD: ${N8N_ADMIN_PASSWORD}
+
       GENERIC_TIMEZONE: ${TZ}
       TZ: ${TZ}
     volumes:
@@ -416,18 +439,24 @@ services:
       - proxy
     labels:
       - traefik.enable=true
+
+      # Router editor
       - traefik.http.routers.n8n-editor.rule=Host(`${N8N_EDITOR_DOMAIN}`)
       - traefik.http.routers.n8n-editor.entrypoints=websecure
       - traefik.http.routers.n8n-editor.tls.certresolver=le
       - traefik.http.routers.n8n-editor.service=n8n
+
+      # Router webhook
       - traefik.http.routers.n8n-webhook.rule=Host(`${N8N_WEBHOOK_DOMAIN}`)
       - traefik.http.routers.n8n-webhook.entrypoints=websecure
       - traefik.http.routers.n8n-webhook.tls.certresolver=le
       - traefik.http.routers.n8n-webhook.service=n8n
+
       - traefik.http.services.n8n.loadbalancer.server.port=5678
 
 networks:
   proxy:
+    external: true
     name: proxy
 YAML
 
@@ -446,6 +475,9 @@ YAML
 run_installation() {
   echo
   echo -e "${YELLOW}Etapa 4/5 - Subindo serviços${RESET}"
+
+  # Garante rede proxy
+  docker network inspect proxy >/dev/null 2>&1 || docker network create proxy >/dev/null 2>&1 || true
 
   cd "${BASE_DIR}"
   docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
@@ -468,13 +500,15 @@ verify_installation() {
     fi
   done
 
-  sleep 8
-
+  # Sanidade do provider docker do Traefik
+  sleep 4
   if docker logs traefik --tail 200 2>&1 | grep -q "client version 1.24 is too old"; then
-    warn "Traefik detectou API Docker antiga (1.24). Aplicando fallback com DOCKER_API_VERSION=1.44."
+    warn "Traefik não conseguiu falar com o Docker (API version). Com este script (Traefik v2.11) isso não deveria acontecer."
+    warn "Se persistir, seu Docker Engine está realmente desatualizado. Rode: docker version"
     failed=1
   fi
 
+  # Teste URLs (aceita 200, redirects, e também 401/403 quando há auth)
   for url in \
     "https://${PORTAINER_DOMAIN}" \
     "https://${EVOLUTION_DOMAIN}" \
@@ -484,7 +518,6 @@ verify_installation() {
     "https://${N8N_WEBHOOK_DOMAIN}"; do
     local status
     status="$(curl -kIsS --max-time 20 -o /dev/null -w '%{http_code}' "${url}" || true)"
-
     if [[ "${status}" =~ ^(200|301|302|307|308|401|403)$ ]]; then
       ok "URL respondeu (${status}): ${url}"
     elif [[ "${status}" == "404" ]]; then
@@ -502,7 +535,7 @@ verify_installation() {
     echo -e "${GREEN}Instalação concluída com sucesso.${RESET}"
   else
     echo -e "${YELLOW}Instalação concluída com alertas. Verifique logs:${RESET} ${LOG_FILE}"
-    echo "Use: docker logs <container> --tail 100"
+    echo "Use: docker logs <container> --tail 200"
   fi
 
   cat <<ACCESS
@@ -517,7 +550,7 @@ Acessos:
 
 Credenciais definidas por você:
 - BASIC AUTH (Traefik/Portainer): ${ADMIN_USER} / ${ADMIN_PASSWORD}
-- n8n BASIC AUTH: ${N8N_ADMIN_EMAIL} / ${N8N_ADMIN_PASSWORD}
+- n8n BASIC AUTH: ${N8N_ADMIN_USER} / ${N8N_ADMIN_PASSWORD}
 - MinIO: ${MINIO_ROOT_USER} / ${MINIO_ROOT_PASSWORD}
 
 Segredos gerados automaticamente:
