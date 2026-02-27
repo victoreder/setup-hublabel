@@ -152,10 +152,10 @@ stack_editavel() {
     SENHA=$(grep "Senha:" "$arquivo" | awk -F': ' '{print $2}')
 
     TOKEN=""
-    for i in $(seq 1 10); do
-        TOKEN=$(curl -k -s -X POST -H "Content-Type: application/json" \
+    for i in $(seq 1 15); do
+        TOKEN=$(curl -k -s -X POST -H "Content-Type: application/json" -H "Host: $PORTAINER_URL" \
             -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
-            "https://$PORTAINER_URL/api/auth" | jq -r .jwt 2>/dev/null)
+            "https://127.0.0.1/api/auth" | jq -r .jwt 2>/dev/null)
         [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && break
         echo "Tentativa $i - Aguardando Portainer..."
         sleep 10
@@ -165,8 +165,8 @@ stack_editavel() {
 
     echo -e "[ PORTAINER ]\nDominio do portainer: $PORTAINER_URL\nUsuario: $USUARIO\nSenha: $SENHA\nToken: $TOKEN" > "$arquivo"
 
-    ENDPOINT_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
-    SWARM_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
+    ENDPOINT_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
+    SWARM_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
 
     if [ ! -f "$(pwd)/${STACK_NAME}.yaml" ]; then
         echo "Erro: ${STACK_NAME}.yaml não encontrado"
@@ -175,11 +175,12 @@ stack_editavel() {
 
     http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X POST \
         -H "Authorization: Bearer $TOKEN" \
+        -H "Host: $PORTAINER_URL" \
         -F "Name=$STACK_NAME" \
         -F "file=@$(pwd)/${STACK_NAME}.yaml" \
         -F "SwarmID=$SWARM_ID" \
         -F "endpointId=$ENDPOINT_ID" \
-        "https://$PORTAINER_URL/api/stacks/create/swarm/file")
+        "https://127.0.0.1/api/stacks/create/swarm/file")
 
     if [ "$http_code" -eq 200 ]; then
         echo -e "10/10 - [ OK ] - Deploy da stack ${verde}$STACK_NAME${reset} feito com sucesso!"
@@ -219,14 +220,19 @@ coletar_informacoes() {
     read -p "Subdomínio do Portainer (ex: painel): " sub_portainer
     sub_portainer="${sub_portainer:-painel}"
     url_portainer="${sub_portainer}.${dominio_base}"
-    read -p "Usuário do Portainer (ex: admin): " user_portainer
+    read -p "Usuário do Portainer (ex: admin) [admin]: " user_portainer
+    user_portainer="${user_portainer:-admin}"
     while true; do
         echo -e "${amarelo}Mínimo 12 caracteres. Letras maiúsculas, minúsculas, número e @ ou _${reset}"
-        read -p "Senha do Portainer: " pass_portainer
+        read -p "Senha do Portainer [EjGse3_0@t50OPo]: " pass_portainer
+        pass_portainer="${pass_portainer:-EjGse3_0@t50OPo}"
         validar_senha "$pass_portainer" 12 && break
     done
-    read -p "Nome do servidor (ex: Hublabel): " nome_servidor
-    read -p "Nome da rede interna (ex: HublabelNet): " nome_rede_interna
+    dominio_sem_sufixo="${dominio_base%%.*}"
+    read -p "Nome do servidor [$dominio_sem_sufixo]: " nome_servidor
+    nome_servidor="${nome_servidor:-$dominio_sem_sufixo}"
+    read -p "Nome da rede interna [Rede$dominio_sem_sufixo]: " nome_rede_interna
+    nome_rede_interna="${nome_rede_interna:-Rede$dominio_sem_sufixo}"
     echo ""
 
     ## Evolution API
@@ -244,10 +250,12 @@ coletar_informacoes() {
     read -p "Subdomínio da API S3 (ex: s3): " sub_s3
     sub_s3="${sub_s3:-s3}"
     url_s3="${sub_s3}.${dominio_base}"
-    read -p "Usuário MinIO (ex: minioadmin): " user_minio
+    read -p "Usuário MinIO [admin]: " user_minio
+    user_minio="${user_minio:-admin}"
     while true; do
         echo -e "${amarelo}Mínimo 8 caracteres. Letras, números e @ ou _${reset}"
-        read -p "Senha MinIO: " senha_minio
+        read -p "Senha MinIO [EjGse3_0@t50OPo]: " senha_minio
+        senha_minio="${senha_minio:-EjGse3_0@t50OPo}"
         validar_senha "$senha_minio" 8 && break
     done
     minio_version="RELEASE.2024-01-13T07-53-03Z-cpuv1"
@@ -261,11 +269,16 @@ coletar_informacoes() {
     read -p "Subdomínio do Webhook N8N (ex: hook): " sub_webhook
     sub_webhook="${sub_webhook:-hook}"
     url_webhookn8n="${sub_webhook}.${dominio_base}"
-    read -p "Email SMTP (ex: contato@$dominio_base): " email_smtp_n8n
-    read -p "Usuário SMTP (ou o mesmo email): " usuario_smtp_n8n
-    read -p "Senha SMTP: " senha_smtp_n8n
-    read -p "Host SMTP (ex: smtp.hostinger.com): " host_smtp_n8n
-    read -p "Porta SMTP (ex: 465): " porta_smtp_n8n
+    read -p "Email SMTP [suporte@$dominio_base]: " email_smtp_n8n
+    email_smtp_n8n="${email_smtp_n8n:-suporte@$dominio_base}"
+    read -p "Usuário SMTP [suporte@$dominio_base]: " usuario_smtp_n8n
+    usuario_smtp_n8n="${usuario_smtp_n8n:-suporte@$dominio_base}"
+    read -p "Senha SMTP [123]: " senha_smtp_n8n
+    senha_smtp_n8n="${senha_smtp_n8n:-123}"
+    read -p "Host SMTP [smtp]: " host_smtp_n8n
+    host_smtp_n8n="${host_smtp_n8n:-smtp}"
+    read -p "Porta SMTP [465]: " porta_smtp_n8n
+    porta_smtp_n8n="${porta_smtp_n8n:-465}"
     [ "$porta_smtp_n8n" = "465" ] && smtp_secure_smtp_n8n=true || smtp_secure_smtp_n8n=false
     echo ""
 
@@ -462,20 +475,25 @@ PYEOF
     wait_stack portainer_portainer
     sleep 30
 
-    ## Criar conta Portainer
-    for i in 1 2 3 4; do
-        resp=$(curl -k -s -X POST "https://$url_portainer/api/users/admin/init" \
-            -H "Content-Type: application/json" \
-            -d "{\"Username\": \"$user_portainer\", \"Password\": \"$pass_portainer\"}")
+    ## Criar conta Portainer (127.0.0.1 evita hairpin NAT)
+    for i in 1 2 3 4 5; do
+        resp=$(curl -k -s -X POST -H "Host: $url_portainer" -H "Content-Type: application/json" \
+            -d "{\"Username\": \"$user_portainer\", \"Password\": \"$pass_portainer\"}" \
+            "https://127.0.0.1/api/users/admin/init")
         if echo "$resp" | grep -q "\"Username\":\"$user_portainer\""; then
             break
         fi
         sleep 15
     done
 
-    token=$(curl -k -s -X POST "https://$url_portainer/api/auth" \
-        -H "Content-Type: application/json" \
-        -d "{\"username\":\"$user_portainer\",\"password\":\"$pass_portainer\"}" | jq -r .jwt)
+    token=""
+    for i in 1 2 3 4 5; do
+        token=$(curl -k -s -X POST -H "Host: $url_portainer" -H "Content-Type: application/json" \
+            -d "{\"username\":\"$user_portainer\",\"password\":\"$pass_portainer\"}" \
+            "https://127.0.0.1/api/auth" | jq -r .jwt)
+        [ -n "$token" ] && [ "$token" != "null" ] && break
+        sleep 10
+    done
 
     mkdir -p dados_vps
     echo -e "[ PORTAINER ]\nDominio do portainer: $url_portainer\nUsuario: $user_portainer\nSenha: $pass_portainer\nToken: $token" > dados_vps/dados_portainer
