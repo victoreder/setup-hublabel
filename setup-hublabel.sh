@@ -452,40 +452,28 @@ email = sys.argv[2]
 with open('/root/traefik.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
-
-## --------------------------- HUBLABEL --------------------------- ##
-
   traefik:
-    image: traefik:v3.5.3  ## Versão do Traefik
+    image: traefik:latest
     command:
       - "--api.dashboard=true"
       - "--providers.swarm=true"
       - "--providers.swarm.endpoint=unix:///var/run/docker.sock"
       - "--providers.swarm.exposedbydefault=false"
-      - "--providers.swarm.network={rede}"  ## Nome da rede interna
+      - "--providers.swarm.network={rede}"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
       - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
       - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
       - "--entrypoints.websecure.address=:443"
-      - "--entrypoints.web.transport.respondingTimeouts.idleTimeout=3600"
       - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge=true"
       - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.letsencryptresolver.acme.storage=/etc/traefik/letsencrypt/acme.json"
-      - "--certificatesresolvers.letsencryptresolver.acme.email={email}"  ## Email para receber as notificações
-      - "--log.level=DEBUG"
-      - "--log.format=common"
-      - "--log.filePath=/var/log/traefik/traefik.log"
-      - "--accesslog=true"
-      - "--accesslog.filepath=/var/log/traefik/access-log"
-
+      - "--certificatesresolvers.letsencryptresolver.acme.email={email}"
+      - "--log.level=INFO"
     volumes:
       - vol_certificates:/etc/traefik/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
+    networks: [ {rede} ]
     ports:
       - target: 80
         published: 80
@@ -493,39 +481,25 @@ services:
       - target: 443
         published: 443
         mode: host
-
     deploy:
-      placement:
-        constraints:
-          - node.role == manager
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
         - traefik.http.middlewares.redirect-https.redirectscheme.scheme=https
         - traefik.http.middlewares.redirect-https.redirectscheme.permanent=true
         - "traefik.http.routers.http-catchall.rule=Host(`{{host:.+}}`)"
         - traefik.http.routers.http-catchall.entrypoints=web
-        - traefik.http.routers.http-catchall.middlewares=redirect-https@docker
+        - traefik.http.routers.http-catchall.middlewares=redirect-https@swarm
         - traefik.http.routers.http-catchall.priority=1
-
-## --------------------------- HUBLABEL --------------------------- ##
-
 volumes:
-  vol_shared:
-    external: true
-    name: volume_swarm_shared
-  vol_certificates:
-    external: true
-    name: volume_swarm_certificates
-
+  vol_shared: {{ external: true, name: volume_swarm_shared }}
+  vol_certificates: {{ external: true, name: volume_swarm_certificates }}
 networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    attachable: true
-    name: {rede}  ## Nome da rede interna
+  {rede}: {{ external: true, attachable: true, name: {rede} }}
 ''')
 PYEOF
 
-    pull traefik:v3.5.3
+    pull traefik:latest
     docker stack deploy --prune --resolve-image always -c traefik.yaml traefik
     wait_stack traefik_traefik
     wait_30_sec
@@ -538,65 +512,33 @@ rede = sys.argv[2]
 with open('/root/portainer.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
-
-## --------------------------- HUBLABEL --------------------------- ##
-
   agent:
-    image: portainer/agent:latest  ## Versão Agent do Portainer
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/lib/docker/volumes:/var/lib/docker/volumes
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    deploy:
-      mode: global
-      placement:
-        constraints:
-          - node.platform.os == linux
-
-## --------------------------- HUBLABEL --------------------------- ##
-
+    image: portainer/agent:latest
+    volumes: [ /var/run/docker.sock:/var/run/docker.sock, /var/lib/docker/volumes:/var/lib/docker/volumes ]
+    networks: [ {rede} ]
+    deploy: {{ mode: global, placement: {{ constraints: [node.platform.os == linux] }} }}
   portainer:
-    image: portainer/portainer-ce:latest  ## Versão do Portainer
+    image: portainer/portainer-ce:latest
     command: -H tcp://tasks.agent:9001 --tlsskipverify
-
-    volumes:
-      - portainer_data:/data
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
+    volumes: [ portainer_data:/data ]
+    networks: [ {rede} ]
     deploy:
       mode: replicated
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
-        - traefik.http.routers.portainer.rule=Host(`{url}`)  ## Dominio do Portainer
+        - traefik.http.routers.portainer.rule=Host(`{url}`)
         - traefik.http.services.portainer.loadbalancer.server.port=9000
         - traefik.http.routers.portainer.tls.certresolver=letsencryptresolver
         - traefik.http.routers.portainer.service=portainer
-        - traefik.docker.network={rede}  ## Nome da rede interna
+        - traefik.swarm.network={rede}
         - traefik.http.routers.portainer.entrypoints=websecure
         - traefik.http.routers.portainer.priority=1
-
-## --------------------------- HUBLABEL --------------------------- ##
-
 volumes:
-  portainer_data:
-    external: true
-    name: portainer_data
-
+  portainer_data: {{ external: true, name: portainer_data }}
 networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    attachable: true
-    name: {rede}  ## Nome da rede interna
+  {rede}: {{ external: true, attachable: true, name: {rede} }}
 ''')
 PYEOF
 
@@ -650,56 +592,22 @@ rede, pgpass = sys.argv[1], sys.argv[2]
 with open('/root/postgres.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
-
-## --------------------------- HUBLABEL --------------------------- ##
-
   postgres:
-    image: postgres:14  ## Versão do postgres
-    command:
-      - postgres
-      - -c max_connections=500
-      - -c shared_buffers=64MB
-      - -c timezone=America/Sao_Paulo
-
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    ## Descomente as linhas abaixo para uso externo
-    #ports:
-    #  - 5432:5432
-
+    image: postgres:14
+    command: postgres -c max_connections=500 -c timezone=America/Sao_Paulo
+    volumes: [ postgres_data:/var/lib/postgresql/data ]
+    networks: [ {rede} ]
     environment:
-    ## Senha do Postgres
-      - POSTGRES_PASSWORD={pgpass}
-
-    ## Timezone
-      - TZ=America/Sao_Paulo
-
+      POSTGRES_PASSWORD: {pgpass}
+      TZ: America/Sao_Paulo
     deploy:
       mode: replicated
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1024M
-
-## --------------------------- HUBLABEL --------------------------- ##
-
+      placement: {{ constraints: [node.role == manager] }}
 volumes:
-  postgres_data:
-    external: true
-    name: postgres_data
-
+  postgres_data: {{ external: true, name: postgres_data }}
 networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    name: {rede}  ## Nome da rede interna
+  {rede}: {{ external: true, name: {rede} }}
 ''')
 PYEOF
 
@@ -756,12 +664,12 @@ services:
       - DATABASE_CONNECTION_URI=postgresql://postgres:{pgpass}@postgres:5432/evolution
       - DATABASE_CONNECTION_CLIENT_NAME=evolution
       - DATABASE_SAVE_DATA_INSTANCE=true
-      - DATABASE_SAVE_DATA_NEW_MESSAGE=false
-      - DATABASE_SAVE_MESSAGE_UPDATE=false
-      - DATABASE_SAVE_DATA_CONTACTS=false
-      - DATABASE_SAVE_DATA_CHATS=false
-      - DATABASE_SAVE_DATA_LABELS=false
-      - DATABASE_SAVE_DATA_HISTORIC=false
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
+      - DATABASE_SAVE_MESSAGE_UPDATE=true
+      - DATABASE_SAVE_DATA_CONTACTS=true
+      - DATABASE_SAVE_DATA_CHATS=true
+      - DATABASE_SAVE_DATA_LABELS=true
+      - DATABASE_SAVE_DATA_HISTORIC=true
 
     ## 🤖 Integracao com N8N
       - N8N_ENABLED=true
@@ -924,8 +832,8 @@ services:
       placement: {{ constraints: [node.role == manager] }}
       resources:
         limits:
-          cpus: "2"
-          memory: 2048M
+          cpus: "1"
+          memory: 1024M
 volumes:
   evolution_instances: {{ external: true, name: evolution_instances }}
   evolution_redis: {{ external: true, name: evolution_redis }}
@@ -936,7 +844,6 @@ PYEOF
 
     STACK_NAME="evolution"
     stack_editavel
-    wait_stack evolution_evolution_redis evolution_evolution_api
     echo -e "${verde}✓ Evolution API instalada | API Key: $apikeyglobal${reset}"
 }
 
@@ -1022,7 +929,6 @@ PYEOF
 
     STACK_NAME="minio"
     stack_editavel
-    wait_stack minio_minio
     echo -e "${verde}✓ MinIO instalado${reset}"
 }
 
@@ -1069,7 +975,6 @@ services:
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_USER=postgres
       - DB_POSTGRESDB_PASSWORD={pgpass}
-      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
 
     ## 🔐 Criptografia
       - N8N_ENCRYPTION_KEY={enc}
@@ -1119,7 +1024,7 @@ services:
 
     ## ⏱️ Execuções e Limpeza
       - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=6
+      - EXECUTIONS_DATA_MAX_AGE=336
 
     ## 🧠 Recursos de IA
       - N8N_AI_ENABLED=false
@@ -1174,7 +1079,6 @@ services:
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_USER=postgres
       - DB_POSTGRESDB_PASSWORD={pgpass}
-      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
 
     ## 🔐 Criptografia
       - N8N_ENCRYPTION_KEY={enc}
@@ -1224,7 +1128,7 @@ services:
 
     ## ⏱️ Execuções e Limpeza
       - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=6
+      - EXECUTIONS_DATA_MAX_AGE=336
 
     ## 🧠 Recursos de IA
       - N8N_AI_ENABLED=false
@@ -1248,8 +1152,8 @@ services:
           - node.role == manager
       resources:
         limits:
-          cpus: "2"
-          memory: 2048M
+          cpus: "1"
+          memory: 1024M
       labels:
         - traefik.enable=true
         - traefik.http.routers.n8n_webhook.rule=Host(`{url_wh}`)
@@ -1260,9 +1164,6 @@ services:
         - traefik.http.services.n8n_webhook.loadbalancer.server.port=5678
         - traefik.http.services.n8n_webhook.loadbalancer.passHostHeader=1
         - traefik.swarm.network={rede}
-        - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.regex=^/(.*)
-        - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.replacement=/webhook/$$1
-        - traefik.http.routers.n8n_webhook.middlewares=n8n-webhook-strip
 
 ## --------------------------- HUBLABEL --------------------------- ##
 
@@ -1282,7 +1183,6 @@ services:
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_USER=postgres
       - DB_POSTGRESDB_PASSWORD={pgpass}
-      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
 
     ## 🔐 Criptografia
       - N8N_ENCRYPTION_KEY={enc}
@@ -1332,7 +1232,7 @@ services:
 
     ## ⏱️ Execuções e Limpeza
       - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=6
+      - EXECUTIONS_DATA_MAX_AGE=336
 
     ## 🧠 Recursos de IA
       - N8N_AI_ENABLED=false
@@ -1356,8 +1256,8 @@ services:
           - node.role == manager
       resources:
         limits:
-          cpus: "2"
-          memory: 2048M
+          cpus: "1"
+          memory: 1024M
 
 ## --------------------------- HUBLABEL --------------------------- ##
 
@@ -1418,35 +1318,16 @@ PYEOF
 
 resumo_final() {
     clear
-    echo ""
-    echo -e "${branco}  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
-    echo -e "${branco}  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
-    echo -e "${branco}  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
-    echo -e "${branco}  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
-    echo -e "${branco}  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
-    echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
-    echo ""
     echo -e "${verde}====================================================================================================${reset}"
     echo -e "${verde}                    INSTALAÇÃO CONCLUÍDA COM SUCESSO!                                                ${reset}"
     echo -e "${verde}====================================================================================================${reset}"
-    echo -e "${amarelo}PORTAINER:${reset}"
-    echo "  URL:    https://$url_portainer"
-    echo "  User:   $user_portainer"
     echo ""
-    echo -e "${amarelo}EVOLUTION${reset}"
-    echo "  URL:    https://$url_evolution"
-    echo ""
-    echo -e "${amarelo}APIKEY${reset}"
-    echo "  $apikeyglobal"
-    echo ""
-    echo -e "${amarelo}MINIO${reset}"
-    echo "  Painel: https://$url_minio"
-    echo "  S3:     https://$url_s3"
-    echo "  User:   $user_minio"
-    echo ""
-    echo -e "${amarelo}N8N${reset}"
-    echo "  Editor:  https://$url_editorn8n"
-    echo "  Webhook: https://$url_webhookn8n"
+    echo "Acessos:"
+    echo "  • Portainer:    https://$url_portainer  (User: $user_portainer)"
+    echo "  • Evolution:    https://$url_evolution"
+    echo "  • MinIO:        https://$url_minio  |  S3: https://$url_s3  (User: $user_minio)"
+    echo "  • N8N Editor:   https://$url_editorn8n"
+    echo "  • N8N Webhook:  https://$url_webhookn8n"
     echo ""
     echo "Arquivos de configuração em /root/"
     echo "Dados da VPS em /root/dados_vps/"
