@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.2
+## SETUP PERSONALIZADO HUBLABEL v1.4
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -288,7 +288,7 @@ stack_editavel() {
 coletar_informacoes() {
     clear
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.2 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
+    echo -e "${amarelo}                                       SETUP HUBLABEL 1.4                                           ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
