@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.3
+## SETUP PERSONALIZADO HUBLABEL v1.2
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -288,7 +288,7 @@ stack_editavel() {
 coletar_informacoes() {
     clear
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.3 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
+    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.2 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
@@ -664,12 +664,12 @@ services:
       - DATABASE_CONNECTION_URI=postgresql://postgres:{pgpass}@postgres:5432/evolution
       - DATABASE_CONNECTION_CLIENT_NAME=evolution
       - DATABASE_SAVE_DATA_INSTANCE=true
-      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
-      - DATABASE_SAVE_MESSAGE_UPDATE=true
-      - DATABASE_SAVE_DATA_CONTACTS=true
-      - DATABASE_SAVE_DATA_CHATS=true
-      - DATABASE_SAVE_DATA_LABELS=true
-      - DATABASE_SAVE_DATA_HISTORIC=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=false
+      - DATABASE_SAVE_MESSAGE_UPDATE=false
+      - DATABASE_SAVE_DATA_CONTACTS=false
+      - DATABASE_SAVE_DATA_CHATS=false
+      - DATABASE_SAVE_DATA_LABELS=false
+      - DATABASE_SAVE_DATA_HISTORIC=false
 
     ## 🤖 Integracao com N8N
       - N8N_ENABLED=true
@@ -832,8 +832,8 @@ services:
       placement: {{ constraints: [node.role == manager] }}
       resources:
         limits:
-          cpus: "1"
-          memory: 1024M
+          cpus: "2"
+          memory: 2048M
 volumes:
   evolution_instances: {{ external: true, name: evolution_instances }}
   evolution_redis: {{ external: true, name: evolution_redis }}
@@ -844,6 +844,7 @@ PYEOF
 
     STACK_NAME="evolution"
     stack_editavel
+    wait_stack evolution_evolution_redis evolution_evolution_api
     echo -e "${verde}✓ Evolution API instalada | API Key: $apikeyglobal${reset}"
 }
 
@@ -929,6 +930,7 @@ PYEOF
 
     STACK_NAME="minio"
     stack_editavel
+    wait_stack minio_minio
     echo -e "${verde}✓ MinIO instalado${reset}"
 }
 
@@ -975,6 +977,7 @@ services:
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_USER=postgres
       - DB_POSTGRESDB_PASSWORD={pgpass}
+      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
 
     ## 🔐 Criptografia
       - N8N_ENCRYPTION_KEY={enc}
@@ -1024,7 +1027,7 @@ services:
 
     ## ⏱️ Execuções e Limpeza
       - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=336
+      - EXECUTIONS_DATA_MAX_AGE=6
 
     ## 🧠 Recursos de IA
       - N8N_AI_ENABLED=false
@@ -1079,6 +1082,7 @@ services:
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_USER=postgres
       - DB_POSTGRESDB_PASSWORD={pgpass}
+      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
 
     ## 🔐 Criptografia
       - N8N_ENCRYPTION_KEY={enc}
@@ -1128,7 +1132,7 @@ services:
 
     ## ⏱️ Execuções e Limpeza
       - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=336
+      - EXECUTIONS_DATA_MAX_AGE=6
 
     ## 🧠 Recursos de IA
       - N8N_AI_ENABLED=false
@@ -1152,8 +1156,8 @@ services:
           - node.role == manager
       resources:
         limits:
-          cpus: "1"
-          memory: 1024M
+          cpus: "2"
+          memory: 2048M
       labels:
         - traefik.enable=true
         - traefik.http.routers.n8n_webhook.rule=Host(`{url_wh}`)
@@ -1164,6 +1168,9 @@ services:
         - traefik.http.services.n8n_webhook.loadbalancer.server.port=5678
         - traefik.http.services.n8n_webhook.loadbalancer.passHostHeader=1
         - traefik.swarm.network={rede}
+        - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.regex=^/(.*)
+        - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.replacement=/webhook/$$1
+        - traefik.http.routers.n8n_webhook.middlewares=n8n-webhook-strip
 
 ## --------------------------- HUBLABEL --------------------------- ##
 
@@ -1183,6 +1190,7 @@ services:
       - DB_POSTGRESDB_PORT=5432
       - DB_POSTGRESDB_USER=postgres
       - DB_POSTGRESDB_PASSWORD={pgpass}
+      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
 
     ## 🔐 Criptografia
       - N8N_ENCRYPTION_KEY={enc}
@@ -1232,7 +1240,7 @@ services:
 
     ## ⏱️ Execuções e Limpeza
       - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=336
+      - EXECUTIONS_DATA_MAX_AGE=6
 
     ## 🧠 Recursos de IA
       - N8N_AI_ENABLED=false
@@ -1256,8 +1264,8 @@ services:
           - node.role == manager
       resources:
         limits:
-          cpus: "1"
-          memory: 1024M
+          cpus: "2"
+          memory: 2048M
 
 ## --------------------------- HUBLABEL --------------------------- ##
 
@@ -1318,16 +1326,35 @@ PYEOF
 
 resumo_final() {
     clear
+    echo ""
+    echo -e "${branco}  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
+    echo -e "${branco}  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
+    echo -e "${branco}  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
+    echo -e "${branco}  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
+    echo -e "${branco}  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
+    echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
+    echo ""
     echo -e "${verde}====================================================================================================${reset}"
     echo -e "${verde}                    INSTALAÇÃO CONCLUÍDA COM SUCESSO!                                                ${reset}"
     echo -e "${verde}====================================================================================================${reset}"
+    echo -e "${amarelo}PORTAINER:${reset}"
+    echo "  URL:    https://$url_portainer"
+    echo "  User:   $user_portainer"
     echo ""
-    echo "Acessos:"
-    echo "  • Portainer:    https://$url_portainer  (User: $user_portainer)"
-    echo "  • Evolution:    https://$url_evolution"
-    echo "  • MinIO:        https://$url_minio  |  S3: https://$url_s3  (User: $user_minio)"
-    echo "  • N8N Editor:   https://$url_editorn8n"
-    echo "  • N8N Webhook:  https://$url_webhookn8n"
+    echo -e "${amarelo}EVOLUTION${reset}"
+    echo "  URL:    https://$url_evolution"
+    echo ""
+    echo -e "${amarelo}APIKEY${reset}"
+    echo "  $apikeyglobal"
+    echo ""
+    echo -e "${amarelo}MINIO${reset}"
+    echo "  Painel: https://$url_minio"
+    echo "  S3:     https://$url_s3"
+    echo "  User:   $user_minio"
+    echo ""
+    echo -e "${amarelo}N8N${reset}"
+    echo "  Editor:  https://$url_editorn8n"
+    echo "  Webhook: https://$url_webhookn8n"
     echo ""
     echo "Arquivos de configuração em /root/"
     echo "Dados da VPS em /root/dados_vps/"
