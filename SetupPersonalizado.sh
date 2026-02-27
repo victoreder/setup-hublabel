@@ -97,6 +97,14 @@ ask_default() {
   printf -v "$var_name" '%s' "$value"
 }
 
+normalize_domain() {
+  local input="$1"
+  input="${input#http://}"
+  input="${input#https://}"
+  input="${input%%/*}"
+  printf '%s' "${input}"
+}
+
 generate_secret() {
   openssl rand -base64 36 | tr -dc 'A-Za-z0-9@#%+=._-' | head -c 28
 }
@@ -108,7 +116,7 @@ collect_inputs() {
   echo
 
   SERVER_NAME="$(hostname)"
-  ask_default "Timezone" TZ_VALUE "America/Sao_Paulo"
+  TZ_VALUE="America/Sao_Paulo"
   ask "E-mail para Let's Encrypt (Traefik): " LETSENCRYPT_EMAIL
 
   echo
@@ -119,6 +127,13 @@ collect_inputs() {
   ask "- MinIO S3/API (ex: s3.seudominio.com): " MINIO_S3_DOMAIN
   ask "- n8n Editor (ex: n8n.seudominio.com): " N8N_EDITOR_DOMAIN
   ask "- n8n Webhook (ex: hook.seudominio.com): " N8N_WEBHOOK_DOMAIN
+
+  PORTAINER_DOMAIN="$(normalize_domain "${PORTAINER_DOMAIN}")"
+  EVOLUTION_DOMAIN="$(normalize_domain "${EVOLUTION_DOMAIN}")"
+  MINIO_CONSOLE_DOMAIN="$(normalize_domain "${MINIO_CONSOLE_DOMAIN}")"
+  MINIO_S3_DOMAIN="$(normalize_domain "${MINIO_S3_DOMAIN}")"
+  N8N_EDITOR_DOMAIN="$(normalize_domain "${N8N_EDITOR_DOMAIN}")"
+  N8N_WEBHOOK_DOMAIN="$(normalize_domain "${N8N_WEBHOOK_DOMAIN}")"
 
   echo
   echo "Acessos principais (você define):"
@@ -276,7 +291,9 @@ services:
       - traefik.http.routers.portainer.entrypoints=websecure
       - traefik.http.routers.portainer.tls.certresolver=le
       - traefik.http.routers.portainer.middlewares=auth@file
-      - traefik.http.services.portainer.loadbalancer.server.port=9000
+      - traefik.http.routers.portainer.service=portainer
+      - traefik.http.services.portainer.loadbalancer.server.port=9443
+      - traefik.http.services.portainer.loadbalancer.server.scheme=https
 
   postgres-evolution:
     image: postgres:16-alpine
@@ -448,10 +465,16 @@ verify_installation() {
     "https://${MINIO_S3_DOMAIN}" \
     "https://${N8N_EDITOR_DOMAIN}" \
     "https://${N8N_WEBHOOK_DOMAIN}"; do
-    if curl -kIsS --max-time 20 "${url}" >/dev/null; then
-      ok "URL respondeu (DNS/TLS/HTTP OK): ${url}"
+    local status
+    status="$(curl -kIsS --max-time 20 -o /dev/null -w '%{http_code}' "${url}" || true)"
+
+    if [[ "${status}" =~ ^(200|301|302|307|308|401|403)$ ]]; then
+      ok "URL respondeu (${status}): ${url}"
+    elif [[ "${status}" == "404" ]]; then
+      warn "URL respondeu com 404 (roteamento/domínio incorreto): ${url}"
+      failed=1
     else
-      warn "URL não acessível (DNS/TLS/conexão): ${url}"
+      warn "URL não acessível ou inesperada (HTTP ${status:-erro}): ${url}"
       failed=1
     fi
   done
