@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.4
+## SETUP PERSONALIZADO HUBLABEL v1.2
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -288,7 +288,7 @@ stack_editavel() {
 coletar_informacoes() {
     clear
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}                                       SETUP HUBLABEL 1.4                                           ${reset}"
+    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.2 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
@@ -452,28 +452,40 @@ email = sys.argv[2]
 with open('/root/traefik.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   traefik:
-    image: traefik:latest
+    image: traefik:v3.5.3  ## Versão do Traefik
     command:
       - "--api.dashboard=true"
       - "--providers.swarm=true"
       - "--providers.swarm.endpoint=unix:///var/run/docker.sock"
       - "--providers.swarm.exposedbydefault=false"
-      - "--providers.swarm.network={rede}"
+      - "--providers.swarm.network={rede}"  ## Nome da rede interna
       - "--entrypoints.web.address=:80"
       - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
       - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
       - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
       - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.transport.respondingTimeouts.idleTimeout=3600"
       - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge=true"
       - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.letsencryptresolver.acme.storage=/etc/traefik/letsencrypt/acme.json"
-      - "--certificatesresolvers.letsencryptresolver.acme.email={email}"
-      - "--log.level=INFO"
+      - "--certificatesresolvers.letsencryptresolver.acme.email={email}"  ## Email para receber as notificações
+      - "--log.level=DEBUG"
+      - "--log.format=common"
+      - "--log.filePath=/var/log/traefik/traefik.log"
+      - "--accesslog=true"
+      - "--accesslog.filepath=/var/log/traefik/access-log"
+
     volumes:
       - vol_certificates:/etc/traefik/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [ {rede} ]
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
     ports:
       - target: 80
         published: 80
@@ -481,25 +493,39 @@ services:
       - target: 443
         published: 443
         mode: host
+
     deploy:
-      placement: {{ constraints: [node.role == manager] }}
+      placement:
+        constraints:
+          - node.role == manager
       labels:
         - traefik.enable=true
         - traefik.http.middlewares.redirect-https.redirectscheme.scheme=https
         - traefik.http.middlewares.redirect-https.redirectscheme.permanent=true
         - "traefik.http.routers.http-catchall.rule=Host(`{{host:.+}}`)"
         - traefik.http.routers.http-catchall.entrypoints=web
-        - traefik.http.routers.http-catchall.middlewares=redirect-https@swarm
+        - traefik.http.routers.http-catchall.middlewares=redirect-https@docker
         - traefik.http.routers.http-catchall.priority=1
+
+## --------------------------- HUBLABEL --------------------------- ##
+
 volumes:
-  vol_shared: {{ external: true, name: volume_swarm_shared }}
-  vol_certificates: {{ external: true, name: volume_swarm_certificates }}
+  vol_shared:
+    external: true
+    name: volume_swarm_shared
+  vol_certificates:
+    external: true
+    name: volume_swarm_certificates
+
 networks:
-  {rede}: {{ external: true, attachable: true, name: {rede} }}
+  {rede}:  ## Nome da rede interna
+    external: true
+    attachable: true
+    name: {rede}  ## Nome da rede interna
 ''')
 PYEOF
 
-    pull traefik:latest
+    pull traefik:v3.5.3
     docker stack deploy --prune --resolve-image always -c traefik.yaml traefik
     wait_stack traefik_traefik
     wait_30_sec
@@ -512,33 +538,65 @@ rede = sys.argv[2]
 with open('/root/portainer.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   agent:
-    image: portainer/agent:latest
-    volumes: [ /var/run/docker.sock:/var/run/docker.sock, /var/lib/docker/volumes:/var/lib/docker/volumes ]
-    networks: [ {rede} ]
-    deploy: {{ mode: global, placement: {{ constraints: [node.platform.os == linux] }} }}
+    image: portainer/agent:latest  ## Versão Agent do Portainer
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.platform.os == linux
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   portainer:
-    image: portainer/portainer-ce:latest
+    image: portainer/portainer-ce:latest  ## Versão do Portainer
     command: -H tcp://tasks.agent:9001 --tlsskipverify
-    volumes: [ portainer_data:/data ]
-    networks: [ {rede} ]
+
+    volumes:
+      - portainer_data:/data
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
     deploy:
       mode: replicated
       replicas: 1
-      placement: {{ constraints: [node.role == manager] }}
+      placement:
+        constraints:
+          - node.role == manager
       labels:
         - traefik.enable=true
-        - traefik.http.routers.portainer.rule=Host(`{url}`)
+        - traefik.http.routers.portainer.rule=Host(`{url}`)  ## Dominio do Portainer
         - traefik.http.services.portainer.loadbalancer.server.port=9000
         - traefik.http.routers.portainer.tls.certresolver=letsencryptresolver
         - traefik.http.routers.portainer.service=portainer
-        - traefik.swarm.network={rede}
+        - traefik.docker.network={rede}  ## Nome da rede interna
         - traefik.http.routers.portainer.entrypoints=websecure
         - traefik.http.routers.portainer.priority=1
+
+## --------------------------- HUBLABEL --------------------------- ##
+
 volumes:
-  portainer_data: {{ external: true, name: portainer_data }}
+  portainer_data:
+    external: true
+    name: portainer_data
+
 networks:
-  {rede}: {{ external: true, attachable: true, name: {rede} }}
+  {rede}:  ## Nome da rede interna
+    external: true
+    attachable: true
+    name: {rede}  ## Nome da rede interna
 ''')
 PYEOF
 
@@ -592,22 +650,56 @@ rede, pgpass = sys.argv[1], sys.argv[2]
 with open('/root/postgres.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   postgres:
-    image: postgres:14
-    command: postgres -c max_connections=500 -c timezone=America/Sao_Paulo
-    volumes: [ postgres_data:/var/lib/postgresql/data ]
-    networks: [ {rede} ]
+    image: postgres:14  ## Versão do postgres
+    command:
+      - postgres
+      - -c max_connections=500
+      - -c shared_buffers=64MB
+      - -c timezone=America/Sao_Paulo
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
+    ## Descomente as linhas abaixo para uso externo
+    #ports:
+    #  - 5432:5432
+
     environment:
-      POSTGRES_PASSWORD: {pgpass}
-      TZ: America/Sao_Paulo
+    ## Senha do Postgres
+      - POSTGRES_PASSWORD={pgpass}
+
+    ## Timezone
+      - TZ=America/Sao_Paulo
+
     deploy:
       mode: replicated
       replicas: 1
-      placement: {{ constraints: [node.role == manager] }}
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+## --------------------------- HUBLABEL --------------------------- ##
+
 volumes:
-  postgres_data: {{ external: true, name: postgres_data }}
+  postgres_data:
+    external: true
+    name: postgres_data
+
 networks:
-  {rede}: {{ external: true, name: {rede} }}
+  {rede}:  ## Nome da rede interna
+    external: true
+    name: {rede}  ## Nome da rede interna
 ''')
 PYEOF
 
