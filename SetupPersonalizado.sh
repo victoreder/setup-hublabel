@@ -87,36 +87,53 @@ ask_secret() {
   done
 }
 
+ask_default() {
+  local prompt="$1"
+  local var_name="$2"
+  local default_value="$3"
+  local value
+  read -r -p "${prompt} [${default_value}]: " value
+  value="${value:-${default_value}}"
+  printf -v "$var_name" '%s' "$value"
+}
+
+generate_secret() {
+  openssl rand -base64 36 | tr -dc 'A-Za-z0-9@#%+=._-' | head -c 28
+}
+
 collect_inputs() {
   print_header
   echo -e "${YELLOW}Etapa 1/5 - Coleta de informações (tudo no início)${RESET}"
+  echo -e "${BLUE}Informe domínios e senhas principais. Segredos internos serão gerados automaticamente.${RESET}"
   echo
 
-  ask "Nome do servidor (ex: vps-producao): " SERVER_NAME
-  ask "Timezone (ex: America/Sao_Paulo): " TZ_VALUE
+  SERVER_NAME="$(hostname)"
+  ask_default "Timezone" TZ_VALUE "America/Sao_Paulo"
   ask "E-mail para Let's Encrypt (Traefik): " LETSENCRYPT_EMAIL
 
   echo
   echo "Domínios públicos apontando para esta VPS:"
   ask "- Portainer (ex: portainer.seudominio.com): " PORTAINER_DOMAIN
   ask "- Evolution API (ex: evolution.seudominio.com): " EVOLUTION_DOMAIN
-  ask "- MinIO Console (ex: minio.seudominio.com): " MINIO_DOMAIN
-  ask "- n8n (ex: n8n.seudominio.com): " N8N_DOMAIN
+  ask "- MinIO Console (ex: minio.seudominio.com): " MINIO_CONSOLE_DOMAIN
+  ask "- MinIO S3/API (ex: s3.seudominio.com): " MINIO_S3_DOMAIN
+  ask "- n8n Editor (ex: n8n.seudominio.com): " N8N_EDITOR_DOMAIN
+  ask "- n8n Webhook (ex: hook.seudominio.com): " N8N_WEBHOOK_DOMAIN
 
   echo
-  echo "Credenciais:"
-  ask "- Usuário admin básico (HTTP Auth para Traefik/Portainer): " ADMIN_USER
-  ask_secret "- Senha admin básico: " ADMIN_PASSWORD
-  ask "- E-mail admin do n8n: " N8N_ADMIN_EMAIL
-  ask_secret "- Senha admin do n8n: " N8N_ADMIN_PASSWORD
-  ask_secret "- Chave de criptografia do n8n (N8N_ENCRYPTION_KEY): " N8N_ENCRYPTION_KEY
-
-  ask "- MinIO Root User: " MINIO_ROOT_USER
+  echo "Acessos principais (você define):"
+  ask_default "- Usuário admin para Basic Auth (Traefik/Portainer)" ADMIN_USER "admin"
+  ask_secret "- Senha admin do Basic Auth: " ADMIN_PASSWORD
+  ask_default "- E-mail login do n8n (Basic Auth)" N8N_ADMIN_EMAIL "admin@${N8N_EDITOR_DOMAIN}"
+  ask_secret "- Senha login do n8n (Basic Auth): " N8N_ADMIN_PASSWORD
+  ask_default "- MinIO Root User" MINIO_ROOT_USER "minioadmin"
   ask_secret "- MinIO Root Password: " MINIO_ROOT_PASSWORD
 
-  ask "- Evolution API AUTHENTICATION_API_KEY: " EVOLUTION_API_KEY
-  ask_secret "- Senha PostgreSQL (Evolution): " EVOLUTION_DB_PASSWORD
-  ask_secret "- Senha Redis (Evolution): " EVOLUTION_REDIS_PASSWORD
+  # Segredos internos gerados automaticamente
+  N8N_ENCRYPTION_KEY="$(generate_secret)$(generate_secret)"
+  EVOLUTION_API_KEY="$(generate_secret)$(generate_secret)"
+  EVOLUTION_DB_PASSWORD="$(generate_secret)"
+  EVOLUTION_REDIS_PASSWORD="$(generate_secret)"
 
   echo
   echo -e "${BLUE}Resumo rápido:${RESET}"
@@ -126,13 +143,18 @@ Timezone: ${TZ_VALUE}
 Email LE: ${LETSENCRYPT_EMAIL}
 Portainer: ${PORTAINER_DOMAIN}
 Evolution: ${EVOLUTION_DOMAIN}
-MinIO: ${MINIO_DOMAIN}
-n8n: ${N8N_DOMAIN}
+MinIO Console: ${MINIO_CONSOLE_DOMAIN}
+MinIO S3/API: ${MINIO_S3_DOMAIN}
+n8n Editor: ${N8N_EDITOR_DOMAIN}
+n8n Webhook: ${N8N_WEBHOOK_DOMAIN}
+Usuário Basic Auth: ${ADMIN_USER}
+Usuário MinIO: ${MINIO_ROOT_USER}
 SUMMARY
   echo
   read -r -p "Confirmar e seguir instalação? (y/N): " confirm
   [[ "${confirm,,}" == "y" ]] || die "Instalação cancelada pelo usuário."
 }
+
 
 install_dependencies() {
   echo
@@ -190,8 +212,10 @@ LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
 
 PORTAINER_DOMAIN=${PORTAINER_DOMAIN}
 EVOLUTION_DOMAIN=${EVOLUTION_DOMAIN}
-MINIO_DOMAIN=${MINIO_DOMAIN}
-N8N_DOMAIN=${N8N_DOMAIN}
+MINIO_CONSOLE_DOMAIN=${MINIO_CONSOLE_DOMAIN}
+MINIO_S3_DOMAIN=${MINIO_S3_DOMAIN}
+N8N_EDITOR_DOMAIN=${N8N_EDITOR_DOMAIN}
+N8N_WEBHOOK_DOMAIN=${N8N_WEBHOOK_DOMAIN}
 
 ADMIN_USER=${ADMIN_USER}
 BASIC_AUTH_HASH=${BASIC_AUTH_HASH}
@@ -285,10 +309,17 @@ services:
     environment:
       SERVER_URL: https://${EVOLUTION_DOMAIN}
       AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      LANGUAGE: pt-BR
       DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
       DATABASE_CONNECTION_URI: postgresql://evolution:${EVOLUTION_DB_PASSWORD}@postgres-evolution:5432/evolution
-      REDIS_ENABLED: "true"
-      REDIS_URI: redis://:${EVOLUTION_REDIS_PASSWORD}@redis-evolution:6379
+      DATABASE_CONNECTION_CLIENT_NAME: evolution
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: redis://:${EVOLUTION_REDIS_PASSWORD}@redis-evolution:6379/1
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_LOCAL_ENABLED: "false"
+      N8N_ENABLED: "true"
       TZ: ${TZ}
     depends_on:
       - postgres-evolution
@@ -310,6 +341,8 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BROWSER_REDIRECT_URL: https://${MINIO_CONSOLE_DOMAIN}
+      MINIO_SERVER_URL: https://${MINIO_S3_DOMAIN}
       TZ: ${TZ}
     volumes:
       - ./minio:/data
@@ -317,22 +350,30 @@ services:
       - proxy
     labels:
       - traefik.enable=true
-      - traefik.http.routers.minio.rule=Host(`${MINIO_DOMAIN}`)
-      - traefik.http.routers.minio.entrypoints=websecure
-      - traefik.http.routers.minio.tls.certresolver=le
-      - traefik.http.services.minio.loadbalancer.server.port=9001
+      - traefik.http.routers.minio-console.rule=Host(`${MINIO_CONSOLE_DOMAIN}`)
+      - traefik.http.routers.minio-console.entrypoints=websecure
+      - traefik.http.routers.minio-console.tls.certresolver=le
+      - traefik.http.routers.minio-console.service=minio-console
+      - traefik.http.services.minio-console.loadbalancer.server.port=9001
+      - traefik.http.routers.minio-s3.rule=Host(`${MINIO_S3_DOMAIN}`)
+      - traefik.http.routers.minio-s3.entrypoints=websecure
+      - traefik.http.routers.minio-s3.tls.certresolver=le
+      - traefik.http.routers.minio-s3.service=minio-s3
+      - traefik.http.services.minio-s3.loadbalancer.server.port=9000
 
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
     restart: unless-stopped
     environment:
-      N8N_HOST: ${N8N_DOMAIN}
+      N8N_HOST: ${N8N_EDITOR_DOMAIN}
       N8N_PORT: 5678
       N8N_PROTOCOL: https
-      WEBHOOK_URL: https://${N8N_DOMAIN}/
-      N8N_EDITOR_BASE_URL: https://${N8N_DOMAIN}/
+      N8N_PROXY_HOPS: 1
+      WEBHOOK_URL: https://${N8N_WEBHOOK_DOMAIN}/
+      N8N_EDITOR_BASE_URL: https://${N8N_EDITOR_DOMAIN}/
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_ONBOARDING_FLOW_DISABLED: "true"
       N8N_RUNNERS_ENABLED: "true"
       N8N_SECURE_COOKIE: "true"
       N8N_BASIC_AUTH_ACTIVE: "true"
@@ -346,9 +387,14 @@ services:
       - proxy
     labels:
       - traefik.enable=true
-      - traefik.http.routers.n8n.rule=Host(`${N8N_DOMAIN}`)
-      - traefik.http.routers.n8n.entrypoints=websecure
-      - traefik.http.routers.n8n.tls.certresolver=le
+      - traefik.http.routers.n8n-editor.rule=Host(`${N8N_EDITOR_DOMAIN}`)
+      - traefik.http.routers.n8n-editor.entrypoints=websecure
+      - traefik.http.routers.n8n-editor.tls.certresolver=le
+      - traefik.http.routers.n8n-editor.service=n8n
+      - traefik.http.routers.n8n-webhook.rule=Host(`${N8N_WEBHOOK_DOMAIN}`)
+      - traefik.http.routers.n8n-webhook.entrypoints=websecure
+      - traefik.http.routers.n8n-webhook.tls.certresolver=le
+      - traefik.http.routers.n8n-webhook.service=n8n
       - traefik.http.services.n8n.loadbalancer.server.port=5678
 
 networks:
@@ -395,11 +441,17 @@ verify_installation() {
 
   sleep 8
 
-  for url in "https://${PORTAINER_DOMAIN}" "https://${EVOLUTION_DOMAIN}" "https://${MINIO_DOMAIN}" "https://${N8N_DOMAIN}"; do
-    if curl -kfsS --max-time 20 "${url}" >/dev/null; then
-      ok "URL respondeu: ${url}"
+  for url in \
+    "https://${PORTAINER_DOMAIN}" \
+    "https://${EVOLUTION_DOMAIN}" \
+    "https://${MINIO_CONSOLE_DOMAIN}" \
+    "https://${MINIO_S3_DOMAIN}" \
+    "https://${N8N_EDITOR_DOMAIN}" \
+    "https://${N8N_WEBHOOK_DOMAIN}"; do
+    if curl -kIsS --max-time 20 "${url}" >/dev/null; then
+      ok "URL respondeu (DNS/TLS/HTTP OK): ${url}"
     else
-      warn "URL ainda não respondeu (DNS/SSL propagação?): ${url}"
+      warn "URL não acessível (DNS/TLS/conexão): ${url}"
       failed=1
     fi
   done
@@ -418,8 +470,21 @@ verify_installation() {
 Acessos:
 - Portainer: https://${PORTAINER_DOMAIN}
 - Evolution: https://${EVOLUTION_DOMAIN}
-- MinIO Console: https://${MINIO_DOMAIN}
-- n8n: https://${N8N_DOMAIN}
+- MinIO Console: https://${MINIO_CONSOLE_DOMAIN}
+- MinIO S3/API: https://${MINIO_S3_DOMAIN}
+- n8n Editor: https://${N8N_EDITOR_DOMAIN}
+- n8n Webhook: https://${N8N_WEBHOOK_DOMAIN}
+
+Credenciais definidas por você:
+- BASIC AUTH (Traefik/Portainer): ${ADMIN_USER} / ${ADMIN_PASSWORD}
+- n8n BASIC AUTH: ${N8N_ADMIN_EMAIL} / ${N8N_ADMIN_PASSWORD}
+- MinIO: ${MINIO_ROOT_USER} / ${MINIO_ROOT_PASSWORD}
+
+Segredos gerados automaticamente:
+- Evolution API KEY: ${EVOLUTION_API_KEY}
+- Evolution PostgreSQL PASSWORD: ${EVOLUTION_DB_PASSWORD}
+- Evolution Redis PASSWORD: ${EVOLUTION_REDIS_PASSWORD}
+- n8n ENCRYPTION KEY: ${N8N_ENCRYPTION_KEY}
 
 Arquivos:
 - Compose: ${COMPOSE_FILE}
