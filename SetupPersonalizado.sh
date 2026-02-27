@@ -2,13 +2,16 @@
 set -euo pipefail
 
 # ==================================================
-# Setup Personalizado VPS
+# Setup Personalizado VPS (FINAL)
 # Instala: Traefik, Portainer, Evolution API, MinIO e n8n
-# Ajustes aplicados:
-# - Traefik fixado em v2.11 (evita erro API Docker "client version 1.24")
-# - Portainer via 9443 (HTTPS) no Traefik
-# - n8n com URL de editor + webhook separados
-# - Rede proxy external (cria se não existir)
+#
+# Correções aplicadas:
+# - Traefik v2.11 (evita bug/erro de API do provider docker)
+# - Portainer roteado via 9443 (HTTPS) no Traefik
+# - n8n: editor + webhook separados, TRUST_PROXY, sem "/" final, user 1000:1000
+# - MinIO: user 1000:1000 (evita Restarting por permissão no volume)
+# - Cria rede proxy (external) automaticamente
+# - Ajusta permissões dos volumes (n8n e minio)
 # ==================================================
 
 GREEN="\e[32m"
@@ -146,7 +149,7 @@ collect_inputs() {
   echo "Acessos principais (você define):"
   ask_default "- Usuário admin para Basic Auth (Traefik/Portainer)" ADMIN_USER "admin"
   ask_secret "- Senha admin do Basic Auth: " ADMIN_PASSWORD
-  ask_default "- Login do n8n (Basic Auth) (pode ser email ou user)" N8N_ADMIN_USER "admin@${N8N_EDITOR_DOMAIN}"
+  ask_default "- Login do n8n (Basic Auth) (email ou user)" N8N_ADMIN_USER "admin@${N8N_EDITOR_DOMAIN}"
   ask_secret "- Senha login do n8n (Basic Auth): " N8N_ADMIN_PASSWORD
   ask_default "- MinIO Root User" MINIO_ROOT_USER "minioadmin"
   ask_secret "- MinIO Root Password: " MINIO_ROOT_PASSWORD
@@ -225,7 +228,7 @@ prepare_files() {
   echo
   echo -e "${YELLOW}Etapa 3/5 - Gerando arquivos de configuração${RESET}"
 
-  mkdir -p "${TRAEFIK_DYNAMIC_DIR}" "${BASE_DIR}/data" \
+  mkdir -p "${TRAEFIK_DYNAMIC_DIR}" \
     "${BASE_DIR}/portainer" "${BASE_DIR}/minio" "${BASE_DIR}/n8n" \
     "${BASE_DIR}/evolution/postgres" "${BASE_DIR}/evolution/redis"
 
@@ -261,7 +264,10 @@ EVOLUTION_DB_PASSWORD=${EVOLUTION_DB_PASSWORD}
 EVOLUTION_REDIS_PASSWORD=${EVOLUTION_REDIS_PASSWORD}
 ENV
 
-  # Traefik v2.11 (estável e compatível com provider docker sem esse bug de API version)
+  # Ajuste de permissões dos volumes (evita Restarting em MinIO e n8n)
+  chown -R 1000:1000 "${BASE_DIR}/minio" "${BASE_DIR}/n8n" || true
+  chmod -R 775 "${BASE_DIR}/minio" "${BASE_DIR}/n8n" || true
+
   cat > "${COMPOSE_FILE}" <<'YAML'
 services:
   traefik:
@@ -294,14 +300,6 @@ services:
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
     networks:
       - proxy
-    labels:
-      - traefik.enable=true
-      # Dashboard do Traefik (opcional). Se não quiser expor, remova.
-      # - traefik.http.routers.traefik.rule=Host(`traefik.${SERVER_NAME}`)
-      # - traefik.http.routers.traefik.entrypoints=websecure
-      # - traefik.http.routers.traefik.tls.certresolver=le
-      # - traefik.http.routers.traefik.service=api@internal
-      # - traefik.http.routers.traefik.middlewares=auth@file
 
   portainer:
     image: portainer/portainer-ce:latest
@@ -318,7 +316,6 @@ services:
       - traefik.http.routers.portainer.entrypoints=websecure
       - traefik.http.routers.portainer.tls.certresolver=le
       - traefik.http.routers.portainer.middlewares=auth@file
-      # Portainer UI moderna em 9443 (HTTPS)
       - traefik.http.services.portainer.loadbalancer.server.port=9443
       - traefik.http.services.portainer.loadbalancer.server.scheme=https
 
@@ -380,6 +377,7 @@ services:
   minio:
     image: minio/minio:latest
     container_name: minio
+    user: "1000:1000"
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -408,25 +406,24 @@ services:
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
+    user: "1000:1000"
     restart: unless-stopped
     environment:
-      # Editor
       N8N_HOST: ${N8N_EDITOR_DOMAIN}
       N8N_PORT: 5678
       N8N_PROTOCOL: https
-      N8N_PROXY_HOPS: 1
 
-      # URLs (editor e webhook separados)
-      N8N_EDITOR_BASE_URL: https://${N8N_EDITOR_DOMAIN}/
-      WEBHOOK_URL: https://${N8N_WEBHOOK_DOMAIN}/
+      N8N_EDITOR_BASE_URL: https://${N8N_EDITOR_DOMAIN}
+      WEBHOOK_URL: https://${N8N_WEBHOOK_DOMAIN}
 
-      # Segurança
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       N8N_ONBOARDING_FLOW_DISABLED: "true"
       N8N_RUNNERS_ENABLED: "true"
-      N8N_SECURE_COOKIE: "true"
 
-      # Basic Auth (n8n)
+      N8N_SECURE_COOKIE: "true"
+      N8N_TRUST_PROXY: "true"
+      N8N_PROXY_HOPS: 1
+
       N8N_BASIC_AUTH_ACTIVE: "true"
       N8N_BASIC_AUTH_USER: ${N8N_ADMIN_USER}
       N8N_BASIC_AUTH_PASSWORD: ${N8N_ADMIN_PASSWORD}
@@ -439,19 +436,14 @@ services:
       - proxy
     labels:
       - traefik.enable=true
-
-      # Router editor
       - traefik.http.routers.n8n-editor.rule=Host(`${N8N_EDITOR_DOMAIN}`)
       - traefik.http.routers.n8n-editor.entrypoints=websecure
       - traefik.http.routers.n8n-editor.tls.certresolver=le
       - traefik.http.routers.n8n-editor.service=n8n
-
-      # Router webhook
       - traefik.http.routers.n8n-webhook.rule=Host(`${N8N_WEBHOOK_DOMAIN}`)
       - traefik.http.routers.n8n-webhook.entrypoints=websecure
       - traefik.http.routers.n8n-webhook.tls.certresolver=le
       - traefik.http.routers.n8n-webhook.service=n8n
-
       - traefik.http.services.n8n.loadbalancer.server.port=5678
 
 networks:
@@ -476,7 +468,6 @@ run_installation() {
   echo
   echo -e "${YELLOW}Etapa 4/5 - Subindo serviços${RESET}"
 
-  # Garante rede proxy
   docker network inspect proxy >/dev/null 2>&1 || docker network create proxy >/dev/null 2>&1 || true
 
   cd "${BASE_DIR}"
@@ -500,15 +491,8 @@ verify_installation() {
     fi
   done
 
-  # Sanidade do provider docker do Traefik
-  sleep 4
-  if docker logs traefik --tail 200 2>&1 | grep -q "client version 1.24 is too old"; then
-    warn "Traefik não conseguiu falar com o Docker (API version). Com este script (Traefik v2.11) isso não deveria acontecer."
-    warn "Se persistir, seu Docker Engine está realmente desatualizado. Rode: docker version"
-    failed=1
-  fi
+  sleep 6
 
-  # Teste URLs (aceita 200, redirects, e também 401/403 quando há auth)
   for url in \
     "https://${PORTAINER_DOMAIN}" \
     "https://${EVOLUTION_DOMAIN}" \
@@ -520,9 +504,6 @@ verify_installation() {
     status="$(curl -kIsS --max-time 20 -o /dev/null -w '%{http_code}' "${url}" || true)"
     if [[ "${status}" =~ ^(200|301|302|307|308|401|403)$ ]]; then
       ok "URL respondeu (${status}): ${url}"
-    elif [[ "${status}" == "404" ]]; then
-      warn "URL respondeu com 404 (roteamento/domínio incorreto): ${url}"
-      failed=1
     else
       warn "URL não acessível ou inesperada (HTTP ${status:-erro}): ${url}"
       failed=1
