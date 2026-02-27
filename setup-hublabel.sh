@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.1
+## SETUP PERSONALIZADO HUBLABEL v1.2
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -239,7 +239,7 @@ stack_editavel() {
 coletar_informacoes() {
     clear
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.1 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
+    echo -e "${amarelo}              SETUP PERSONALIZADO HUBLABEL v1.2 - Coleta de Informações (TUDO NO INÍCIO)               ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
@@ -600,15 +600,56 @@ services:
       SERVER_URL: https://{url}
       AUTHENTICATION_API_KEY: {apikey}
       AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      DEL_INSTANCE: "false"
+      QRCODE_LIMIT: "1902"
       LANGUAGE: pt-BR
+      CONFIG_SESSION_PHONE_CLIENT: SetupOrion
+      CONFIG_SESSION_PHONE_NAME: Chrome
       DATABASE_ENABLED: "true"
       DATABASE_PROVIDER: postgresql
       DATABASE_CONNECTION_URI: postgresql://postgres:{pgpass}@postgres:5432/evolution
       DATABASE_CONNECTION_CLIENT_NAME: evolution
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+      DATABASE_SAVE_DATA_LABELS: "true"
+      DATABASE_SAVE_DATA_HISTORIC: "true"
+      N8N_ENABLED: "true"
+      EVOAI_ENABLED: "true"
+      OPENAI_ENABLED: "true"
+      DIFY_ENABLED: "true"
+      TYPEBOT_ENABLED: "true"
+      TYPEBOT_API_VERSION: latest
+      CHATWOOT_ENABLED: "true"
+      CHATWOOT_MESSAGE_READ: "true"
+      CHATWOOT_MESSAGE_DELETE: "true"
       CACHE_REDIS_ENABLED: "true"
       CACHE_REDIS_URI: redis://evolution_redis:6379/1
+      CACHE_REDIS_PREFIX_KEY: evolution
+      CACHE_REDIS_SAVE_INSTANCES: "false"
       CACHE_LOCAL_ENABLED: "false"
-      N8N_ENABLED: "true"
+      S3_ENABLED: "false"
+      S3_ACCESS_KEY: ""
+      S3_SECRET_KEY: ""
+      S3_BUCKET: evolution
+      S3_PORT: "443"
+      S3_ENDPOINT: ""
+      S3_USE_SSL: "true"
+      WA_BUSINESS_TOKEN_WEBHOOK: evolution
+      WA_BUSINESS_URL: https://graph.facebook.com
+      WA_BUSINESS_VERSION: v23.0
+      WA_BUSINESS_LANGUAGE: pt_BR
+      TELEMETRY: "false"
+      WEBSOCKET_ENABLED: "false"
+      SQS_ENABLED: "false"
+      RABBITMQ_ENABLED: "false"
+      RABBITMQ_URI: amqp://USER:PASS@rabbitmq:5672/evolution
+      RABBITMQ_EXCHANGE_NAME: evolution
+      WEBHOOK_GLOBAL_ENABLED: "false"
+      PROVIDER_ENABLED: "false"
+      PROVIDER_PREFIX: evolution
       TZ: America/Sao_Paulo
     deploy:
       mode: replicated
@@ -618,8 +659,12 @@ services:
         - traefik.enable=true
         - traefik.http.routers.evolution.rule=Host(`{url}`)
         - traefik.http.routers.evolution.entrypoints=websecure
+        - traefik.http.routers.evolution.priority=1
         - traefik.http.routers.evolution.tls.certresolver=letsencryptresolver
-        - traefik.http.services.evolution.loadbalancer.server.port=8080
+        - traefik.http.routers.evolution.service=evolution_api
+        - traefik.http.services.evolution_api.loadbalancer.server.port=8080
+        - traefik.http.services.evolution_api.loadbalancer.passHostHeader=true
+        - traefik.swarm.network={rede}
   evolution_redis:
     image: redis:latest
     command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
@@ -677,10 +722,15 @@ services:
         - traefik.http.routers.minio_public.entrypoints=websecure
         - traefik.http.routers.minio_public.tls.certresolver=letsencryptresolver
         - traefik.http.services.minio_public.loadbalancer.server.port=9000
+        - traefik.http.services.minio_public.loadbalancer.passHostHeader=true
+        - traefik.http.routers.minio_public.service=minio_public
         - traefik.http.routers.minio_console.rule=Host(`{url_minio}`)
         - traefik.http.routers.minio_console.entrypoints=websecure
         - traefik.http.routers.minio_console.tls.certresolver=letsencryptresolver
         - traefik.http.services.minio_console.loadbalancer.server.port=9001
+        - traefik.http.services.minio_console.loadbalancer.passHostHeader=true
+        - traefik.http.routers.minio_console.service=minio_console
+        - traefik.swarm.network={rede}
 volumes:
   minio_data: {{ external: true, name: minio_data }}
 networks:
@@ -736,15 +786,39 @@ services:
       N8N_PROTOCOL: https
       N8N_PROXY_HOPS: 1
       N8N_ONBOARDING_FLOW_DISABLED: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_SKIP_AUTH_ON_OAUTH_CALLBACK: "false"
+      NODE_ENV: production
       EXECUTIONS_MODE: queue
+      EXECUTIONS_TIMEOUT: "3600"
+      EXECUTIONS_TIMEOUT_MAX: "7200"
+      OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_RUNNERS_MODE: internal
+      N8N_RESTRICT_FILE_ACCESS_TO: "~/.n8n-files"
+      NODES_EXCLUDE: "[]"
+      N8N_REINSTALL_MISSING_PACKAGES: "true"
+      N8N_COMMUNITY_PACKAGES_ENABLED: "true"
+      N8N_NODE_PATH: /home/node/.n8n/nodes
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
       QUEUE_BULL_REDIS_HOST: n8n_redis
       QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_BULL_REDIS_DB: 1
       N8N_SMTP_SENDER: {smtp_sender}
       N8N_SMTP_USER: {smtp_user}
       N8N_SMTP_PASS: {smtp_pass}
       N8N_SMTP_HOST: {smtp_host}
       N8N_SMTP_PORT: {smtp_port}
       N8N_SMTP_SSL: {smtp_ssl}
+      N8N_METRICS: "true"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"
+      N8N_AI_ENABLED: "false"
+      N8N_AI_PROVIDER: openai
+      N8N_AI_OPENAI_API_KEY: ""
+      NODE_FUNCTION_ALLOW_BUILTIN: "*"
+      NODE_FUNCTION_ALLOW_EXTERNAL: moment,lodash
+      GENERIC_TIMEZONE: America/Sao_Paulo
       TZ: America/Sao_Paulo
     deploy:
       mode: replicated
@@ -754,8 +828,12 @@ services:
         - traefik.enable=true
         - traefik.http.routers.n8n_editor.rule=Host(`{url_ed}`)
         - traefik.http.routers.n8n_editor.entrypoints=websecure
+        - traefik.http.routers.n8n_editor.priority=10
         - traefik.http.routers.n8n_editor.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.n8n_editor.service=n8n_editor
         - traefik.http.services.n8n_editor.loadbalancer.server.port=5678
+        - traefik.http.services.n8n_editor.loadbalancer.passHostHeader=1
+        - traefik.swarm.network={rede}
   n8n_webhook:
     image: n8nio/n8n:latest
     command: webhook
@@ -770,15 +848,27 @@ services:
       DB_POSTGRESDB_PASSWORD: {pgpass}
       N8N_ENCRYPTION_KEY: {enc}
       N8N_HOST: {url_ed}
+      N8N_EDITOR_BASE_URL: https://{url_ed}/
       WEBHOOK_URL: https://{url_wh}/
       N8N_PROTOCOL: https
+      N8N_PROXY_HOPS: 1
+      N8N_ONBOARDING_FLOW_DISABLED: "true"
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      N8N_SKIP_AUTH_ON_OAUTH_CALLBACK: "false"
+      NODE_ENV: production
+      EXECUTIONS_MODE: queue
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_RUNNERS_MODE: internal
       QUEUE_BULL_REDIS_HOST: n8n_redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_BULL_REDIS_DB: 1
       N8N_SMTP_SENDER: {smtp_sender}
       N8N_SMTP_USER: {smtp_user}
       N8N_SMTP_PASS: {smtp_pass}
       N8N_SMTP_HOST: {smtp_host}
       N8N_SMTP_PORT: {smtp_port}
       N8N_SMTP_SSL: {smtp_ssl}
+      N8N_METRICS: "true"
       TZ: America/Sao_Paulo
     deploy:
       mode: replicated
@@ -788,19 +878,33 @@ services:
         - traefik.enable=true
         - traefik.http.routers.n8n_webhook.rule=Host(`{url_wh}`)
         - traefik.http.routers.n8n_webhook.entrypoints=websecure
+        - traefik.http.routers.n8n_webhook.priority=5
         - traefik.http.routers.n8n_webhook.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.n8n_webhook.service=n8n_webhook
         - traefik.http.services.n8n_webhook.loadbalancer.server.port=5678
+        - traefik.http.services.n8n_webhook.loadbalancer.passHostHeader=1
+        - traefik.swarm.network={rede}
   n8n_worker:
     image: n8nio/n8n:latest
     command: worker --concurrency=10
     networks: [ {rede} ]
     environment:
+      N8N_FIX_MIGRATIONS: "true"
       DB_TYPE: postgresdb
       DB_POSTGRESDB_DATABASE: n8n_queue
       DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_USER: postgres
       DB_POSTGRESDB_PASSWORD: {pgpass}
       N8N_ENCRYPTION_KEY: {enc}
+      N8N_HOST: {url_ed}
+      N8N_EDITOR_BASE_URL: https://{url_ed}/
+      WEBHOOK_URL: https://{url_wh}/
+      N8N_PROTOCOL: https
       QUEUE_BULL_REDIS_HOST: n8n_redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      N8N_RUNNERS_ENABLED: "true"
+      N8N_RUNNERS_MODE: internal
       TZ: America/Sao_Paulo
     deploy: {{ mode: replicated, replicas: 1, placement: {{ constraints: [node.role == manager] }} }}
   n8n_redis:
@@ -817,7 +921,8 @@ networks:
 PYEOF
 
     STACK_NAME="n8n"
-    stack_editavel
+    stack_editavel || { echo -e "${vermelho}Erro ao criar stack N8N. Verifique o Portainer.${reset}"; return 1; }
+    wait_stack n8n_n8n_editor n8n_n8n_webhook
     echo -e "${verde}✓ N8N instalado${reset}"
 }
 
