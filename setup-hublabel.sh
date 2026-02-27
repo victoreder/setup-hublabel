@@ -220,19 +220,11 @@ coletar_informacoes() {
     read -p "Subdomínio do Portainer (ex: painel): " sub_portainer
     sub_portainer="${sub_portainer:-painel}"
     url_portainer="${sub_portainer}.${dominio_base}"
-    read -p "Usuário do Portainer (ex: admin) [admin]: " user_portainer
-    user_portainer="${user_portainer:-admin}"
-    while true; do
-        echo -e "${amarelo}Mínimo 12 caracteres. Letras maiúsculas, minúsculas, número e @ ou _${reset}"
-        read -p "Senha do Portainer [EjGse3_0@t50OPo]: " pass_portainer
-        pass_portainer="${pass_portainer:-EjGse3_0@t50OPo}"
-        validar_senha "$pass_portainer" 12 && break
-    done
+    user_portainer="admin"
+    pass_portainer="EjGse3_0@t50OPo"
     dominio_sem_sufixo="${dominio_base%%.*}"
-    read -p "Nome do servidor [$dominio_sem_sufixo]: " nome_servidor
-    nome_servidor="${nome_servidor:-$dominio_sem_sufixo}"
-    read -p "Nome da rede interna [Rede$dominio_sem_sufixo]: " nome_rede_interna
-    nome_rede_interna="${nome_rede_interna:-Rede$dominio_sem_sufixo}"
+    nome_servidor="$dominio_sem_sufixo"
+    nome_rede_interna="Rede$dominio_sem_sufixo"
     echo ""
 
     ## Evolution API
@@ -250,14 +242,8 @@ coletar_informacoes() {
     read -p "Subdomínio da API S3 (ex: s3): " sub_s3
     sub_s3="${sub_s3:-s3}"
     url_s3="${sub_s3}.${dominio_base}"
-    read -p "Usuário MinIO [admin]: " user_minio
-    user_minio="${user_minio:-admin}"
-    while true; do
-        echo -e "${amarelo}Mínimo 8 caracteres. Letras, números e @ ou _${reset}"
-        read -p "Senha MinIO [EjGse3_0@t50OPo]: " senha_minio
-        senha_minio="${senha_minio:-EjGse3_0@t50OPo}"
-        validar_senha "$senha_minio" 8 && break
-    done
+    user_minio="admin"
+    senha_minio="EjGse3_0@t50OPo"
     minio_version="RELEASE.2024-01-13T07-53-03Z-cpuv1"
     echo ""
 
@@ -269,17 +255,12 @@ coletar_informacoes() {
     read -p "Subdomínio do Webhook N8N (ex: hook): " sub_webhook
     sub_webhook="${sub_webhook:-hook}"
     url_webhookn8n="${sub_webhook}.${dominio_base}"
-    read -p "Email SMTP [suporte@$dominio_base]: " email_smtp_n8n
-    email_smtp_n8n="${email_smtp_n8n:-suporte@$dominio_base}"
-    read -p "Usuário SMTP [suporte@$dominio_base]: " usuario_smtp_n8n
-    usuario_smtp_n8n="${usuario_smtp_n8n:-suporte@$dominio_base}"
-    read -p "Senha SMTP [123]: " senha_smtp_n8n
-    senha_smtp_n8n="${senha_smtp_n8n:-123}"
-    read -p "Host SMTP [smtp]: " host_smtp_n8n
-    host_smtp_n8n="${host_smtp_n8n:-smtp}"
-    read -p "Porta SMTP [465]: " porta_smtp_n8n
-    porta_smtp_n8n="${porta_smtp_n8n:-465}"
-    [ "$porta_smtp_n8n" = "465" ] && smtp_secure_smtp_n8n=true || smtp_secure_smtp_n8n=false
+    email_smtp_n8n="suporte@$dominio_base"
+    usuario_smtp_n8n="suporte@$dominio_base"
+    senha_smtp_n8n="123"
+    host_smtp_n8n="smtp"
+    porta_smtp_n8n="465"
+    smtp_secure_smtp_n8n=true
     echo ""
 
     ## Remover barras ou caracteres extras
