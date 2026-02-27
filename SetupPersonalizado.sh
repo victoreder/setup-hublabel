@@ -195,16 +195,23 @@ install_dependencies() {
   systemctl enable docker
   systemctl start docker
 
-  if ! command -v docker-compose >/dev/null 2>&1; then
+  if ! docker compose version >/dev/null 2>&1; then
+    local arch
+    arch="$(uname -m)"
+    case "${arch}" in
+      x86_64|amd64) arch="x86_64" ;;
+      aarch64|arm64) arch="aarch64" ;;
+      *) die "Arquitetura não suportada para docker compose plugin automático: ${arch}" ;;
+    esac
+
     local compose_plugin_path="/usr/local/lib/docker/cli-plugins"
     mkdir -p "${compose_plugin_path}"
-    curl -SL "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-x86_64" -o "${compose_plugin_path}/docker-compose"
+    curl -SL "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-${arch}" -o "${compose_plugin_path}/docker-compose"
     chmod +x "${compose_plugin_path}/docker-compose"
-    ln -sf "${compose_plugin_path}/docker-compose" /usr/local/bin/docker-compose
   fi
 
   require_cmd docker
-  require_cmd docker-compose
+  docker compose version >/dev/null 2>&1 || die "docker compose plugin não disponível"
   require_cmd htpasswd
   ok "Dependências prontas"
 }
@@ -252,22 +259,27 @@ ENV
   cat > "${COMPOSE_FILE}" <<'YAML'
 services:
   traefik:
-    image: traefik:v3.2
+    image: traefik:v3.5.3
     container_name: traefik
     restart: unless-stopped
     command:
       - --api.dashboard=true
       - --providers.docker=true
+      - --providers.docker.endpoint=unix:///var/run/docker.sock
       - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=proxy
       - --providers.file.directory=/etc/traefik/dynamic
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
       - --entrypoints.web.http.redirections.entrypoint.to=websecure
       - --entrypoints.web.http.redirections.entrypoint.scheme=https
-      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
       - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
       - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
       - --log.level=INFO
+    environment:
+      - DOCKER_API_VERSION=1.44
     ports:
       - "80:80"
       - "443:443"
@@ -436,7 +448,7 @@ run_installation() {
   echo -e "${YELLOW}Etapa 4/5 - Subindo serviços${RESET}"
 
   cd "${BASE_DIR}"
-  docker-compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
+  docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d
   ok "Containers iniciados"
 }
 
@@ -457,6 +469,11 @@ verify_installation() {
   done
 
   sleep 8
+
+  if docker logs traefik --tail 200 2>&1 | grep -q "client version 1.24 is too old"; then
+    warn "Traefik detectou API Docker antiga (1.24). Aplicando fallback com DOCKER_API_VERSION=1.44."
+    failed=1
+  fi
 
   for url in \
     "https://${PORTAINER_DOMAIN}" \
