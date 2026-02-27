@@ -211,10 +211,11 @@ stack_editavel() {
     [ -z "$SWARM_ID" ] || [ "$SWARM_ID" = "null" ] && SWARM_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
 
     if [ ! -f "$(pwd)/${STACK_NAME}.yaml" ]; then
-        echo "Erro: ${STACK_NAME}.yaml não encontrado"
+        echo "Erro: ${STACK_NAME}.yaml não encontrado em $(pwd)"
         return 1
     fi
 
+    ## Tentar create via 127.0.0.1 (igual SetupOrion usa URL direta; 127.0.0.1 pode falhar em alguns ambientes)
     http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X POST \
         -H "Authorization: Bearer $TOKEN" \
         -H "Host: $PORTAINER_URL" \
@@ -222,14 +223,62 @@ stack_editavel() {
         -F "file=@$(pwd)/${STACK_NAME}.yaml" \
         -F "SwarmID=$SWARM_ID" \
         -F "endpointId=$ENDPOINT_ID" \
-        "https://127.0.0.1/api/stacks/create/swarm/file")
+        "https://127.0.0.1/api/stacks/create/swarm/file" 2>/dev/null)
+
+    ## Se falhou, tentar via URL direta (igual SetupOrion)
+    if [ "$http_code" != "200" ]; then
+        http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "Name=$STACK_NAME" \
+            -F "file=@$(pwd)/${STACK_NAME}.yaml" \
+            -F "SwarmID=$SWARM_ID" \
+            -F "endpointId=$ENDPOINT_ID" \
+            "https://$PORTAINER_URL/api/stacks/create/swarm/file" 2>/dev/null)
+    fi
 
     if [ "$http_code" -eq 200 ]; then
         echo -e "10/10 - [ OK ] - Deploy da stack ${verde}$STACK_NAME${reset} feito com sucesso!"
-    else
-        echo "10/10 - [ OFF ] - Erro ao fazer deploy. HTTP $http_code"
-        return 1
+        return 0
     fi
+
+    ## Se stack já existe, tentar update
+    STACK_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/stacks" 2>/dev/null | jq -r ".[] | select(.Name==\"$STACK_NAME\") | .Id")
+    [ -z "$STACK_ID" ] || [ "$STACK_ID" = "null" ] && STACK_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/stacks" 2>/dev/null | jq -r ".[] | select(.Name==\"$STACK_NAME\") | .Id")
+
+    if [ -n "$STACK_ID" ] && [ "$STACK_ID" != "null" ]; then
+        stack_file="$(pwd)/${STACK_NAME}.yaml"
+        file_content=$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$stack_file")
+        http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X PUT \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Host: $PORTAINER_URL" \
+            -d "{\"stackFileContent\":$file_content,\"prune\":true,\"pullImage\":true}" \
+            "https://127.0.0.1/api/stacks/$STACK_ID" 2>/dev/null)
+        if [ "$http_code" != "200" ]; then
+            http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X PUT \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "{\"stackFileContent\":$file_content,\"prune\":true,\"pullImage\":true}" \
+                "https://$PORTAINER_URL/api/stacks/$STACK_ID" 2>/dev/null)
+        fi
+        if [ "$http_code" -eq 200 ]; then
+            echo -e "10/10 - [ OK ] - Update da stack ${verde}$STACK_NAME${reset} feito com sucesso!"
+            return 0
+        fi
+    fi
+
+    ## Fallback: docker stack deploy direto (igual SetupOrion tem comentado)
+    echo "10/10 - [ OFF ] - Portainer API falhou (HTTP $http_code). Tentando docker stack deploy..."
+    if [ -f /tmp/stack_response ] && [ -s /tmp/stack_response ]; then
+        echo "Resposta Portainer: $(cat /tmp/stack_response | jq . 2>/dev/null || cat /tmp/stack_response)"
+    fi
+    if docker stack deploy --prune --resolve-image always -c "$(pwd)/${STACK_NAME}.yaml" "$STACK_NAME" 2>/dev/null; then
+        echo -e "10/10 - [ OK ] - Deploy da stack ${verde}$STACK_NAME${reset} via docker feito com sucesso!"
+        return 0
+    fi
+
+    echo "10/10 - [ OFF ] - Erro ao fazer deploy. HTTP $http_code"
+    return 1
 }
 
 ## ============================================================================
@@ -586,9 +635,9 @@ instalar_evolution() {
 
     criar_banco_postgres_da_stack evolution
 
-    python3 - "$nome_rede_interna" "$url_evolution" "$apikeyglobal" "$senha_postgres" << 'PYEOF'
+    python3 - "$nome_rede_interna" "$url_evolution" "$apikeyglobal" "$senha_postgres" "$dominio_sem_sufixo" << 'PYEOF'
 import sys
-rede, url, apikey, pgpass = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+rede, url, apikey, pgpass, cliente = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 with open('/root/evolution.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
@@ -597,66 +646,175 @@ services:
     volumes: [ evolution_instances:/evolution/instances ]
     networks: [ {rede} ]
     environment:
-      SERVER_URL: https://{url}
-      AUTHENTICATION_API_KEY: {apikey}
-      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
-      DEL_INSTANCE: "false"
-      QRCODE_LIMIT: "1902"
-      LANGUAGE: pt-BR
-      CONFIG_SESSION_PHONE_CLIENT: SetupOrion
-      CONFIG_SESSION_PHONE_NAME: Chrome
-      DATABASE_ENABLED: "true"
-      DATABASE_PROVIDER: postgresql
-      DATABASE_CONNECTION_URI: postgresql://postgres:{pgpass}@postgres:5432/evolution
-      DATABASE_CONNECTION_CLIENT_NAME: evolution
-      DATABASE_SAVE_DATA_INSTANCE: "true"
-      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
-      DATABASE_SAVE_MESSAGE_UPDATE: "true"
-      DATABASE_SAVE_DATA_CONTACTS: "true"
-      DATABASE_SAVE_DATA_CHATS: "true"
-      DATABASE_SAVE_DATA_LABELS: "true"
-      DATABASE_SAVE_DATA_HISTORIC: "true"
-      N8N_ENABLED: "true"
-      EVOAI_ENABLED: "true"
-      OPENAI_ENABLED: "true"
-      DIFY_ENABLED: "true"
-      TYPEBOT_ENABLED: "true"
-      TYPEBOT_API_VERSION: latest
-      CHATWOOT_ENABLED: "true"
-      CHATWOOT_MESSAGE_READ: "true"
-      CHATWOOT_MESSAGE_DELETE: "true"
-      CACHE_REDIS_ENABLED: "true"
-      CACHE_REDIS_URI: redis://evolution_redis:6379/1
-      CACHE_REDIS_PREFIX_KEY: evolution
-      CACHE_REDIS_SAVE_INSTANCES: "false"
-      CACHE_LOCAL_ENABLED: "false"
-      S3_ENABLED: "false"
-      S3_ACCESS_KEY: ""
-      S3_SECRET_KEY: ""
-      S3_BUCKET: evolution
-      S3_PORT: "443"
-      S3_ENDPOINT: ""
-      S3_USE_SSL: "true"
-      WA_BUSINESS_TOKEN_WEBHOOK: evolution
-      WA_BUSINESS_URL: https://graph.facebook.com
-      WA_BUSINESS_VERSION: v23.0
-      WA_BUSINESS_LANGUAGE: pt_BR
-      TELEMETRY: "false"
-      WEBSOCKET_ENABLED: "false"
-      SQS_ENABLED: "false"
-      RABBITMQ_ENABLED: "false"
-      RABBITMQ_URI: amqp://USER:PASS@rabbitmq:5672/evolution
-      RABBITMQ_EXCHANGE_NAME: evolution
-      WEBHOOK_GLOBAL_ENABLED: "false"
-      PROVIDER_ENABLED: "false"
-      PROVIDER_PREFIX: evolution
-      TZ: America/Sao_Paulo
+    ## ⚙️ Configuracoes Gerais
+      - SERVER_URL=https://{url}
+      - AUTHENTICATION_API_KEY={apikey}
+      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+      - DEL_INSTANCE=false
+      - QRCODE_LIMIT=1902
+      - LANGUAGE=pt-BR
+
+    ## 📱 Configuracao do Cliente
+      - CONFIG_SESSION_PHONE_CLIENT={cliente}
+      - CONFIG_SESSION_PHONE_NAME=Chrome
+
+    ## 🗄️ Configuracao do Banco de Dados
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://postgres:{pgpass}@postgres:5432/evolution
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
+      - DATABASE_SAVE_MESSAGE_UPDATE=true
+      - DATABASE_SAVE_DATA_CONTACTS=true
+      - DATABASE_SAVE_DATA_CHATS=true
+      - DATABASE_SAVE_DATA_LABELS=true
+      - DATABASE_SAVE_DATA_HISTORIC=true
+
+    ## 🤖 Integracao com N8N
+      - N8N_ENABLED=true
+
+    ## 🤖 Integracao com EvoAI
+      - EVOAI_ENABLED=true
+
+    ## 🤖 Integracao com OpenAI
+      - OPENAI_ENABLED=true
+
+    ## 🌐 Integracao com Dify
+      - DIFY_ENABLED=true
+
+    ## 💬 Integracao com Typebot
+      - TYPEBOT_ENABLED=true
+      - TYPEBOT_API_VERSION=latest
+
+    ## 🗣️ Integracao com Chatwoot
+      - CHATWOOT_ENABLED=true
+      - CHATWOOT_MESSAGE_READ=true
+      - CHATWOOT_MESSAGE_DELETE=true
+      - CHATWOOT_IMPORT_DATABASE_CONNECTION_URI=postgresql://postgres:SENHA_DO_PGVECTOR@pgvector:5432/chatwoot?sslmode=disable
+      - CHATWOOT_IMPORT_PLACEHOLDER_MEDIA_MESSAGE=false
+
+    ## 🧊 Configuracao do Cache
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://evolution_redis:6379/1
+      - CACHE_REDIS_PREFIX_KEY=evolution
+      - CACHE_REDIS_SAVE_INSTANCES=false
+      - CACHE_LOCAL_ENABLED=false
+
+    ## ☁️ Configuracao do S3
+      - S3_ENABLED=false
+      - S3_ACCESS_KEY=
+      - S3_SECRET_KEY=
+      - S3_BUCKET=evolution
+      - S3_PORT=443
+      - S3_ENDPOINT=
+      - S3_USE_SSL=true
+
+    ## 💼 Configuracao do WhatsApp Business
+      - WA_BUSINESS_TOKEN_WEBHOOK=evolution
+      - WA_BUSINESS_URL=https://graph.facebook.com
+      - WA_BUSINESS_VERSION=v23.0
+      - WA_BUSINESS_LANGUAGE=pt_BR
+
+    ## 📊 Telemetria
+      - TELEMETRY=false
+      - TELEMETRY_URL=
+
+    ## 🌐 Configuracao do WebSocket
+      - WEBSOCKET_ENABLED=false
+      - WEBSOCKET_GLOBAL_EVENTS=false
+
+    ## 📨 Configuracao do SQS
+      - SQS_ENABLED=false
+      - SQS_ACCESS_KEY_ID=
+      - SQS_SECRET_ACCESS_KEY=
+      - SQS_ACCOUNT_ID=
+      - SQS_REGION=
+
+    ## 🐇 Configuracao do RabbitMQ
+      - RABBITMQ_ENABLED=false
+      - RABBITMQ_FRAME_MAX=8192
+      - RABBITMQ_URI=amqp://USER:PASS@rabbitmq:5672/evolution
+      - RABBITMQ_EXCHANGE_NAME=evolution
+      - RABBITMQ_GLOBAL_ENABLED=false
+      - RABBITMQ_EVENTS_APPLICATION_STARTUP=false
+      - RABBITMQ_EVENTS_INSTANCE_CREATE=false
+      - RABBITMQ_EVENTS_INSTANCE_DELETE=false
+      - RABBITMQ_EVENTS_QRCODE_UPDATED=false
+      - RABBITMQ_EVENTS_SEND_MESSAGE_UPDATE=false
+      - RABBITMQ_EVENTS_MESSAGES_SET=false
+      - RABBITMQ_EVENTS_MESSAGES_UPSERT=true
+      - RABBITMQ_EVENTS_MESSAGES_EDITED=false
+      - RABBITMQ_EVENTS_MESSAGES_UPDATE=false
+      - RABBITMQ_EVENTS_MESSAGES_DELETE=false
+      - RABBITMQ_EVENTS_SEND_MESSAGE=false
+      - RABBITMQ_EVENTS_CONTACTS_SET=false
+      - RABBITMQ_EVENTS_CONTACTS_UPSERT=false
+      - RABBITMQ_EVENTS_CONTACTS_UPDATE=false
+      - RABBITMQ_EVENTS_PRESENCE_UPDATE=false
+      - RABBITMQ_EVENTS_CHATS_SET=false
+      - RABBITMQ_EVENTS_CHATS_UPSERT=false
+      - RABBITMQ_EVENTS_CHATS_UPDATE=false
+      - RABBITMQ_EVENTS_CHATS_DELETE=false
+      - RABBITMQ_EVENTS_GROUPS_UPSERT=false
+      - RABBITMQ_EVENTS_GROUP_UPDATE=false
+      - RABBITMQ_EVENTS_GROUP_PARTICIPANTS_UPDATE=false
+      - RABBITMQ_EVENTS_CONNECTION_UPDATE=true
+      - RABBITMQ_EVENTS_CALL=false
+      - RABBITMQ_EVENTS_TYPEBOT_START=false
+      - RABBITMQ_EVENTS_TYPEBOT_CHANGE_STATUS=false
+
+    ## 🌐 Configuracao do Webhook
+      - WEBHOOK_GLOBAL_ENABLED=false
+      - WEBHOOK_GLOBAL_URL=
+      - WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS=false
+      - WEBHOOK_EVENTS_APPLICATION_STARTUP=false
+      - WEBHOOK_EVENTS_QRCODE_UPDATED=false
+      - WEBHOOK_EVENTS_MESSAGES_SET=false
+      - WEBHOOK_EVENTS_SEND_MESSAGE_UPDATE=false
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=false
+      - WEBHOOK_EVENTS_MESSAGES_EDITED=false
+      - WEBHOOK_EVENTS_MESSAGES_UPDATE=false
+      - WEBHOOK_EVENTS_MESSAGES_DELETE=false
+      - WEBHOOK_EVENTS_SEND_MESSAGE=false
+      - WEBHOOK_EVENTS_CONTACTS_SET=false
+      - WEBHOOK_EVENTS_CONTACTS_UPSERT=false
+      - WEBHOOK_EVENTS_CONTACTS_UPDATE=false
+      - WEBHOOK_EVENTS_PRESENCE_UPDATE=false
+      - WEBHOOK_EVENTS_CHATS_SET=false
+      - WEBHOOK_EVENTS_CHATS_UPSERT=false
+      - WEBHOOK_EVENTS_CHATS_UPDATE=false
+      - WEBHOOK_EVENTS_CHATS_DELETE=false
+      - WEBHOOK_EVENTS_GROUPS_UPSERT=false
+      - WEBHOOK_EVENTS_GROUPS_UPDATE=false
+      - WEBHOOK_EVENTS_GROUP_PARTICIPANTS_UPDATE=false
+      - WEBHOOK_EVENTS_CONNECTION_UPDATE=false
+      - WEBHOOK_EVENTS_LABELS_EDIT=false
+      - WEBHOOK_EVENTS_LABELS_ASSOCIATION=false
+      - WEBHOOK_EVENTS_CALL=false
+      - WEBHOOK_EVENTS_TYPEBOT_START=false
+      - WEBHOOK_EVENTS_TYPEBOT_CHANGE_STATUS=false
+      - WEBHOOK_EVENTS_ERRORS=false
+      - WEBHOOK_EVENTS_ERRORS_WEBHOOK=
+      - WEBHOOK_REQUEST_TIMEOUT_MS=60000
+      - WEBHOOK_RETRY_MAX_ATTEMPTS=10
+      - WEBHOOK_RETRY_INITIAL_DELAY_SECONDS=5
+      - WEBHOOK_RETRY_USE_EXPONENTIAL_BACKOFF=true
+      - WEBHOOK_RETRY_MAX_DELAY_SECONDS=300
+      - WEBHOOK_RETRY_JITTER_FACTOR=0.2
+      - WEBHOOK_RETRY_NON_RETRYABLE_STATUS_CODES=400,401,403,404,422
+
+    ## 🔌 Configuracao do Provider
+      - PROVIDER_ENABLED=false
+      - PROVIDER_HOST=127.0.0.1
+      - PROVIDER_PORT=5656
+      - PROVIDER_PREFIX=evolution
     deploy:
       mode: replicated
       replicas: 1
       placement: {{ constraints: [node.role == manager] }}
       labels:
-        - traefik.enable=true
+        - traefik.enable=1
         - traefik.http.routers.evolution.rule=Host(`{url}`)
         - traefik.http.routers.evolution.entrypoints=websecure
         - traefik.http.routers.evolution.priority=1
@@ -670,7 +828,12 @@ services:
     command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
     volumes: [ evolution_redis:/data ]
     networks: [ {rede} ]
-    deploy: {{ placement: {{ constraints: [node.role == manager] }} }}
+    deploy:
+      placement: {{ constraints: [node.role == manager] }}
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
 volumes:
   evolution_instances: {{ external: true, name: evolution_instances }}
   evolution_redis: {{ external: true, name: evolution_redis }}
@@ -701,29 +864,47 @@ rede, ver, user, pwd, url_minio, url_s3 = sys.argv[1], sys.argv[2], sys.argv[3],
 with open('/root/minio.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   minio:
-    image: quay.io/minio/minio:{ver}
+    image: quay.io/minio/minio:{ver}  ## Versão do MinIO
     command: server /data --console-address ":9001"
-    volumes: [ minio_data:/data ]
-    networks: [ {rede} ]
+
+    volumes:
+      - minio_data:/data
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
     environment:
-      MINIO_ROOT_USER: {user}
-      MINIO_ROOT_PASSWORD: {pwd}
-      MINIO_BROWSER_REDIRECT_URL: https://{url_minio}
-      MINIO_SERVER_URL: https://{url_s3}
-      MINIO_REGION_NAME: eu-south
+    ## 🔑 Dados de acesso
+      - MINIO_ROOT_USER={user}
+      - MINIO_ROOT_PASSWORD={pwd}
+
+    ## 🌐 URL do MinIO
+      - MINIO_BROWSER_REDIRECT_URL=https://{url_minio}
+      - MINIO_SERVER_URL=https://{url_s3}
+
+    ## 📍 Região
+      - MINIO_REGION_NAME=eu-south
+
     deploy:
       mode: replicated
       replicas: 1
-      placement: {{ constraints: [node.role == manager] }}
+      placement:
+        constraints:
+          - node.role == manager
       labels:
         - traefik.enable=true
+        ## Console
         - traefik.http.routers.minio_public.rule=Host(`{url_s3}`)
         - traefik.http.routers.minio_public.entrypoints=websecure
         - traefik.http.routers.minio_public.tls.certresolver=letsencryptresolver
         - traefik.http.services.minio_public.loadbalancer.server.port=9000
         - traefik.http.services.minio_public.loadbalancer.passHostHeader=true
         - traefik.http.routers.minio_public.service=minio_public
+        ## API S3
         - traefik.http.routers.minio_console.rule=Host(`{url_minio}`)
         - traefik.http.routers.minio_console.entrypoints=websecure
         - traefik.http.routers.minio_console.tls.certresolver=letsencryptresolver
@@ -731,10 +912,18 @@ services:
         - traefik.http.services.minio_console.loadbalancer.passHostHeader=true
         - traefik.http.routers.minio_console.service=minio_console
         - traefik.swarm.network={rede}
+
+## --------------------------- HUBLABEL --------------------------- ##
+
 volumes:
-  minio_data: {{ external: true, name: minio_data }}
+  minio_data:
+    external: true
+    name: minio_data
+
 networks:
-  {rede}: {{ external: true, name: {rede} }}
+  {rede}:  ## Nome da rede interna
+    external: true
+    name: {rede}  ## Nome da rede interna
 ''')
 PYEOF
 
@@ -767,63 +956,100 @@ smtp_sender, smtp_user, smtp_pass, smtp_host, smtp_port, smtp_ssl = a[6], a[7], 
 with open('/root/n8n.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   n8n_editor:
-    image: n8nio/n8n:latest
+    image: n8nio/n8n:latest  ## Versão do N8N
     command: start
-    networks: [ {rede} ]
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
     environment:
-      N8N_FIX_MIGRATIONS: "true"
-      DB_TYPE: postgresdb
-      DB_POSTGRESDB_DATABASE: n8n_queue
-      DB_POSTGRESDB_HOST: postgres
-      DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_USER: postgres
-      DB_POSTGRESDB_PASSWORD: {pgpass}
-      N8N_ENCRYPTION_KEY: {enc}
-      N8N_HOST: {url_ed}
-      N8N_EDITOR_BASE_URL: https://{url_ed}/
-      WEBHOOK_URL: https://{url_wh}/
-      N8N_PROTOCOL: https
-      N8N_PROXY_HOPS: 1
-      N8N_ONBOARDING_FLOW_DISABLED: "true"
-      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
-      N8N_SKIP_AUTH_ON_OAUTH_CALLBACK: "false"
-      NODE_ENV: production
-      EXECUTIONS_MODE: queue
-      EXECUTIONS_TIMEOUT: "3600"
-      EXECUTIONS_TIMEOUT_MAX: "7200"
-      OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS: "true"
-      N8N_RUNNERS_ENABLED: "true"
-      N8N_RUNNERS_MODE: internal
-      N8N_RESTRICT_FILE_ACCESS_TO: "~/.n8n-files"
-      NODES_EXCLUDE: "[]"
-      N8N_REINSTALL_MISSING_PACKAGES: "true"
-      N8N_COMMUNITY_PACKAGES_ENABLED: "true"
-      N8N_NODE_PATH: /home/node/.n8n/nodes
-      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "true"
-      QUEUE_BULL_REDIS_HOST: n8n_redis
-      QUEUE_BULL_REDIS_PORT: 6379
-      QUEUE_BULL_REDIS_DB: 1
-      N8N_SMTP_SENDER: {smtp_sender}
-      N8N_SMTP_USER: {smtp_user}
-      N8N_SMTP_PASS: {smtp_pass}
-      N8N_SMTP_HOST: {smtp_host}
-      N8N_SMTP_PORT: {smtp_port}
-      N8N_SMTP_SSL: {smtp_ssl}
-      N8N_METRICS: "true"
-      EXECUTIONS_DATA_PRUNE: "true"
-      EXECUTIONS_DATA_MAX_AGE: "336"
-      N8N_AI_ENABLED: "false"
-      N8N_AI_PROVIDER: openai
-      N8N_AI_OPENAI_API_KEY: ""
-      NODE_FUNCTION_ALLOW_BUILTIN: "*"
-      NODE_FUNCTION_ALLOW_EXTERNAL: moment,lodash
-      GENERIC_TIMEZONE: America/Sao_Paulo
-      TZ: America/Sao_Paulo
+    ## 🗄️ Banco de Dados (PostgreSQL)
+      - N8N_FIX_MIGRATIONS=true
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_DATABASE=n8n_queue
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_USER=postgres
+      - DB_POSTGRESDB_PASSWORD={pgpass}
+
+    ## 🔐 Criptografia
+      - N8N_ENCRYPTION_KEY={enc}
+
+      ## 🌐 URLs e Configurações de Acesso
+      - N8N_HOST={url_ed}
+      - N8N_EDITOR_BASE_URL=https://{url_ed}/
+      - WEBHOOK_URL=https://{url_wh}/
+      - N8N_PROTOCOL=https
+      - N8N_PROXY_HOPS=1
+      - N8N_ONBOARDING_FLOW_DISABLED=true
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_SKIP_AUTH_ON_OAUTH_CALLBACK=false
+
+    ## ⚙️ Ambiente de Execução
+      - NODE_ENV=production
+      - EXECUTIONS_MODE=queue
+      - EXECUTIONS_TIMEOUT=3600
+      - EXECUTIONS_TIMEOUT_MAX=7200
+      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_RUNNERS_MODE=internal
+      - N8N_RESTRICT_FILE_ACCESS_TO="~/.n8n-files"
+      - NODES_EXCLUDE="[]"
+
+    ## 📦 Pacotes e Nós Comunitários
+      - N8N_REINSTALL_MISSING_PACKAGES=true
+      - N8N_COMMUNITY_PACKAGES_ENABLED=true
+      - N8N_NODE_PATH=/home/node/.n8n/nodes
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+
+    ## 📧 SMTP (Envio de E-mails)
+      - N8N_SMTP_SENDER={smtp_sender}
+      - N8N_SMTP_USER={smtp_user}
+      - N8N_SMTP_PASS={smtp_pass}
+      - N8N_SMTP_HOST={smtp_host}
+      - N8N_SMTP_PORT={smtp_port}
+      - N8N_SMTP_SSL={smtp_ssl}
+
+    ## 🔁 Redis (Fila de Execução)
+      - QUEUE_BULL_REDIS_HOST=n8n_redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_DB=1
+
+    ## 📊 Métricas
+      - N8N_METRICS=true
+
+    ## ⏱️ Execuções e Limpeza
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336
+
+    ## 🧠 Recursos de IA
+      - N8N_AI_ENABLED=false
+      - N8N_AI_PROVIDER=openai
+      - N8N_AI_OPENAI_API_KEY=
+
+    ## 🧰 Permissões em Funções Personalizadas
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash
+
+    ## 🕒 Fuso Horário
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+      - TZ=America/Sao_Paulo
+      #- N8N_DEFAULT_LOCALE=pt-BR
+
     deploy:
       mode: replicated
       replicas: 1
-      placement: {{ constraints: [node.role == manager] }}
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
       labels:
         - traefik.enable=true
         - traefik.http.routers.n8n_editor.rule=Host(`{url_ed}`)
@@ -834,46 +1060,100 @@ services:
         - traefik.http.services.n8n_editor.loadbalancer.server.port=5678
         - traefik.http.services.n8n_editor.loadbalancer.passHostHeader=1
         - traefik.swarm.network={rede}
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   n8n_webhook:
-    image: n8nio/n8n:latest
+    image: n8nio/n8n:latest  ## Versão do N8N
     command: webhook
-    networks: [ {rede} ]
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
     environment:
-      N8N_FIX_MIGRATIONS: "true"
-      DB_TYPE: postgresdb
-      DB_POSTGRESDB_DATABASE: n8n_queue
-      DB_POSTGRESDB_HOST: postgres
-      DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_USER: postgres
-      DB_POSTGRESDB_PASSWORD: {pgpass}
-      N8N_ENCRYPTION_KEY: {enc}
-      N8N_HOST: {url_ed}
-      N8N_EDITOR_BASE_URL: https://{url_ed}/
-      WEBHOOK_URL: https://{url_wh}/
-      N8N_PROTOCOL: https
-      N8N_PROXY_HOPS: 1
-      N8N_ONBOARDING_FLOW_DISABLED: "true"
-      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
-      N8N_SKIP_AUTH_ON_OAUTH_CALLBACK: "false"
-      NODE_ENV: production
-      EXECUTIONS_MODE: queue
-      N8N_RUNNERS_ENABLED: "true"
-      N8N_RUNNERS_MODE: internal
-      QUEUE_BULL_REDIS_HOST: n8n_redis
-      QUEUE_BULL_REDIS_PORT: 6379
-      QUEUE_BULL_REDIS_DB: 1
-      N8N_SMTP_SENDER: {smtp_sender}
-      N8N_SMTP_USER: {smtp_user}
-      N8N_SMTP_PASS: {smtp_pass}
-      N8N_SMTP_HOST: {smtp_host}
-      N8N_SMTP_PORT: {smtp_port}
-      N8N_SMTP_SSL: {smtp_ssl}
-      N8N_METRICS: "true"
-      TZ: America/Sao_Paulo
+    ## 🗄️ Banco de Dados (PostgreSQL)
+      - N8N_FIX_MIGRATIONS=true
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_DATABASE=n8n_queue
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_USER=postgres
+      - DB_POSTGRESDB_PASSWORD={pgpass}
+
+    ## 🔐 Criptografia
+      - N8N_ENCRYPTION_KEY={enc}
+
+      ## 🌐 URLs e Configurações de Acesso
+      - N8N_HOST={url_ed}
+      - N8N_EDITOR_BASE_URL=https://{url_ed}/
+      - WEBHOOK_URL=https://{url_wh}/
+      - N8N_PROTOCOL=https
+      - N8N_PROXY_HOPS=1
+      - N8N_ONBOARDING_FLOW_DISABLED=true
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_SKIP_AUTH_ON_OAUTH_CALLBACK=false
+
+    ## ⚙️ Ambiente de Execução
+      - NODE_ENV=production
+      - EXECUTIONS_MODE=queue
+      - EXECUTIONS_TIMEOUT=3600
+      - EXECUTIONS_TIMEOUT_MAX=7200
+      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_RUNNERS_MODE=internal
+      - N8N_RESTRICT_FILE_ACCESS_TO="~/.n8n-files"
+      - NODES_EXCLUDE="[]"
+
+    ## 📦 Pacotes e Nós Comunitários
+      - N8N_REINSTALL_MISSING_PACKAGES=true
+      - N8N_COMMUNITY_PACKAGES_ENABLED=true
+      - N8N_NODE_PATH=/home/node/.n8n/nodes
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+
+    ## 📧 SMTP (Envio de E-mails)
+      - N8N_SMTP_SENDER={smtp_sender}
+      - N8N_SMTP_USER={smtp_user}
+      - N8N_SMTP_PASS={smtp_pass}
+      - N8N_SMTP_HOST={smtp_host}
+      - N8N_SMTP_PORT={smtp_port}
+      - N8N_SMTP_SSL={smtp_ssl}
+
+    ## 🔁 Redis (Fila de Execução)
+      - QUEUE_BULL_REDIS_HOST=n8n_redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_DB=1
+
+    ## 📊 Métricas
+      - N8N_METRICS=true
+
+    ## ⏱️ Execuções e Limpeza
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336
+
+    ## 🧠 Recursos de IA
+      - N8N_AI_ENABLED=false
+      - N8N_AI_PROVIDER=openai
+      - N8N_AI_OPENAI_API_KEY=
+
+    ## 🧰 Permissões em Funções Personalizadas
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash
+
+    ## 🕒 Fuso Horário
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+      - TZ=America/Sao_Paulo
+      #- N8N_DEFAULT_LOCALE=pt-BR
+
     deploy:
       mode: replicated
       replicas: 1
-      placement: {{ constraints: [node.role == manager] }}
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
       labels:
         - traefik.enable=true
         - traefik.http.routers.n8n_webhook.rule=Host(`{url_wh}`)
@@ -884,45 +1164,151 @@ services:
         - traefik.http.services.n8n_webhook.loadbalancer.server.port=5678
         - traefik.http.services.n8n_webhook.loadbalancer.passHostHeader=1
         - traefik.swarm.network={rede}
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   n8n_worker:
-    image: n8nio/n8n:latest
+    image: n8nio/n8n:latest  ## Versão do N8N
     command: worker --concurrency=10
-    networks: [ {rede} ]
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
     environment:
-      N8N_FIX_MIGRATIONS: "true"
-      DB_TYPE: postgresdb
-      DB_POSTGRESDB_DATABASE: n8n_queue
-      DB_POSTGRESDB_HOST: postgres
-      DB_POSTGRESDB_PORT: 5432
-      DB_POSTGRESDB_USER: postgres
-      DB_POSTGRESDB_PASSWORD: {pgpass}
-      N8N_ENCRYPTION_KEY: {enc}
-      N8N_HOST: {url_ed}
-      N8N_EDITOR_BASE_URL: https://{url_ed}/
-      WEBHOOK_URL: https://{url_wh}/
-      N8N_PROTOCOL: https
-      QUEUE_BULL_REDIS_HOST: n8n_redis
-      QUEUE_BULL_REDIS_PORT: 6379
-      N8N_RUNNERS_ENABLED: "true"
-      N8N_RUNNERS_MODE: internal
-      TZ: America/Sao_Paulo
-    deploy: {{ mode: replicated, replicas: 1, placement: {{ constraints: [node.role == manager] }} }}
+    ## 🗄️ Banco de Dados (PostgreSQL)
+      - N8N_FIX_MIGRATIONS=true
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_DATABASE=n8n_queue
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_USER=postgres
+      - DB_POSTGRESDB_PASSWORD={pgpass}
+
+    ## 🔐 Criptografia
+      - N8N_ENCRYPTION_KEY={enc}
+
+      ## 🌐 URLs e Configurações de Acesso
+      - N8N_HOST={url_ed}
+      - N8N_EDITOR_BASE_URL=https://{url_ed}/
+      - WEBHOOK_URL=https://{url_wh}/
+      - N8N_PROTOCOL=https
+      - N8N_PROXY_HOPS=1
+      - N8N_ONBOARDING_FLOW_DISABLED=true
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - N8N_SKIP_AUTH_ON_OAUTH_CALLBACK=false
+
+    ## ⚙️ Ambiente de Execução
+      - NODE_ENV=production
+      - EXECUTIONS_MODE=queue
+      - EXECUTIONS_TIMEOUT=3600
+      - EXECUTIONS_TIMEOUT_MAX=7200
+      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
+      - N8N_RUNNERS_ENABLED=true
+      - N8N_RUNNERS_MODE=internal
+      - N8N_RESTRICT_FILE_ACCESS_TO="~/.n8n-files"
+      - NODES_EXCLUDE="[]"
+
+    ## 📦 Pacotes e Nós Comunitários
+      - N8N_REINSTALL_MISSING_PACKAGES=true
+      - N8N_COMMUNITY_PACKAGES_ENABLED=true
+      - N8N_NODE_PATH=/home/node/.n8n/nodes
+      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+
+    ## 📧 SMTP (Envio de E-mails)
+      - N8N_SMTP_SENDER={smtp_sender}
+      - N8N_SMTP_USER={smtp_user}
+      - N8N_SMTP_PASS={smtp_pass}
+      - N8N_SMTP_HOST={smtp_host}
+      - N8N_SMTP_PORT={smtp_port}
+      - N8N_SMTP_SSL={smtp_ssl}
+
+    ## 🔁 Redis (Fila de Execução)
+      - QUEUE_BULL_REDIS_HOST=n8n_redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_DB=1
+
+    ## 📊 Métricas
+      - N8N_METRICS=true
+
+    ## ⏱️ Execuções e Limpeza
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336
+
+    ## 🧠 Recursos de IA
+      - N8N_AI_ENABLED=false
+      - N8N_AI_PROVIDER=openai
+      - N8N_AI_OPENAI_API_KEY=
+
+    ## 🧰 Permissões em Funções Personalizadas
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+      - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash
+
+    ## 🕒 Fuso Horário
+      - GENERIC_TIMEZONE=America/Sao_Paulo
+      - TZ=America/Sao_Paulo
+      #- N8N_DEFAULT_LOCALE=pt-BR
+
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+## --------------------------- HUBLABEL --------------------------- ##
+
   n8n_redis:
-    image: redis:latest
-    command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
-    volumes: [ n8n_redis:/data ]
-    networks: [ {rede} ]
-    deploy: {{ placement: {{ constraints: [node.role == manager] }} }}
+    image: redis:latest  ## Versão do Redis
+    command:
+      - redis-server
+      - --appendonly
+      - yes
+      - --port
+      - "6379"
+
+    volumes:
+      - n8n_redis:/data
+
+    networks:
+      - {rede}  ## Nome da rede interna
+
+    ## Descomente as linhas abaixo para uso externo
+    #ports:
+    #  - 6379:6379
+
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1024M
+
+## --------------------------- HUBLABEL --------------------------- ##
+
 volumes:
-  n8n_redis: {{ external: true, name: n8n_redis }}
+  n8n_redis:
+    external: true
+    name: n8n_redis
+
 networks:
-  {rede}: {{ external: true, name: {rede} }}
+  {rede}:  ## Nome da rede interna
+    external: true
+    name: {rede}  ## Nome da rede interna
 ''')
 PYEOF
 
+    ## Baixando imagens (igual SetupOrion)
+    pull redis:latest n8nio/n8n:latest
+
     STACK_NAME="n8n"
     stack_editavel || { echo -e "${vermelho}Erro ao criar stack N8N. Verifique o Portainer.${reset}"; return 1; }
-    wait_stack n8n_n8n_editor n8n_n8n_webhook
+    wait_stack n8n_n8n_redis n8n_n8n_editor n8n_n8n_webhook n8n_n8n_worker
     echo -e "${verde}✓ N8N instalado${reset}"
 }
 
