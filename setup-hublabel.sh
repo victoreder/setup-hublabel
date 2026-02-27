@@ -359,18 +359,22 @@ EOL
     docker volume create volume_swarm_certificates 2>/dev/null || true
     docker volume create portainer_data 2>/dev/null || true
 
-    ## Traefik
-    cat > traefik.yaml <<EOL
-version: "3.7"
+    ## Traefik (Python evita problema com backticks no heredoc)
+    python3 - "$nome_rede_interna" "$email_ssl" << 'PYEOF'
+import sys
+rede = sys.argv[1]
+email = sys.argv[2]
+with open('/root/traefik.yaml', 'w') as f:
+    f.write(f'''version: "3.7"
 services:
   traefik:
-    image: traefik:v3.5.3
+    image: traefik:latest
     command:
       - "--api.dashboard=true"
       - "--providers.swarm=true"
-      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
-      - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=$nome_rede_interna"
+      - "--providers.swarm.endpoint=unix:///var/run/docker.sock"
+      - "--providers.swarm.exposedbydefault=false"
+      - "--providers.swarm.network={rede}"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
       - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
@@ -379,12 +383,12 @@ services:
       - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge=true"
       - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge.entrypoint=web"
       - "--certificatesresolvers.letsencryptresolver.acme.storage=/etc/traefik/letsencrypt/acme.json"
-      - "--certificatesresolvers.letsencryptresolver.acme.email=$email_ssl"
+      - "--certificatesresolvers.letsencryptresolver.acme.email={email}"
       - "--log.level=INFO"
     volumes:
       - vol_certificates:/etc/traefik/letsencrypt
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     ports:
       - target: 80
         published: 80
@@ -393,59 +397,65 @@ services:
         published: 443
         mode: host
     deploy:
-      placement: { constraints: [node.role == manager] }
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
         - traefik.http.middlewares.redirect-https.redirectscheme.scheme=https
         - traefik.http.middlewares.redirect-https.redirectscheme.permanent=true
-        - traefik.http.routers.http-catchall.rule=Host(\`{host:.+}\`)
+        - "traefik.http.routers.http-catchall.rule=Host(`{{host:.+}}`)"
         - traefik.http.routers.http-catchall.entrypoints=web
-        - traefik.http.routers.http-catchall.middlewares=redirect-https@docker
+        - traefik.http.routers.http-catchall.middlewares=redirect-https@swarm
         - traefik.http.routers.http-catchall.priority=1
 volumes:
-  vol_shared: { external: true, name: volume_swarm_shared }
-  vol_certificates: { external: true, name: volume_swarm_certificates }
+  vol_shared: {{ external: true, name: volume_swarm_shared }}
+  vol_certificates: {{ external: true, name: volume_swarm_certificates }}
 networks:
-  $nome_rede_interna: { external: true, attachable: true, name: $nome_rede_interna }
-EOL
+  {rede}: {{ external: true, attachable: true, name: {rede} }}
+''')
+PYEOF
 
-    pull traefik:v3.5.3
+    pull traefik:latest
     docker stack deploy --prune --resolve-image always -c traefik.yaml traefik
     wait_stack traefik_traefik
     wait_30_sec
 
-    ## Portainer
-    cat > portainer.yaml <<EOL
-version: "3.7"
+    ## Portainer (Python evita problema com backticks no heredoc)
+    python3 - "$url_portainer" "$nome_rede_interna" << 'PYEOF'
+import sys
+url = sys.argv[1]
+rede = sys.argv[2]
+with open('/root/portainer.yaml', 'w') as f:
+    f.write(f'''version: "3.7"
 services:
   agent:
     image: portainer/agent:latest
     volumes: [ /var/run/docker.sock:/var/run/docker.sock, /var/lib/docker/volumes:/var/lib/docker/volumes ]
-    networks: [ $nome_rede_interna ]
-    deploy: { mode: global, placement: { constraints: [node.platform.os == linux] } }
+    networks: [ {rede} ]
+    deploy: {{ mode: global, placement: {{ constraints: [node.platform.os == linux] }} }}
   portainer:
     image: portainer/portainer-ce:latest
     command: -H tcp://tasks.agent:9001 --tlsskipverify
     volumes: [ portainer_data:/data ]
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     deploy:
       mode: replicated
       replicas: 1
-      placement: { constraints: [node.role == manager] }
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
-        - traefik.http.routers.portainer.rule=Host(\`$url_portainer\`)
+        - traefik.http.routers.portainer.rule=Host(`{url}`)
         - traefik.http.services.portainer.loadbalancer.server.port=9000
         - traefik.http.routers.portainer.tls.certresolver=letsencryptresolver
         - traefik.http.routers.portainer.service=portainer
-        - traefik.docker.network=$nome_rede_interna
+        - traefik.swarm.network={rede}
         - traefik.http.routers.portainer.entrypoints=websecure
         - traefik.http.routers.portainer.priority=1
 volumes:
-  portainer_data: { external: true, name: portainer_data }
+  portainer_data: {{ external: true, name: portainer_data }}
 networks:
-  $nome_rede_interna: { external: true, attachable: true, name: $nome_rede_interna }
-EOL
+  {rede}: {{ external: true, attachable: true, name: {rede} }}
+''')
+PYEOF
 
     pull portainer/agent:latest portainer/portainer-ce:latest
     docker stack deploy --prune --resolve-image always -c portainer.yaml portainer
@@ -486,26 +496,30 @@ instalar_postgres() {
     senha_postgres=$(openssl rand -hex 16)
     docker volume create postgres_data 2>/dev/null || true
 
-    cat > postgres.yaml <<EOL
-version: "3.7"
+    python3 - "$nome_rede_interna" "$senha_postgres" << 'PYEOF'
+import sys
+rede, pgpass = sys.argv[1], sys.argv[2]
+with open('/root/postgres.yaml', 'w') as f:
+    f.write(f'''version: "3.7"
 services:
   postgres:
     image: postgres:14
     command: postgres -c max_connections=500 -c timezone=America/Sao_Paulo
     volumes: [ postgres_data:/var/lib/postgresql/data ]
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     environment:
-      POSTGRES_PASSWORD: $senha_postgres
+      POSTGRES_PASSWORD: {pgpass}
       TZ: America/Sao_Paulo
     deploy:
       mode: replicated
       replicas: 1
-      placement: { constraints: [node.role == manager] }
+      placement: {{ constraints: [node.role == manager] }}
 volumes:
-  postgres_data: { external: true, name: postgres_data }
+  postgres_data: {{ external: true, name: postgres_data }}
 networks:
-  $nome_rede_interna: { external: true, name: $nome_rede_interna }
-EOL
+  {rede}: {{ external: true, name: {rede} }}
+''')
+PYEOF
 
     STACK_NAME="postgres"
     stack_editavel
@@ -531,21 +545,24 @@ instalar_evolution() {
 
     criar_banco_postgres_da_stack evolution
 
-    cat > evolution.yaml <<EOL
-version: "3.7"
+    python3 - "$nome_rede_interna" "$url_evolution" "$apikeyglobal" "$senha_postgres" << 'PYEOF'
+import sys
+rede, url, apikey, pgpass = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open('/root/evolution.yaml', 'w') as f:
+    f.write(f'''version: "3.7"
 services:
   evolution_api:
     image: evoapicloud/evolution-api:latest
     volumes: [ evolution_instances:/evolution/instances ]
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     environment:
-      SERVER_URL: https://$url_evolution
-      AUTHENTICATION_API_KEY: $apikeyglobal
+      SERVER_URL: https://{url}
+      AUTHENTICATION_API_KEY: {apikey}
       AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
       LANGUAGE: pt-BR
       DATABASE_ENABLED: "true"
       DATABASE_PROVIDER: postgresql
-      DATABASE_CONNECTION_URI: postgresql://postgres:$senha_postgres@postgres:5432/evolution
+      DATABASE_CONNECTION_URI: postgresql://postgres:{pgpass}@postgres:5432/evolution
       DATABASE_CONNECTION_CLIENT_NAME: evolution
       CACHE_REDIS_ENABLED: "true"
       CACHE_REDIS_URI: redis://evolution_redis:6379/1
@@ -555,10 +572,10 @@ services:
     deploy:
       mode: replicated
       replicas: 1
-      placement: { constraints: [node.role == manager] }
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
-        - traefik.http.routers.evolution.rule=Host(\`$url_evolution\`)
+        - traefik.http.routers.evolution.rule=Host(`{url}`)
         - traefik.http.routers.evolution.entrypoints=websecure
         - traefik.http.routers.evolution.tls.certresolver=letsencryptresolver
         - traefik.http.services.evolution.loadbalancer.server.port=8080
@@ -566,14 +583,15 @@ services:
     image: redis:latest
     command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
     volumes: [ evolution_redis:/data ]
-    networks: [ $nome_rede_interna ]
-    deploy: { placement: { constraints: [node.role == manager] } }
+    networks: [ {rede} ]
+    deploy: {{ placement: {{ constraints: [node.role == manager] }} }}
 volumes:
-  evolution_instances: { external: true, name: evolution_instances }
-  evolution_redis: { external: true, name: evolution_redis }
+  evolution_instances: {{ external: true, name: evolution_instances }}
+  evolution_redis: {{ external: true, name: evolution_redis }}
 networks:
-  $nome_rede_interna: { external: true, name: $nome_rede_interna }
-EOL
+  {rede}: {{ external: true, name: {rede} }}
+''')
+PYEOF
 
     STACK_NAME="evolution"
     stack_editavel
@@ -591,39 +609,43 @@ instalar_minio() {
 
     docker volume create minio_data 2>/dev/null || true
 
-    cat > minio.yaml <<EOL
-version: "3.7"
+    python3 - "$nome_rede_interna" "$minio_version" "$user_minio" "$senha_minio" "$url_minio" "$url_s3" << 'PYEOF'
+import sys
+rede, ver, user, pwd, url_minio, url_s3 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+with open('/root/minio.yaml', 'w') as f:
+    f.write(f'''version: "3.7"
 services:
   minio:
-    image: quay.io/minio/minio:$minio_version
+    image: quay.io/minio/minio:{ver}
     command: server /data --console-address ":9001"
     volumes: [ minio_data:/data ]
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     environment:
-      MINIO_ROOT_USER: $user_minio
-      MINIO_ROOT_PASSWORD: $senha_minio
-      MINIO_BROWSER_REDIRECT_URL: https://$url_minio
-      MINIO_SERVER_URL: https://$url_s3
+      MINIO_ROOT_USER: {user}
+      MINIO_ROOT_PASSWORD: {pwd}
+      MINIO_BROWSER_REDIRECT_URL: https://{url_minio}
+      MINIO_SERVER_URL: https://{url_s3}
       MINIO_REGION_NAME: eu-south
     deploy:
       mode: replicated
       replicas: 1
-      placement: { constraints: [node.role == manager] }
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
-        - traefik.http.routers.minio_public.rule=Host(\`$url_s3\`)
+        - traefik.http.routers.minio_public.rule=Host(`{url_s3}`)
         - traefik.http.routers.minio_public.entrypoints=websecure
         - traefik.http.routers.minio_public.tls.certresolver=letsencryptresolver
         - traefik.http.services.minio_public.loadbalancer.server.port=9000
-        - traefik.http.routers.minio_console.rule=Host(\`$url_minio\`)
+        - traefik.http.routers.minio_console.rule=Host(`{url_minio}`)
         - traefik.http.routers.minio_console.entrypoints=websecure
         - traefik.http.routers.minio_console.tls.certresolver=letsencryptresolver
         - traefik.http.services.minio_console.loadbalancer.server.port=9001
 volumes:
-  minio_data: { external: true, name: minio_data }
+  minio_data: {{ external: true, name: minio_data }}
 networks:
-  $nome_rede_interna: { external: true, name: $nome_rede_interna }
-EOL
+  {rede}: {{ external: true, name: {rede} }}
+''')
+PYEOF
 
     STACK_NAME="minio"
     stack_editavel
@@ -645,13 +667,19 @@ instalar_n8n() {
 
     docker volume create n8n_redis 2>/dev/null || true
 
-    cat > n8n.yaml <<EOL
-version: "3.7"
+    python3 - "$nome_rede_interna" "$senha_postgres" "$encryption_key" "$url_editorn8n" "$url_webhookn8n" \
+        "$email_smtp_n8n" "$usuario_smtp_n8n" "$senha_smtp_n8n" "$host_smtp_n8n" "$porta_smtp_n8n" "$smtp_secure_smtp_n8n" << 'PYEOF'
+import sys
+a = sys.argv
+rede, pgpass, enc, url_ed, url_wh = a[1], a[2], a[3], a[4], a[5]
+smtp_sender, smtp_user, smtp_pass, smtp_host, smtp_port, smtp_ssl = a[6], a[7], a[8], a[9], a[10], a[11]
+with open('/root/n8n.yaml', 'w') as f:
+    f.write(f'''version: "3.7"
 services:
   n8n_editor:
     image: n8nio/n8n:latest
     command: start
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     environment:
       N8N_FIX_MIGRATIONS: "true"
       DB_TYPE: postgresdb
@@ -659,38 +687,38 @@ services:
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
       DB_POSTGRESDB_USER: postgres
-      DB_POSTGRESDB_PASSWORD: $senha_postgres
-      N8N_ENCRYPTION_KEY: $encryption_key
-      N8N_HOST: $url_editorn8n
-      N8N_EDITOR_BASE_URL: https://$url_editorn8n/
-      WEBHOOK_URL: https://$url_webhookn8n/
+      DB_POSTGRESDB_PASSWORD: {pgpass}
+      N8N_ENCRYPTION_KEY: {enc}
+      N8N_HOST: {url_ed}
+      N8N_EDITOR_BASE_URL: https://{url_ed}/
+      WEBHOOK_URL: https://{url_wh}/
       N8N_PROTOCOL: https
       N8N_PROXY_HOPS: 1
       N8N_ONBOARDING_FLOW_DISABLED: "true"
       EXECUTIONS_MODE: queue
       QUEUE_BULL_REDIS_HOST: n8n_redis
       QUEUE_BULL_REDIS_PORT: 6379
-      N8N_SMTP_SENDER: $email_smtp_n8n
-      N8N_SMTP_USER: $usuario_smtp_n8n
-      N8N_SMTP_PASS: $senha_smtp_n8n
-      N8N_SMTP_HOST: $host_smtp_n8n
-      N8N_SMTP_PORT: $porta_smtp_n8n
-      N8N_SMTP_SSL: $smtp_secure_smtp_n8n
+      N8N_SMTP_SENDER: {smtp_sender}
+      N8N_SMTP_USER: {smtp_user}
+      N8N_SMTP_PASS: {smtp_pass}
+      N8N_SMTP_HOST: {smtp_host}
+      N8N_SMTP_PORT: {smtp_port}
+      N8N_SMTP_SSL: {smtp_ssl}
       TZ: America/Sao_Paulo
     deploy:
       mode: replicated
       replicas: 1
-      placement: { constraints: [node.role == manager] }
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
-        - traefik.http.routers.n8n_editor.rule=Host(\`$url_editorn8n\`)
+        - traefik.http.routers.n8n_editor.rule=Host(`{url_ed}`)
         - traefik.http.routers.n8n_editor.entrypoints=websecure
         - traefik.http.routers.n8n_editor.tls.certresolver=letsencryptresolver
         - traefik.http.services.n8n_editor.loadbalancer.server.port=5678
   n8n_webhook:
     image: n8nio/n8n:latest
     command: webhook
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     environment:
       N8N_FIX_MIGRATIONS: "true"
       DB_TYPE: postgresdb
@@ -698,53 +726,54 @@ services:
       DB_POSTGRESDB_HOST: postgres
       DB_POSTGRESDB_PORT: 5432
       DB_POSTGRESDB_USER: postgres
-      DB_POSTGRESDB_PASSWORD: $senha_postgres
-      N8N_ENCRYPTION_KEY: $encryption_key
-      N8N_HOST: $url_editorn8n
-      WEBHOOK_URL: https://$url_webhookn8n/
+      DB_POSTGRESDB_PASSWORD: {pgpass}
+      N8N_ENCRYPTION_KEY: {enc}
+      N8N_HOST: {url_ed}
+      WEBHOOK_URL: https://{url_wh}/
       N8N_PROTOCOL: https
       QUEUE_BULL_REDIS_HOST: n8n_redis
-      N8N_SMTP_SENDER: $email_smtp_n8n
-      N8N_SMTP_USER: $usuario_smtp_n8n
-      N8N_SMTP_PASS: $senha_smtp_n8n
-      N8N_SMTP_HOST: $host_smtp_n8n
-      N8N_SMTP_PORT: $porta_smtp_n8n
-      N8N_SMTP_SSL: $smtp_secure_smtp_n8n
+      N8N_SMTP_SENDER: {smtp_sender}
+      N8N_SMTP_USER: {smtp_user}
+      N8N_SMTP_PASS: {smtp_pass}
+      N8N_SMTP_HOST: {smtp_host}
+      N8N_SMTP_PORT: {smtp_port}
+      N8N_SMTP_SSL: {smtp_ssl}
       TZ: America/Sao_Paulo
     deploy:
       mode: replicated
       replicas: 1
-      placement: { constraints: [node.role == manager] }
+      placement: {{ constraints: [node.role == manager] }}
       labels:
         - traefik.enable=true
-        - traefik.http.routers.n8n_webhook.rule=Host(\`$url_webhookn8n\`)
+        - traefik.http.routers.n8n_webhook.rule=Host(`{url_wh}`)
         - traefik.http.routers.n8n_webhook.entrypoints=websecure
         - traefik.http.routers.n8n_webhook.tls.certresolver=letsencryptresolver
         - traefik.http.services.n8n_webhook.loadbalancer.server.port=5678
   n8n_worker:
     image: n8nio/n8n:latest
     command: worker --concurrency=10
-    networks: [ $nome_rede_interna ]
+    networks: [ {rede} ]
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_DATABASE: n8n_queue
       DB_POSTGRESDB_HOST: postgres
-      DB_POSTGRESDB_PASSWORD: $senha_postgres
-      N8N_ENCRYPTION_KEY: $encryption_key
+      DB_POSTGRESDB_PASSWORD: {pgpass}
+      N8N_ENCRYPTION_KEY: {enc}
       QUEUE_BULL_REDIS_HOST: n8n_redis
       TZ: America/Sao_Paulo
-    deploy: { mode: replicated, replicas: 1, placement: { constraints: [node.role == manager] } }
+    deploy: {{ mode: replicated, replicas: 1, placement: {{ constraints: [node.role == manager] }} }}
   n8n_redis:
     image: redis:latest
     command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
     volumes: [ n8n_redis:/data ]
-    networks: [ $nome_rede_interna ]
-    deploy: { placement: { constraints: [node.role == manager] } }
+    networks: [ {rede} ]
+    deploy: {{ placement: {{ constraints: [node.role == manager] }} }}
 volumes:
-  n8n_redis: { external: true, name: n8n_redis }
+  n8n_redis: {{ external: true, name: n8n_redis }}
 networks:
-  $nome_rede_interna: { external: true, name: $nome_rede_interna }
-EOL
+  {rede}: {{ external: true, name: {rede} }}
+''')
+PYEOF
 
     STACK_NAME="n8n"
     stack_editavel
