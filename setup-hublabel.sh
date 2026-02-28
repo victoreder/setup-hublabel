@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.4
+## SETUP PERSONALIZADO HUBLABEL v1.5
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -296,7 +296,7 @@ coletar_informacoes() {
     echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
     echo ""
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.4                                                   ${reset}"
+    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.5                                                   ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
@@ -311,48 +311,68 @@ coletar_informacoes() {
     dominio_base="${dominio_base,,}"
     dominio_base="${dominio_base#www.}"
     echo ""
-    echo -e "${branco}Agora informe apenas o subdomínio para cada serviço. Será usado: subdominio.$dominio_base${reset}"
-    echo ""
 
-    ## Traefik + Portainer
-    echo -e "${verde}[1/4] Traefik e Portainer${reset}"
-    read -p "Subdomínio do Portainer (ex: painel): " sub_portainer
-    sub_portainer="${sub_portainer:-painel}"
+    read -p "Os subdominios usados são os padroes? (Y/N): " subdominios_padrao
+    subdominios_padrao="${subdominios_padrao:-N}"
+
+    if [ "${subdominios_padrao^^}" = "Y" ]; then
+        sub_portainer="painel"
+        sub_evolution="wpp"
+        sub_minio="imagens"
+        sub_s3="s3"
+        sub_n8n="back"
+        sub_webhook="app"
+        echo ""
+        echo -e "${verde}Subdomínios padrão aplicados:${reset}"
+        echo "  Portainer: painel | Evolution: wpp | MinIO: imagens | S3: s3 | N8N Editor: back | N8N Webhook: app"
+        echo ""
+    else
+        echo ""
+        echo -e "${branco}Agora informe apenas o subdomínio para cada serviço. Será usado: subdominio.$dominio_base${reset}"
+        echo ""
+
+        ## Traefik + Portainer
+        echo -e "${verde}[1/4] Traefik e Portainer${reset}"
+        read -p "Subdomínio do Portainer (ex: painel): " sub_portainer
+        sub_portainer="${sub_portainer:-painel}"
+        echo ""
+
+        ## Evolution API
+        echo -e "${verde}[2/4] Evolution API${reset}"
+        read -p "Subdomínio da Evolution API (ex: evolution): " sub_evolution
+        sub_evolution="${sub_evolution:-evolution}"
+        echo ""
+
+        ## MinIO
+        echo -e "${verde}[3/4] MinIO${reset}"
+        read -p "Subdomínio do painel MinIO (ex: minio): " sub_minio
+        sub_minio="${sub_minio:-minio}"
+        read -p "Subdomínio da API S3 (ex: s3): " sub_s3
+        sub_s3="${sub_s3:-s3}"
+        echo ""
+
+        ## N8N
+        echo -e "${verde}[4/4] N8N${reset}"
+        read -p "Subdomínio do N8N Editor (ex: n8n): " sub_n8n
+        sub_n8n="${sub_n8n:-n8n}"
+        read -p "Subdomínio do Webhook N8N (ex: hook): " sub_webhook
+        sub_webhook="${sub_webhook:-hook}"
+        echo ""
+    fi
+
     url_portainer="${sub_portainer}.${dominio_base}"
     user_portainer="admin"
     pass_portainer="EjGse3_0@t50OPo"
     dominio_sem_sufixo="${dominio_base%%.*}"
     nome_servidor="$dominio_sem_sufixo"
     nome_rede_interna="Rede$dominio_sem_sufixo"
-    echo ""
-
-    ## Evolution API
-    echo -e "${verde}[2/4] Evolution API${reset}"
-    read -p "Subdomínio da Evolution API (ex: evolution): " sub_evolution
-    sub_evolution="${sub_evolution:-evolution}"
     url_evolution="${sub_evolution}.${dominio_base}"
-    echo ""
-
-    ## MinIO
-    echo -e "${verde}[3/4] MinIO${reset}"
-    read -p "Subdomínio do painel MinIO (ex: minio): " sub_minio
-    sub_minio="${sub_minio:-minio}"
     url_minio="${sub_minio}.${dominio_base}"
-    read -p "Subdomínio da API S3 (ex: s3): " sub_s3
-    sub_s3="${sub_s3:-s3}"
     url_s3="${sub_s3}.${dominio_base}"
     user_minio="admin"
     senha_minio="EjGse3_0@t50OPo"
     minio_version="RELEASE.2024-01-13T07-53-03Z-cpuv1"
-    echo ""
-
-    ## N8N
-    echo -e "${verde}[4/4] N8N${reset}"
-    read -p "Subdomínio do N8N Editor (ex: n8n): " sub_n8n
-    sub_n8n="${sub_n8n:-n8n}"
     url_editorn8n="${sub_n8n}.${dominio_base}"
-    read -p "Subdomínio do Webhook N8N (ex: hook): " sub_webhook
-    sub_webhook="${sub_webhook:-hook}"
     url_webhookn8n="${sub_webhook}.${dominio_base}"
     email_smtp_n8n="suporte@$dominio_base"
     usuario_smtp_n8n="suporte@$dominio_base"
