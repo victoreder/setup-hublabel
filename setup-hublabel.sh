@@ -520,7 +520,7 @@ services:
 ## --------------------------- HUBLABEL --------------------------- ##
 
   traefik:
-    image: traefik:v3.5.3  ## Versão do Traefik
+    image: traefik:latest  ## Versão do Traefik
     command:
       - "--api.dashboard=true"
       - "--providers.swarm=true"
@@ -645,7 +645,7 @@ services:
         - traefik.http.services.portainer.loadbalancer.server.port=9000
         - traefik.http.routers.portainer.tls.certresolver=letsencryptresolver
         - traefik.http.routers.portainer.service=portainer
-        - traefik.docker.network={rede}  ## Nome da rede interna
+        - traefik.swarm.network={rede}  ## Nome da rede interna
         - traefik.http.routers.portainer.entrypoints=websecure
         - traefik.http.routers.portainer.priority=1
 
