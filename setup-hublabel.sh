@@ -93,7 +93,7 @@ verificar_container_postgres() {
 pegar_senha_postgres() {
     while :; do
         if [ -f /root/postgres.yaml ]; then
-            senha_postgres=$(grep "POSTGRES_PASSWORD" /root/postgres.yaml | sed 's/.*: *//' | tr -d ' ')
+            senha_postgres=$(grep "POSTGRES_PASSWORD" /root/postgres.yaml | sed 's/.*POSTGRES_PASSWORD=//' | tr -d ' \r\n')
             [ -n "$senha_postgres" ] && break
         fi
         sleep 2
@@ -822,7 +822,7 @@ services:
     ## 🗄️ Configuracao do Banco de Dados
       - DATABASE_ENABLED=true
       - DATABASE_PROVIDER=postgresql
-      - DATABASE_CONNECTION_URI=postgresql://postgres:{pgpass}@postgres:5432/evolution
+      - DATABASE_CONNECTION_URI=postgresql://postgres:{pgpass}@postgres_postgres:5432/evolution
       - DATABASE_CONNECTION_CLIENT_NAME=evolution
       - DATABASE_SAVE_DATA_INSTANCE=true
       - DATABASE_SAVE_DATA_NEW_MESSAGE=false
@@ -993,7 +993,7 @@ services:
       placement: {{ constraints: [node.role == manager] }}
       resources:
         limits:
-          cpus: "2"
+          cpus: "1"
           memory: 2048M
 volumes:
   evolution_instances: {{ external: true, name: evolution_instances }}
@@ -1317,7 +1317,7 @@ services:
           - node.role == manager
       resources:
         limits:
-          cpus: "2"
+          cpus: "1"
           memory: 2048M
       labels:
         - traefik.enable=true
@@ -1425,7 +1425,7 @@ services:
           - node.role == manager
       resources:
         limits:
-          cpus: "2"
+          cpus: "1"
           memory: 2048M
 
 ## --------------------------- HUBLABEL --------------------------- ##
