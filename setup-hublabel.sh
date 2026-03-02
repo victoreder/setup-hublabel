@@ -723,9 +723,12 @@ services:
     image: postgres:14  ## Versão do postgres
     command:
       - postgres
-      - -c max_connections=500
-      - -c shared_buffers=64MB
-      - -c timezone=America/Sao_Paulo
+      - -c
+      - max_connections=500
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - timezone=America/Sao_Paulo
 
     volumes:
       - postgres_data:/var/lib/postgresql/data
