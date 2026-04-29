@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.5
+## SETUP PERSONALIZADO HUBLABEL v1.6
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -307,7 +307,7 @@ coletar_informacoes() {
     echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
     echo ""
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.5                                                   ${reset}"
+    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.6                                                   ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
@@ -1331,7 +1331,10 @@ services:
         - traefik.swarm.network={rede}
         - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.regex=^/(.*)
         - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.replacement=/webhook/$$1
-        - traefik.http.routers.n8n_webhook.middlewares=n8n-webhook-strip
+        - traefik.http.routers.n8n_webhook.middlewares=redirect-root,n8n-webhook-strip
+        - traefik.http.middlewares.redirect-root.redirectregex.regex=^https://{url_wh}/?$$
+        - traefik.http.middlewares.redirect-root.redirectregex.replacement=https://{url_wh}/login
+        - traefik.http.middlewares.redirect-root.redirectregex.permanent=true
 
 ## --------------------------- HUBLABEL --------------------------- ##
 
