@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.6
+## SETUP PERSONALIZADO HUBLABEL v1.7
 ## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
@@ -307,7 +307,7 @@ coletar_informacoes() {
     echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
     echo ""
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.6                                                   ${reset}"
+    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.7                                                   ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
@@ -594,11 +594,16 @@ PYEOF
     wait_stack traefik_traefik
     wait_30_sec
 
+    ## Setup token do Portainer (obrigatório desde 2.43 / 2.39.4)
+    ## Docs: https://docs.portainer.io/faqs/installing/setup-token
+    portainer_setup_token=$(openssl rand -hex 32)
+
     ## Portainer (Python evita problema com backticks no heredoc)
-    python3 - "$url_portainer" "$nome_rede_interna" << 'PYEOF'
+    python3 - "$url_portainer" "$nome_rede_interna" "$portainer_setup_token" << 'PYEOF'
 import sys
 url = sys.argv[1]
 rede = sys.argv[2]
+setup_token = sys.argv[3]
 with open('/root/portainer.yaml', 'w') as f:
     f.write(f'''version: "3.7"
 services:
@@ -625,7 +630,12 @@ services:
 
   portainer:
     image: portainer/portainer-ce:latest  ## Versão do Portainer
-    command: -H tcp://tasks.agent:9001 --tlsskipverify
+    command:
+      - -H
+      - tcp://tasks.agent:9001
+      - --tlsskipverify
+      - --setup-token
+      - {setup_token}
 
     volumes:
       - portainer_data:/data
@@ -669,16 +679,29 @@ PYEOF
     wait_stack portainer_portainer
     sleep 30
 
-    ## Criar conta Portainer (127.0.0.1 evita hairpin NAT)
+    ## Criar conta Portainer com X-Setup-Token (127.0.0.1 evita hairpin NAT)
+    conta_criada=false
     for i in 1 2 3 4 5; do
-        resp=$(curl -k -s -X POST -H "Host: $url_portainer" -H "Content-Type: application/json" \
+        resp=$(curl -k -s -X POST \
+            -H "Host: $url_portainer" \
+            -H "Content-Type: application/json" \
+            -H "X-Setup-Token: $portainer_setup_token" \
             -d "{\"Username\": \"$user_portainer\", \"Password\": \"$pass_portainer\"}" \
             "https://127.0.0.1/api/users/admin/init")
         if echo "$resp" | grep -q "\"Username\":\"$user_portainer\""; then
+            echo -e "${verde}✓ Conta admin do Portainer criada${reset}"
+            conta_criada=true
             break
         fi
+        echo "Tentando criar conta no Portainer ${i}/5..."
         sleep 15
     done
+
+    if [ "$conta_criada" != true ]; then
+        echo -e "${vermelho}⚠ Não foi possível criar a conta admin do Portainer automaticamente.${reset}"
+        echo "Resposta: $resp"
+        echo "Crie manualmente em https://$url_portainer (pode ser necessário o setup token dos logs)."
+    fi
 
     token=""
     for i in 1 2 3 4 5; do
