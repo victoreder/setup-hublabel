@@ -1,8 +1,8 @@
 #!/bin/bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.7
-## Instala: Traefik, Portainer, Evolution API, MinIO, N8N e dependências
+## SETUP PERSONALIZADO HUBLABEL v1.8
+## Instala: Traefik, Portainer, Evolution API, MinIO, N8N, Disparador e dependências
 ## Baseado exatamente no SetupOrion - sem Basic Auth
 ##
 ## COMANDO PARA INICIAR A INSTALAÇÃO:
@@ -393,6 +393,12 @@ coletar_informacoes() {
     smtp_secure_smtp_n8n=true
     echo ""
 
+    ## Supabase (usado pelo Disparador)
+    echo -e "${verde}[Supabase]${reset}"
+    read -p "URL do Supabase (ex: https://xxxxx.supabase.co): " supabase_url
+    read -p "Service Role Key do Supabase: " supabase_service_role_key
+    echo ""
+
     ## Remover barras ou caracteres extras
     url_portainer="${url_portainer%%/*}"
     url_evolution="${url_evolution%%/*}"
@@ -400,6 +406,7 @@ coletar_informacoes() {
     url_s3="${url_s3%%/*}"
     url_editorn8n="${url_editorn8n%%/*}"
     url_webhookn8n="${url_webhookn8n%%/*}"
+    supabase_url="${supabase_url%/}"
 
     ## Confirmação
     clear
@@ -429,8 +436,12 @@ coletar_informacoes() {
     echo -e "${amarelo}N8N${reset}"
     echo "  https://$url_editorn8n"
     echo ""
-    echo -e "${amarelo}N8N WEBHOOK${reset}"
+    echo -e "${amarelo}N8N WEBHOOK / APP (Disparador)${reset}"
     echo "  https://$url_webhookn8n"
+    echo ""
+    echo -e "${amarelo}SUPABASE${reset}"
+    echo "  URL: $supabase_url"
+    echo "  Service Role: (informada)"
     echo ""
     echo -e "${amarelo}EMAIL${reset}"
     echo "  $email_ssl"
@@ -1115,7 +1126,97 @@ PYEOF
     STACK_NAME="minio"
     stack_editavel
     wait_stack minio_minio
+    sleep 20
+    criar_bucket_minio_n8n
     echo -e "${verde}✓ MinIO instalado${reset}"
+}
+
+## ============================================================================
+## BUCKET N8N + ACCESS KEY NO MINIO
+## ============================================================================
+
+criar_bucket_minio_n8n() {
+    echo -e "${amarelo}• Criando bucket n8n e Access Key no MinIO...${reset}"
+
+    local BUCKET_NAME="n8n"
+    local MINIO_CONTAINER
+    local MC_CMD
+    local S3_ENDPOINT=""
+    local endpoint
+
+    MINIO_CONTAINER=$(docker ps --filter "name=minio" -q | head -n1)
+    if [ -z "$MINIO_CONTAINER" ]; then
+        echo -e "${vermelho}Container MinIO não encontrado. Bucket/keys não foram criados.${reset}"
+        return 1
+    fi
+
+    MC_CMD="docker exec -i $MINIO_CONTAINER mc"
+
+    for endpoint in "http://localhost:9000" "http://minio:9000" "http://127.0.0.1:9000"; do
+        if $MC_CMD alias set admin "$endpoint" "$user_minio" "$senha_minio" >/dev/null 2>&1; then
+            S3_ENDPOINT="$endpoint"
+            echo -e "${verde}✓ Conectado ao MinIO via $S3_ENDPOINT${reset}"
+            break
+        fi
+    done
+
+    if [ -z "$S3_ENDPOINT" ]; then
+        echo -e "${vermelho}Falha ao conectar no MinIO para criar bucket/keys.${reset}"
+        return 1
+    fi
+
+    if $MC_CMD ls admin/"$BUCKET_NAME" >/dev/null 2>&1; then
+        echo -e "${amarelo}Bucket '$BUCKET_NAME' já existe, continuando...${reset}"
+    else
+        if $MC_CMD mb admin/"$BUCKET_NAME" >/dev/null 2>&1; then
+            echo -e "${verde}✓ Bucket '$BUCKET_NAME' criado${reset}"
+        else
+            echo -e "${amarelo}Não foi possível criar o bucket '$BUCKET_NAME' (pode já existir).${reset}"
+        fi
+    fi
+
+    if $MC_CMD anonymous set public admin/"$BUCKET_NAME" >/dev/null 2>&1; then
+        echo -e "${verde}✓ Política pública aplicada ao bucket '$BUCKET_NAME'${reset}"
+    else
+        echo -e "${amarelo}Falha ao aplicar política pública ao bucket '$BUCKET_NAME'${reset}"
+    fi
+
+    minio_n8n_access_key=$(head /dev/urandom | tr -dc A-Z0-9 | head -c 20)
+    minio_n8n_secret_key=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 40)
+
+    if $MC_CMD admin user add admin "$minio_n8n_access_key" "$minio_n8n_secret_key" >/dev/null 2>&1; then
+        echo -e "${verde}✓ Access Key criada no MinIO${reset}"
+    else
+        echo -e "${vermelho}Falha ao criar Access Key no MinIO${reset}"
+        return 1
+    fi
+
+    if $MC_CMD admin policy attach admin readwrite --user "$minio_n8n_access_key" >/dev/null 2>&1; then
+        echo -e "${verde}✓ Política readwrite anexada à Access Key${reset}"
+    else
+        # Fallback para versões antigas do mc
+        if $MC_CMD admin policy set admin readwrite user="$minio_n8n_access_key" >/dev/null 2>&1; then
+            echo -e "${verde}✓ Política readwrite anexada à Access Key${reset}"
+        else
+            echo -e "${amarelo}Falha ao anexar política à Access Key${reset}"
+        fi
+    fi
+
+    mkdir -p /root/dados_vps
+    cat > /root/dados_vps/dados_minio <<EOL
+[ MINIO ]
+
+Painel: https://$url_minio
+S3: https://$url_s3
+Usuario Root: $user_minio
+Senha Root: $senha_minio
+
+Bucket: $BUCKET_NAME
+Access Key: $minio_n8n_access_key
+Secret Key: $minio_n8n_secret_key
+EOL
+
+    echo -e "${verde}✓ Credenciais MinIO salvas em /root/dados_vps/dados_minio${reset}"
 }
 
 ## ============================================================================
@@ -1508,6 +1609,231 @@ PYEOF
 }
 
 ## ============================================================================
+## INSTALAÇÃO DISPARADOR (Meta + Evolution + Inbound)
+## ============================================================================
+
+instalar_disparador() {
+    echo -e "${amarelo}• Instalando Disparador Hublabel...${reset}"
+    cd /root
+    dados
+
+    if [ -z "${minio_n8n_access_key:-}" ] || [ -z "${minio_n8n_secret_key:-}" ]; then
+        if [ -f /root/dados_vps/dados_minio ]; then
+            minio_n8n_access_key=$(grep "Access Key:" /root/dados_vps/dados_minio | sed 's/.*Access Key: *//')
+            minio_n8n_secret_key=$(grep "Secret Key:" /root/dados_vps/dados_minio | sed 's/.*Secret Key: *//')
+        fi
+    fi
+
+    python3 - \
+        "$nome_rede_interna" \
+        "$supabase_url" \
+        "$supabase_service_role_key" \
+        "$url_evolution" \
+        "$apikeyglobal" \
+        "$url_webhookn8n" \
+        "$url_s3" \
+        "${minio_n8n_access_key}" \
+        "${minio_n8n_secret_key}" << 'PYEOF'
+import sys
+rede = sys.argv[1]
+supabase_url = sys.argv[2]
+supabase_key = sys.argv[3]
+url_evolution = sys.argv[4]
+evo_key = sys.argv[5]
+url_app = sys.argv[6]
+url_s3 = sys.argv[7]
+s3_access = sys.argv[8]
+s3_secret = sys.argv[9]
+
+with open('/root/disparador.yaml', 'w') as f:
+    f.write(f'''version: "3.7"
+services:
+
+## --------------------------- HUBLABEL DISPARADOR META --------------------------- ##
+
+  disparador-meta:
+    image: ghcr.io/victoreder/hublabel-disparador:latest
+
+    environment:
+      SUPABASE_URL: {supabase_url}
+      SUPABASE_SERVICE_ROLE_KEY: {supabase_key}
+      META_GRAPH_API_VERSION: v25.0
+      PORT: "3080"
+      SEND_INTERVAL_MS: "2000"
+      POLL_IDLE_MS: "2000"
+      MAX_RETRIES: "3"
+      NODE_ENV: production
+
+    networks:
+      - {rede}
+
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+      restart_policy:
+        condition: any
+        delay: 5s
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+## --------------------------- HUBLABEL DISPARADOR EVOLUTION --------------------------- ##
+
+  disparador-evolution:
+    image: ghcr.io/victoreder/hublabel-disparador:latest
+    command: ["node", "src/workers/evolution.js"]
+
+    environment:
+      SUPABASE_URL: {supabase_url}
+      SUPABASE_SERVICE_ROLE_KEY: {supabase_key}
+      EVOLUTION_BASE_URL: https://{url_evolution}
+      EVOLUTION_API_KEY: {evo_key}
+      NODE_ENV: production
+
+    networks:
+      - {rede}
+
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+      restart_policy:
+        condition: any
+        delay: 5s
+
+    healthcheck:
+      disable: true
+
+## --------------------------- HUBLABEL DISPARADOR INBOUND --------------------------- ##
+
+  disparador-inbound:
+    image: ghcr.io/victoreder/hublabel-disparador:latest
+    command: ["node", "src/inbound.js"]
+
+    environment:
+      SUPABASE_URL: {supabase_url}
+      SUPABASE_SERVICE_ROLE_KEY: {supabase_key}
+      BACK_URL: https://{url_app}
+      EVOLUTION_BASE_URL: https://{url_evolution}
+      EVOLUTION_API_KEY: {evo_key}
+      S3_ENDPOINT: https://{url_s3}
+      S3_ACCESS_KEY_ID: {s3_access}
+      S3_SECRET_ACCESS_KEY: {s3_secret}
+      S3_PUBLIC_BASE_URL: https://{url_s3}/n8n
+      REDIS_URL: redis://n8n_redis:6379
+      NODE_ENV: production
+
+    networks:
+      - {rede}
+
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+      restart_policy:
+        condition: any
+        delay: 5s
+      labels:
+        - traefik.enable=true
+        - traefik.swarm.network={rede}
+        - traefik.http.middlewares.disparador_inbound_strip.stripprefix.prefixes=/webhook
+        - traefik.http.routers.disparador_inbound_health.rule=Host(`{url_app}`) && Path(`/health`)
+        - traefik.http.routers.disparador_inbound_health.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_health.priority=1000
+        - traefik.http.routers.disparador_inbound_health.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_health.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_health.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_eventsmeta.rule=Host(`{url_app}`) && Path(`/eventsmeta`)
+        - traefik.http.routers.disparador_inbound_eventsmeta.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_eventsmeta.priority=1000
+        - traefik.http.routers.disparador_inbound_eventsmeta.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_eventsmeta.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_eventsmeta.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_evo.rule=Host(`{url_app}`) && Path(`/agente-no-whatsapp`)
+        - traefik.http.routers.disparador_inbound_evo.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_evo.priority=1000
+        - traefik.http.routers.disparador_inbound_evo.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_evo.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_evo.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_meta_token.rule=Host(`{url_app}`) && Path(`/meta-token`)
+        - traefik.http.routers.disparador_inbound_meta_token.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_meta_token.priority=1000
+        - traefik.http.routers.disparador_inbound_meta_token.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_meta_token.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_meta_token.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_meta_criar_tpl.rule=Host(`{url_app}`) && Path(`/meta-criar-template`)
+        - traefik.http.routers.disparador_inbound_meta_criar_tpl.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_meta_criar_tpl.priority=1000
+        - traefik.http.routers.disparador_inbound_meta_criar_tpl.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_meta_criar_tpl.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_meta_criar_tpl.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.rule=Host(`{url_app}`) && Path(`/meta-excluir-template`)
+        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.priority=1000
+        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_meta_perfil.rule=Host(`{url_app}`) && Path(`/meta-perfil`)
+        - traefik.http.routers.disparador_inbound_meta_perfil.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_meta_perfil.priority=1000
+        - traefik.http.routers.disparador_inbound_meta_perfil.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_meta_perfil.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_meta_perfil.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_meta_renovar.rule=Host(`{url_app}`) && Path(`/meta-renovar-token`)
+        - traefik.http.routers.disparador_inbound_meta_renovar.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_meta_renovar.priority=1000
+        - traefik.http.routers.disparador_inbound_meta_renovar.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_meta_renovar.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_meta_renovar.service=disparador_inbound
+        - traefik.http.routers.disparador_inbound_meta_renovar_cron.rule=Host(`{url_app}`) && Path(`/meta-renovar-token-cron`)
+        - traefik.http.routers.disparador_inbound_meta_renovar_cron.entrypoints=websecure
+        - traefik.http.routers.disparador_inbound_meta_renovar_cron.priority=1000
+        - traefik.http.routers.disparador_inbound_meta_renovar_cron.tls.certresolver=letsencryptresolver
+        - traefik.http.routers.disparador_inbound_meta_renovar_cron.middlewares=disparador_inbound_strip
+        - traefik.http.routers.disparador_inbound_meta_renovar_cron.service=disparador_inbound
+        - traefik.http.services.disparador_inbound.loadbalancer.server.port=3090
+        - traefik.http.services.disparador_inbound.loadbalancer.passHostHeader=1
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  {rede}:
+    external: true
+    name: {rede}
+''')
+PYEOF
+
+    pull ghcr.io/victoreder/hublabel-disparador:latest
+
+    STACK_NAME="disparador"
+    stack_editavel || { echo -e "${vermelho}Erro ao criar stack Disparador. Verifique o Portainer.${reset}"; return 1; }
+    wait_stack disparador_disparador-meta disparador_disparador-evolution disparador_disparador-inbound
+    echo -e "${verde}✓ Disparador instalado${reset}"
+}
+
+## ============================================================================
 ## RESUMO FINAL
 ## ============================================================================
 
@@ -1538,10 +1864,19 @@ resumo_final() {
     echo "  Painel: https://$url_minio"
     echo "  S3:     https://$url_s3"
     echo "  User:   $user_minio"
+    echo "  Bucket: n8n (público)"
+    if [ -n "${minio_n8n_access_key:-}" ]; then
+        echo "  Access Key: $minio_n8n_access_key"
+        echo "  Secret Key: $minio_n8n_secret_key"
+    fi
     echo ""
     echo -e "${amarelo}N8N${reset}"
     echo "  Editor:  https://$url_editorn8n"
     echo "  Webhook: https://$url_webhookn8n"
+    echo ""
+    echo -e "${amarelo}DISPARADOR${reset}"
+    echo "  App/Webhook: https://$url_webhookn8n"
+    echo "  Supabase:    $supabase_url"
     echo ""
     echo "Arquivos de configuração em /root/"
     echo "Dados da VPS em /root/dados_vps/"
@@ -1560,6 +1895,7 @@ main() {
     instalar_evolution
     instalar_minio
     instalar_n8n
+    instalar_disparador
     resumo_final
 }
 
