@@ -307,7 +307,7 @@ coletar_informacoes() {
     echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
     echo ""
     echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.7                                                   ${reset}"
+    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.8                                                   ${reset}"
     echo -e "${amarelo}====================================================================================================${reset}"
     echo ""
     echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
