@@ -382,7 +382,7 @@ coletar_informacoes() {
     url_s3="${sub_s3}.${dominio_base}"
     user_minio="admin"
     senha_minio="EjGse3_0@t50OPo"
-    minio_version="RELEASE.2024-01-13T07-53-03Z-cpuv1"
+    minio_image="ghcr.io/victoreder/minio:RELEASE.2024-01-13T07-53-03Z"
     url_editorn8n="${sub_n8n}.${dominio_base}"
     url_webhookn8n="${sub_webhook}.${dominio_base}"
     email_smtp_n8n="suporte@$dominio_base"
@@ -1054,7 +1054,7 @@ instalar_minio() {
 
     docker volume create minio_data 2>/dev/null || true
 
-    python3 - "$nome_rede_interna" "$minio_version" "$user_minio" "$senha_minio" "$url_minio" "$url_s3" << 'PYEOF'
+    python3 - "$nome_rede_interna" "$minio_image" "$user_minio" "$senha_minio" "$url_minio" "$url_s3" << 'PYEOF'
 import sys
 rede, ver, user, pwd, url_minio, url_s3 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
 with open('/root/minio.yaml', 'w') as f:
@@ -1064,7 +1064,7 @@ services:
 ## --------------------------- HUBLABEL --------------------------- ##
 
   minio:
-    image: quay.io/minio/minio:{ver}  ## Versão do MinIO
+    image: {ver}  ## Imagem própria do MinIO (console completo)
     command: server /data --console-address ":9001"
 
     volumes:
