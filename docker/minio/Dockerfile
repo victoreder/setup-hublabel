@@ -1,35 +1,30 @@
 ## MinIO RELEASE.2024-01-13T07-53-03Z (console completo: users, policies, access keys)
-## Imagem própria para não depender do quay.io/minio (que passou a retornar 401).
-## Binários baixados do arquivo oficial dl.min.io e validados por sha256.
+## Imagem própria para não depender do quay.io/minio (401) nem do dl.min.io (410).
+## Compila minio + mc a partir das tags oficiais do GitHub, com as mesmas ldflags
+## do build oficial (minio --version mostra RELEASE.2024-01-13T07-53-03Z).
 
-FROM debian:bookworm-slim AS build
+FROM --platform=$BUILDPLATFORM golang:1.21-bookworm AS build
 
+ARG TARGETOS
 ARG TARGETARCH
 ARG MINIO_RELEASE=RELEASE.2024-01-13T07-53-03Z
-ARG MC_MONTH=2024-01
+ARG MC_RELEASE=RELEASE.2024-01-13T08-44-48Z
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl \
- && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /out
+ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 
 ## minio server
 RUN set -eux; \
-    base="https://dl.min.io/server/minio/release/linux-${TARGETARCH}/archive"; \
-    curl -fsSL -o minio "${base}/minio.${MINIO_RELEASE}"; \
-    echo "$(curl -fsSL "${base}/minio.${MINIO_RELEASE}.sha256sum" | awk '{print $1}')  minio" | sha256sum -c -; \
-    chmod +x minio
+    git clone --depth 1 --branch "${MINIO_RELEASE}" https://github.com/minio/minio /src/minio; \
+    cd /src/minio; \
+    LDFLAGS="$(MINIO_RELEASE=RELEASE go run buildscripts/gen-ldflags.go "${MINIO_RELEASE#RELEASE.}")"; \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -tags kqueue -trimpath -ldflags "$LDFLAGS" -o /out/minio .
 
-## mc (cliente, usado pelo setup via docker exec) - última release do mesmo mês
+## mc (cliente, usado pelo setup via docker exec)
 RUN set -eux; \
-    base="https://dl.min.io/client/mc/release/linux-${TARGETARCH}/archive"; \
-    mc_release=$(curl -fsSL "${base}/" | grep -o "mc\.RELEASE\.${MC_MONTH}-[0-9T-]*Z" | sort -u | tail -n1 | sed 's/^mc\.//'); \
-    test -n "$mc_release"; \
-    echo "mc: $mc_release"; \
-    curl -fsSL -o mc "${base}/mc.${mc_release}"; \
-    echo "$(curl -fsSL "${base}/mc.${mc_release}.sha256sum" | awk '{print $1}')  mc" | sha256sum -c -; \
-    chmod +x mc
+    git clone --depth 1 --branch "${MC_RELEASE}" https://github.com/minio/mc /src/mc; \
+    cd /src/mc; \
+    LDFLAGS="$(MC_RELEASE=RELEASE go run buildscripts/gen-ldflags.go "${MC_RELEASE#RELEASE.}")"; \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags "$LDFLAGS" -o /out/mc .
 
 FROM debian:bookworm-slim
 
