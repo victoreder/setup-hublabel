@@ -602,16 +602,34 @@ descrever_ambiente() {
 ## ============================================================================
 
 ## ---------------------------------------------------------------- Passo 1: domínios
+## Deixa só o domínio: tira http(s)://, www., caminho, porta, espaços e ponto no fim
+## Ex.: "HTTPS://www.SuaEmpresa.com.br/login" → "suaempresa.com.br"
+normalizar_dominio() {
+    local d
+    d="$(limpar "$1")"
+    d="${d,,}"
+    d="${d// /}"
+    d="$(printf '%s' "$d" | sed -E 's#^[a-z]+:/*##; s#^[^@/]*@##; s#[/?\#].*$##; s#:[0-9]*$##; s#\.+$##; s#^(www\.)+##')"
+    printf '%s' "$d"
+}
+
+## Subdomínio: só a primeira parte (ex.: "https://app.suaempresa.com.br" → "app")
+normalizar_sub() {
+    local d
+    d="$(normalizar_dominio "$1")"
+    printf '%s' "${d%%.*}"
+}
+
 passo_dominios() {
     while :; do
         cabecalho_passo 1 "DOMÍNIOS"
         texto "Qual é o domínio da sua empresa?"
         dica "Exemplo: suaempresa.com.br  (sem https:// e sem www)"
         echo ""
-        perguntar DOMINIO_BASE "Domínio" "${DOMINIO_BASE:-}" || return 1
-        DOMINIO_BASE="${DOMINIO_BASE,,}"
-        DOMINIO_BASE="${DOMINIO_BASE#http://}"; DOMINIO_BASE="${DOMINIO_BASE#https://}"
-        DOMINIO_BASE="${DOMINIO_BASE%%/*}"; DOMINIO_BASE="${DOMINIO_BASE#www.}"
+        local d
+        perguntar d "Domínio" "${DOMINIO_BASE:-}" || return 1
+        DOMINIO_BASE="$(normalizar_dominio "$d")"
+        [ "$DOMINIO_BASE" != "$(limpar "$d")" ] && dica "  Ajustei para: $DOMINIO_BASE"
         if ! [[ "$DOMINIO_BASE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
             falha "Domínio inválido: $DOMINIO_BASE"
             enter
@@ -634,8 +652,7 @@ passo_dominios() {
                 perguntar SUB_APP "Sistema" "${SUB_APP:-app}" || continue
                 perguntar SUB_EVO "WhatsApp" "${SUB_EVO:-wpp}" || continue
                 perguntar SUB_S3 "Arquivos" "${SUB_S3:-s3}" || continue
-                SUB_APP="${SUB_APP%%.*}"; SUB_EVO="${SUB_EVO%%.*}"; SUB_S3="${SUB_S3%%.*}"
-                SUB_APP="${SUB_APP,,}"; SUB_EVO="${SUB_EVO,,}"; SUB_S3="${SUB_S3,,}"
+                SUB_APP="$(normalizar_sub "$SUB_APP")"; SUB_EVO="$(normalizar_sub "$SUB_EVO")"; SUB_S3="$(normalizar_sub "$SUB_S3")"
                 ;;
         esac
         APP_HOST="$SUB_APP.$DOMINIO_BASE"
