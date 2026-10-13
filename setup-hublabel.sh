@@ -35,6 +35,8 @@ S3_BUCKET="n8n"
 SENHA_PADRAO_INTEGRACAO="Padrao123456"
 ## Senha inicial do administrador criado pelo setup
 ADMIN_SENHA_PADRAO="Padrao123456"
+## SQL de criação das tabelas (arquivo único, neste repositório)
+SQL_URL="https://raw.githubusercontent.com/victoreder/setup-hublabel/main/sql/criar-tabelas.sql"
 ## Tabelas conferidas depois do SQL (FollowupExecucao fica no fim do arquivo)
 TABELAS_SQL=(SAAS_Contas SAAS_Usuarios FollowupExecucao SAAS_Personalizacao)
 
@@ -857,7 +859,7 @@ tabelas_faltando() {
 
 passo_sql() {
     cabecalho_passo 3 "TABELAS"
-    local falta resp link ref
+    local falta resp
     info "Conferindo as tabelas no seu Supabase..."
     falta="$(tabelas_faltando)"
     if [ -z "${falta// /}" ]; then
@@ -865,16 +867,14 @@ passo_sql() {
         sleep 1
         return 0
     fi
-    ref="$(ref_supabase)"
-    link="${ref:+https://supabase.com/dashboard/project/$ref/sql/new}"
     echo ""
     falha "As tabelas do sistema ainda não existem no seu Supabase."
     echo ""
     texto "Siga o ${branco}vídeo de instalação${reset} para criar as tabelas:"
     echo ""
-    instrucao "1." "Copie o ${branco}SQL${reset} que está na ${branco}descrição do vídeo${reset}"
+    instrucao "1." "Copie o ${branco}SQL${reset} que está na ${branco}descrição do vídeo${reset} ou neste link:"
+    echo -e "      ${verde}$SQL_URL${reset}"
     instrucao "2." "Abra o ${branco}SQL Editor${reset} do seu Supabase e cole o SQL"
-    [ -n "$link" ] && echo -e "      ${cinza}$link${reset}"
     instrucao "3." "Clique em ${branco}Run${reset} e espere aparecer ${branco}Success${reset}"
     echo ""
     while :; do
