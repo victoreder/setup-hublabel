@@ -33,8 +33,12 @@ IMG_CADDY="caddy:2-alpine"
 
 S3_BUCKET="n8n"
 SENHA_PADRAO_INTEGRACAO="Padrao123456"
+## Senha inicial do administrador criado pelo setup
+ADMIN_SENHA_PADRAO="Padrao123456"
+## SQL de criação das tabelas (arquivo único, neste repositório)
+SQL_URL="https://raw.githubusercontent.com/victoreder/setup-hublabel/main/sql/criar-tabelas.sql"
 ## Tabelas conferidas depois do SQL (FollowupExecucao fica no fim do arquivo)
-TABELAS_SQL=(SAAS_Contas SAAS_Usuarios FollowupExecucao)
+TABELAS_SQL=(SAAS_Contas SAAS_Usuarios FollowupExecucao SAAS_Personalizacao)
 
 amarelo="\e[33m"
 verde="\e[32m"
@@ -475,7 +479,7 @@ descrever_ambiente() {
 ## ASSISTENTE (PERGUNTAS)
 ## ============================================================================
 
-TOTAL_PASSOS=5
+TOTAL_PASSOS=6
 
 passo_dominios() {
     cabecalho_passo 1 $TOTAL_PASSOS "Domínios"
@@ -703,8 +707,10 @@ passo_sql() {
         echo ""
         echo "As tabelas do sistema ainda não existem no seu Supabase. Para criar:"
         echo -e "  1. Abra o ${branco}SQL Editor${reset} do Supabase${link:+: ${verde}$link${reset}}"
-        echo -e "  2. Cole o conteúdo do arquivo SQL de criação das tabelas e clique em ${branco}Run${reset}"
-        echo -e "  3. Espere aparecer ${branco}Success${reset} e volte aqui"
+        echo -e "  2. Abra este arquivo, copie tudo (Ctrl+A, Ctrl+C) e cole no SQL Editor:"
+        echo -e "     ${verde}$SQL_URL${reset}"
+        echo -e "  3. Clique em ${branco}Run${reset}"
+        echo -e "  4. Espere aparecer ${branco}Success${reset} e volte aqui"
         echo ""
         printf '%b' "Aperte ${branco}Enter${reset} depois de rodar o SQL (0 = voltar): "
         ler resp
@@ -788,8 +794,45 @@ passo_licenca() {
     done
 }
 
+## Busca um usuário do sistema pelo e-mail → imprime o id (vazio se não existe)
+usuario_por_email() {
+    local q
+    q="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1")"
+    supabase_curl "$SUPABASE_SERVICE_ROLE_KEY" "$SUPABASE_URL/rest/v1/SAAS_Usuarios?select=id&Email=eq.$q&limit=1" >/dev/null
+    sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$TMP/resp"
+}
+
+passo_acesso() {
+    cabecalho_passo 6 $TOTAL_PASSOS "Seu sistema"
+    echo "Qual nome você quer dar ao seu sistema? Ele aparece nas telas e na aba do navegador."
+    echo -e "${cinza}Você pode mudar depois no painel de administrador.${reset}"
+    echo ""
+    perguntar NOME_SISTEMA "Nome do sistema" "${NOME_SISTEMA:-}" || return 1
+    NOME_SISTEMA="$(printf '%s' "$NOME_SISTEMA" | tr -d "\"'\\\\<>\`\$")"
+
+    echo ""
+    echo "Qual e-mail vai ser o administrador do sistema (o dono)?"
+    echo -e "${cinza}A senha inicial será ${ADMIN_SENHA_PADRAO}. Troque depois de entrar.${reset}"
+    echo ""
+    while :; do
+        local e
+        perguntar e "E-mail do administrador" "${ADMIN_EMAIL:-$LICENCA_EMAIL}" || return 1
+        e="${e,,}"
+        if ! [[ "$e" =~ ^[^@[:space:]\"\']+@[^@[:space:]\"\']+\.[^@[:space:]\"\']+$ ]]; then
+            falha "E-mail inválido."
+            continue
+        fi
+        ADMIN_EMAIL="$e"
+        break
+    done
+    if [ -n "$(usuario_por_email "$ADMIN_EMAIL")" ]; then
+        ok "Esse e-mail já tem conta no sistema. A senha dele continua a mesma."
+        sleep 2
+    fi
+}
+
 assistente() {
-    local passos=(passo_dominios passo_supabase_url passo_supabase_service passo_sql passo_licenca)
+    local passos=(passo_dominios passo_supabase_url passo_supabase_service passo_sql passo_licenca passo_acesso)
     local i
     while :; do
         i=0
@@ -809,6 +852,8 @@ assistente() {
         echo -e "${amarelo}ARQUIVOS${reset}       https://$S3_HOST"
         echo -e "${amarelo}SUPABASE${reset}       $SUPABASE_URL"
         echo -e "${amarelo}LICENÇA${reset}        $LICENCA_EMAIL"
+        echo -e "${amarelo}NOME${reset}           $NOME_SISTEMA"
+        echo -e "${amarelo}ADMINISTRADOR${reset}  $ADMIN_EMAIL"
         echo ""
         echo -e "${amarelo}====================================================================================${reset}"
         local r
@@ -868,7 +913,7 @@ instalar_docker() {
 VARS_SALVAS=(MODO_DEPLOY MODO_ROTA PAINEL TRAEFIK_RESOLVER TRAEFIK_ENTRYPOINT TRAEFIK_REDE TRAEFIK_LABEL_REDE
     TRAEFIK_PASTA_ARQUIVOS REDE_INTERNA PORTA_APP PORTA_EVO PORTA_S3
     DOMINIO_BASE SUB_APP SUB_EVO SUB_S3 APP_HOST EVO_HOST S3_HOST
-    SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY LICENCA_EMAIL
+    SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY LICENCA_EMAIL BACK_PATH NOME_SISTEMA ADMIN_EMAIL
     EVOLUTION_API_KEY POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY)
 
 salvar_config() {
@@ -887,6 +932,8 @@ salvar_config() {
 carregar_config() {
     # shellcheck disable=SC1090
     . "$ENV_FILE"
+    ## Instalações antigas usavam /webhook no endereço: mantém para não quebrar os webhooks já cadastrados
+    BACK_PATH="${BACK_PATH-/webhook}"
 }
 
 gerar_segredos() {
@@ -1004,7 +1051,7 @@ services:
       SUPABASE_URL: "$SUPABASE_URL"
       SUPABASE_SERVICE_ROLE_KEY: "$SUPABASE_SERVICE_ROLE_KEY"
       SUPABASE_ANON_KEY: "$SUPABASE_ANON_KEY"
-      BACK_URL: "https://$APP_HOST/webhook"
+      BACK_URL: "https://$APP_HOST${BACK_PATH:-}"
       EVOLUTION_BASE_URL: "https://$EVO_HOST"
       EVOLUTION_API_KEY: "$EVOLUTION_API_KEY"
       S3_ENDPOINT: "http://hublabel-minio:9000"
@@ -1335,6 +1382,102 @@ verificar_https() {
     return 1
 }
 
+## Cria o administrador (super admin, plano Ilimitado) e grava o nome do sistema.
+configurar_sistema() {
+    info "Criando seu acesso de administrador..."
+    ADMIN_SENHA="$ADMIN_SENHA_PADRAO" NOME_SISTEMA="${NOME_SISTEMA:-}" ADMIN_EMAIL="${ADMIN_EMAIL:-}" \
+    SB_URL="$SUPABASE_URL" SB_KEY="$SUPABASE_SERVICE_ROLE_KEY" python3 -I - >"$TMP/admin" 2>&1 <<'PYEOF'
+import json, os, time, urllib.error, urllib.parse, urllib.request
+
+url, chave = os.environ["SB_URL"], os.environ["SB_KEY"]
+email, senha = os.environ["ADMIN_EMAIL"], os.environ["ADMIN_SENHA"]
+nome_sistema = os.environ["NOME_SISTEMA"]
+## Sem nome informado: o nome do usuário é o próprio e-mail
+nome_admin = email
+q = urllib.parse.quote
+
+
+def chamar(metodo, caminho, corpo=None, extra=None):
+    h = {"apikey": chave, "Content-Type": "application/json", "Prefer": "return=representation"}
+    if not chave.startswith("sb_"):
+        h["Authorization"] = "Bearer " + chave
+    h.update(extra or {})
+    dados = json.dumps(corpo).encode() if corpo is not None else None
+    req = urllib.request.Request(url + caminho, data=dados, method=metodo, headers=h)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode(errors="ignore")
+        try:
+            return e.code, json.loads(txt)
+        except Exception:
+            return e.code, txt
+    except Exception as e:
+        return 0, str(e)
+
+
+def usuario():
+    _, r = chamar("GET", f'/rest/v1/SAAS_Usuarios?select=id,auth_user_id,"contaId"&Email=eq.{q(email)}&limit=1')
+    return r[0] if isinstance(r, list) and r else None
+
+
+def plano_ilimitado():
+    _, r = chamar("GET", "/rest/v1/SAAS_Planos?select=id&nome=eq.Ilimitado&limit=1")
+    return r[0]["id"] if isinstance(r, list) and r else None
+
+
+if email:
+    u = usuario()
+    senha_usada = False
+    if not u and senha:
+        senha_usada = True
+        meta = {"nome": nome_admin}
+        plano = plano_ilimitado()
+        if plano:
+            meta["planoId"] = str(plano)
+        cod, r = chamar("POST", "/auth/v1/admin/users",
+                        {"email": email, "password": senha, "email_confirm": True, "user_metadata": meta})
+        if cod >= 300 or cod == 0:
+            msg = (r.get("msg") or r.get("message") or r.get("error_description")) if isinstance(r, dict) else r
+            print("ERRO_ADMIN", msg)
+        for _ in range(10):
+            u = usuario()
+            if u:
+                break
+            time.sleep(1)
+    if u:
+        chamar("PATCH", f'/rest/v1/SAAS_Usuarios?id=eq.{u["id"]}', {"super_admin": True, "funcao": "admin"})
+        if u.get("contaId"):
+            corpo = {"status": True, "dataValidade": None}
+            plano = plano_ilimitado()
+            if plano:
+                corpo["plano"] = plano
+            chamar("PATCH", f'/rest/v1/SAAS_Contas?id=eq.{u["contaId"]}', corpo)
+        print("OK_ADMIN", "novo" if senha_usada else "existente")
+    else:
+        print("ERRO_ADMIN o usuário não apareceu no sistema")
+
+if nome_sistema:
+    agora = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    cod, r = chamar("POST", "/rest/v1/SAAS_Personalizacao", {"id": 1, "nome": nome_sistema, "updated_at": agora},
+                    {"Prefer": "resolution=merge-duplicates,return=minimal"})
+    print("OK_NOME" if 0 < cod < 300 else f"ERRO_NOME {r}")
+PYEOF
+    ADMIN_CRIADO="$(sed -n 's/^OK_ADMIN //p' "$TMP/admin" | head -1)"
+    if [ -n "$ADMIN_CRIADO" ]; then
+        ok "Super administrador pronto: $ADMIN_EMAIL"
+    elif [ -n "${ADMIN_EMAIL:-}" ]; then
+        falha "Não consegui criar o administrador: $(sed -n 's/^ERRO_ADMIN //p' "$TMP/admin" | head -1)"
+        echo -e "${cinza}Rode o setup de novo e escolha \"Refazer a configuração\" para tentar outra vez.${reset}"
+    fi
+    if grep -q '^OK_NOME' "$TMP/admin"; then
+        ok "Nome do sistema: $NOME_SISTEMA"
+    elif [ -n "${NOME_SISTEMA:-}" ]; then
+        aviso "Não consegui gravar o nome do sistema. Ajuste depois no painel de administrador."
+    fi
+}
+
 ## ============================================================================
 ## RESUMO FINAL
 ## ============================================================================
@@ -1346,11 +1489,21 @@ resumo_final() {
     echo -e "${verde}====================================================================================${reset}"
     echo ""
     echo -e "${amarelo}SISTEMA${reset}"
-    echo "  Acesso:             https://$APP_HOST/webhook/login"
-    echo "  Webhook Meta:       https://$APP_HOST/webhook/eventsmeta"
-    echo "  Webhook Evolution:  https://$APP_HOST/webhook/agente-no-whatsapp"
+    echo "  Acesso:             https://$APP_HOST${BACK_PATH:-}/login"
+    echo "  Webhook Meta:       https://$APP_HOST${BACK_PATH:-}/eventsmeta"
+    echo "  Webhook Evolution:  https://$APP_HOST${BACK_PATH:-}/agente-no-whatsapp"
     echo "  Senha padrão:       $SENHA_PADRAO_INTEGRACAO  (usuários criados por integração)"
     echo ""
+    if [ -n "${ADMIN_EMAIL:-}" ]; then
+        echo -e "${amarelo}SUPER ADMINISTRADOR${reset}"
+        echo "  E-mail:  $ADMIN_EMAIL"
+        if [ "${ADMIN_CRIADO:-}" = novo ]; then
+            echo "  Senha:   $ADMIN_SENHA_PADRAO  (troque depois de entrar)"
+        else
+            echo "  Senha:   a mesma que você já usa nesse e-mail"
+        fi
+        echo ""
+    fi
     echo -e "${amarelo}WHATSAPP (EVOLUTION API)${reset}"
     echo "  URL:      https://$EVO_HOST"
     echo "  Manager:  https://$EVO_HOST/manager"
@@ -1389,6 +1542,7 @@ instalar() {
     gerar_arquivo_deploy
     subir
     configurar_minio
+    configurar_sistema
     aguardar_sistema
     verificar_https
     resumo_final
@@ -1416,6 +1570,7 @@ menu_instalacao_existente() {
             exit 0
             ;;
         2)
+            BACK_PATH=""
             assistente
             instalar
             exit 0
@@ -1437,6 +1592,7 @@ main() {
     descrever_ambiente
     sleep 2
 
+    BACK_PATH=""
     assistente
     banner
     instalar_docker
