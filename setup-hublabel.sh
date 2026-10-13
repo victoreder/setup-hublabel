@@ -44,9 +44,10 @@ amarelo="\e[33m"
 verde="\e[92m"
 branco="\e[97m"
 vermelho="\e[91m"
-ciano="\e[96m"
-azul="\e[94m"
-roxo="\e[95m"
+## Paleta única em amarelo (verde e vermelho só para ✔ e ✘)
+ciano="\e[93m"
+azul="\e[33m"
+roxo="\e[33m"
 cinza="\e[90m"
 negrito="\e[1m"
 reset="\e[0m"
@@ -96,12 +97,12 @@ digitar() { # digitar "texto" [cor]
 banner() {
     clear
     echo ""
-    echo -e "\e[96m  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
-    echo -e "\e[96m  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
-    echo -e "\e[94m  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
-    echo -e "\e[94m  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
-    echo -e "\e[95m  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
-    echo -e "\e[95m  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
+    echo -e "\e[93m  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
+    echo -e "\e[93m  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
+    echo -e "\e[93m  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
+    echo -e "\e[93m  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
+    echo -e "\e[93m  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
+    echo -e "\e[93m  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
     echo -e "  ${cinza}$(linha 66 ━)${reset}"
     echo -e "  ${negrito}${branco}Instalador oficial${reset}  ${cinza}•  versão $VERSAO${reset}"
     echo ""
@@ -1009,7 +1010,7 @@ assistente() {
         banner
         trilha $((TOTAL_PASSOS + 1))
         echo ""
-        titulo_caixa "CONFIRA OS DADOS" "$verde"
+        titulo_caixa "CONFIRA OS DADOS"
         echo ""
         abrir_bloco "ENDEREÇOS" "$azul"
         item "Sistema" "https://$APP_HOST"
@@ -1647,9 +1648,9 @@ PYEOF
 
 resumo_final() {
     banner
-    titulo_caixa "🎉  INSTALAÇÃO CONCLUÍDA!" "$verde"
+    titulo_caixa "🎉  INSTALAÇÃO CONCLUÍDA!"
     echo ""
-    abrir_bloco "ACESSE SEU SISTEMA" "$verde"
+    abrir_bloco "ACESSE SEU SISTEMA" "$azul"
     item "Endereço" "https://$APP_HOST${BACK_PATH:-}/login"
     if [ -n "${ADMIN_EMAIL:-}" ]; then
         item "E-mail" "$ADMIN_EMAIL"
@@ -1677,7 +1678,7 @@ resumo_final() {
     item "Access Key" "$S3_ACCESS_KEY"
     item "Secret Key" "$S3_SECRET_KEY"
     fechar_bloco
-    abrir_bloco "SUPABASE" "$cinza"
+    abrir_bloco "SUPABASE" "$azul"
     item "Projeto" "$SUPABASE_URL"
     fechar_bloco
     if [ "$MODO_ROTA" = manual ]; then
