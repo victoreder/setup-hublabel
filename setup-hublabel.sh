@@ -165,7 +165,97 @@ ip_da_vps() {
     hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-ip_do_dominio() { getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+## IPs de um domínio, um por linha. Pergunta primeiro ao servidor DNS oficial do
+## domínio e depois ao Google/Cloudflare, para não pegar resposta velha do cache da VPS.
+ips_do_dominio() {
+    {
+        python3 -I - "$1" 2>/dev/null <<'PYEOF'
+import json, random, socket, struct, sys, urllib.request
+
+host = sys.argv[1].strip(".").lower()
+
+def doh(nome, tipo):
+    """Consulta DNS por HTTPS (Google e Cloudflare). Retorna os dados das respostas do tipo pedido."""
+    codigo = {"A": 1, "NS": 2}[tipo]
+    saida = []
+    for base in ("https://dns.google/resolve", "https://cloudflare-dns.com/dns-query"):
+        try:
+            req = urllib.request.Request(f"{base}?name={nome}&type={tipo}", headers={"accept": "application/dns-json"})
+            dados = json.load(urllib.request.urlopen(req, timeout=5))
+        except Exception:
+            continue
+        for r in dados.get("Answer") or []:
+            if r.get("type") == codigo:
+                v = r.get("data", "").rstrip(".")
+                if v and v not in saida:
+                    saida.append(v)
+    return saida
+
+def pular_nome(dados, i):
+    while True:
+        tam = dados[i]
+        if tam == 0:
+            return i + 1
+        if tam & 0xC0 == 0xC0:
+            return i + 2
+        i += tam + 1
+
+def consulta_direta(ip_ns, nome):
+    """Pergunta direto ao servidor DNS oficial do domínio (sem cache no caminho)."""
+    tid = random.randint(0, 65535)
+    pacote = struct.pack(">HHHHHH", tid, 0, 1, 0, 0, 0)
+    for parte in nome.split("."):
+        pacote += bytes([len(parte)]) + parte.encode()
+    pacote += b"\0" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3)
+    try:
+        s.sendto(pacote, (ip_ns, 53))
+        dados, _ = s.recvfrom(4096)
+    finally:
+        s.close()
+    if struct.unpack(">H", dados[:2])[0] != tid:
+        return []
+    respostas = struct.unpack(">H", dados[6:8])[0]
+    i = pular_nome(dados, 12) + 4
+    ips = []
+    for _ in range(respostas):
+        i = pular_nome(dados, i)
+        tipo, _cls, _ttl, tam = struct.unpack(">HHIH", dados[i:i + 10])
+        i += 10
+        if tipo == 1 and tam == 4:
+            ips.append(socket.inet_ntoa(dados[i:i + 4]))
+        i += tam
+    return ips
+
+ips = []
+## 1) Servidor oficial do domínio: acha a zona subindo pelos níveis (app.x.com.br → x.com.br)
+partes = host.split(".")
+for n in range(len(partes) - 1):
+    zona = ".".join(partes[n:])
+    servidores = doh(zona, "NS")
+    if not servidores:
+        continue
+    for ns in servidores[:3]:
+        for ip_ns in doh(ns, "A")[:1]:
+            try:
+                ips = consulta_direta(ip_ns, host)
+            except Exception:
+                ips = []
+            if ips:
+                break
+        if ips:
+            break
+    break
+## 2) DNS públicos (Google e Cloudflare)
+for ip in doh(host, "A"):
+    if ip not in ips:
+        ips.append(ip)
+print("\n".join(ips))
+PYEOF
+        getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}'
+    } | awk 'NF && !visto[$0]++'
+}
 
 ## Campo de um JWT (sem validar assinatura): jwt_campo TOKEN campo
 jwt_campo() {
@@ -357,7 +447,7 @@ detectar_ambiente() {
             && [ "$(docker network inspect -f '{{.Driver}} {{.Attachable}}' "$TRAEFIK_REDE" 2>/dev/null)" = "overlay false" ]; then
             MODO_DEPLOY="stack"
         fi
-        PAINEL="${nome:+$nome + }Traefik"
+        PAINEL="${nome:-Traefik}"
         return
     fi
 
@@ -366,26 +456,18 @@ detectar_ambiente() {
         MODO_DEPLOY="compose"
         local quem=""
         quem="$(ss -ltnpH 2>/dev/null | grep -E '[:.](80|443) ' | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -1)"
-        PAINEL="${nome:-${quem:-outro sistema}} (portas 80/443 já em uso)"
+        [ "$quem" = "docker-proxy" ] && quem=""
+        PAINEL="${nome:-${quem:-outro painel}}"
         return
     fi
 
-    [ -n "$nome" ] && PAINEL="$nome (sem proxy nas portas 80/443)"
+    [ -n "$nome" ] && PAINEL="$nome"
 }
 
 descrever_ambiente() {
-    echo -e "${branco}Ambiente detectado:${reset} ${verde}$PAINEL${reset}"
-    case "$MODO_ROTA" in
-        caddy)  echo "  O sistema será instalado com Docker e HTTPS automático (Caddy). Sem Portainer." ;;
-        labels) echo "  Vou usar o Traefik que já existe nesta VPS (rede: $TRAEFIK_REDE${TRAEFIK_RESOLVER:+, certificado: $TRAEFIK_RESOLVER})." ;;
-        file)   echo "  Vou cadastrar os domínios no Traefik que já existe nesta VPS (rede: $TRAEFIK_REDE)." ;;
-        manual) echo "  Esta VPS já tem um proxy nas portas 80/443 que eu não consigo configurar sozinho."
-                echo "  Vou instalar tudo e, no final, mostrar para qual porta apontar cada domínio no seu painel." ;;
-    esac
+    ok "Ambiente detectado: $PAINEL"
     if [ "$HUBLABEL_V18" = 1 ]; then
-        echo ""
-        aviso "Esta VPS já tem o HubLabel antigo (v1.8 com N8N)."
-        aviso "Esta instalação é separada: use subdomínios diferentes e um Supabase diferente do atual."
+        aviso "Esta VPS já tem o HubLabel antigo. Use subdomínios e um Supabase diferentes dos atuais."
     fi
 }
 
@@ -442,17 +524,18 @@ passo_dominios() {
 }
 
 verificar_dns() {
-    local ip_vps tudo_ok resp h ip
+    local ip_vps tudo_ok resp h ip ips
     ip_vps="$(ip_da_vps)"
     while :; do
         echo ""
-        echo -e "${branco}Conferindo o DNS (registros tipo A apontando para ${ip_vps:-esta VPS})...${reset}"
+        echo -e "${branco}Conferindo se os endereços já apontam para esta VPS (${ip_vps:-IP desconhecido})...${reset}"
         tudo_ok=1
         for h in "$APP_HOST" "$EVO_HOST" "$S3_HOST"; do
-            ip="$(ip_do_dominio "$h")"
-            if [ -n "$ip" ] && { [ -z "$ip_vps" ] || [ "$ip" = "$ip_vps" ]; }; then
-                echo -e "  ${verde}✔${reset} $h → $ip"
+            ips="$(ips_do_dominio "$h")"
+            if [ -n "$ips" ] && { [ -z "$ip_vps" ] || printf '%s\n' "$ips" | grep -qxF "$ip_vps"; }; then
+                echo -e "  ${verde}✔${reset} $h"
             else
+                ip="$(printf '%s\n' "$ips" | head -1)"
                 echo -e "  ${vermelho}✘${reset} $h → ${ip:-não encontrado}"
                 tudo_ok=0
             fi
@@ -460,7 +543,8 @@ verificar_dns() {
         [ "$tudo_ok" = 1 ] && { echo ""; ok "DNS certo."; sleep 1; return 0; }
         echo ""
         echo "No painel do seu domínio (Registro.br, Cloudflare, Hostinger...), crie um registro"
-        echo -e "tipo ${branco}A${reset} para cada endereço com ✘, apontando para ${branco}${ip_vps:-o IP desta VPS}${reset}."
+        echo -e "tipo ${branco}A${reset} para cada endereço com ✘:"
+        echo -e "  Nome: a primeira parte do endereço (ex.: ${branco}$SUB_APP${reset})   Valor: ${branco}${ip_vps:-o IP desta VPS}${reset}"
         echo -e "${cinza}Usa Cloudflare? Deixe a nuvem cinza (\"somente DNS\").${reset}"
         echo -e "${cinza}A mudança pode levar alguns minutos para valer.${reset}"
         echo ""
@@ -550,7 +634,7 @@ passo_supabase_url() {
         fi
         codigo="$(supabase_curl "$k" "$SUPABASE_URL/auth/v1/settings")"
         if [ "$codigo" != "200" ]; then
-            falha "O Supabase recusou essa chave (HTTP $codigo). Copie de novo, inteira."
+            falha "O Supabase recusou essa chave. Copie de novo, inteira."
             continue
         fi
         SUPABASE_ANON_KEY="$k"
@@ -584,7 +668,7 @@ passo_supabase_service() {
         fi
         codigo="$(supabase_curl "$k" "$SUPABASE_URL/auth/v1/admin/users?page=1&per_page=1")"
         if [ "$codigo" != "200" ]; then
-            falha "O Supabase recusou essa chave (HTTP $codigo). Copie de novo, inteira."
+            falha "O Supabase recusou essa chave. Copie de novo, inteira."
             continue
         fi
         SUPABASE_SERVICE_ROLE_KEY="$k"
@@ -632,7 +716,7 @@ passo_sql() {
             sleep 1
             return 0
         fi
-        falha "Ainda faltam as tabelas: $falta"
+        falha "As tabelas ainda não foram encontradas."
         echo -e "${cinza}Confira se rodou o SQL no projeto certo ($SUPABASE_URL) e se terminou com Success.${reset}"
     done
 }
@@ -720,10 +804,9 @@ assistente() {
         banner
         echo -e "${branco}Confira os dados:${reset}"
         echo ""
-        echo -e "${amarelo}AMBIENTE${reset}       $PAINEL"
         echo -e "${amarelo}SISTEMA${reset}        https://$APP_HOST"
-        echo -e "${amarelo}EVOLUTION${reset}      https://$EVO_HOST"
-        echo -e "${amarelo}S3${reset}             https://$S3_HOST"
+        echo -e "${amarelo}WHATSAPP${reset}       https://$EVO_HOST"
+        echo -e "${amarelo}ARQUIVOS${reset}       https://$S3_HOST"
         echo -e "${amarelo}SUPABASE${reset}       $SUPABASE_URL"
         echo -e "${amarelo}LICENÇA${reset}        $LICENCA_EMAIL"
         echo ""
@@ -762,7 +845,7 @@ verificacoes_iniciais() {
 
 instalar_docker() {
     if ! command -v docker >/dev/null 2>&1; then
-        info "Instalando o Docker (pode levar alguns minutos)..."
+        info "Preparando a VPS (pode levar alguns minutos)..."
         command -v apt-get >/dev/null 2>&1 || erro "Não encontrei o apt-get. Instale o Docker e rode de novo."
         apt-get update -qq
         timedatectl set-timezone America/Sao_Paulo 2>/dev/null || true
@@ -770,13 +853,12 @@ instalar_docker() {
     fi
     systemctl enable --now docker >/dev/null 2>&1 || true
     if [ "$MODO_DEPLOY" = compose ] && ! docker compose version >/dev/null 2>&1; then
-        info "Instalando o Docker Compose..."
+        info "Preparando a VPS..."
         apt-get update -qq
         apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
             || erro "Não consegui instalar o Docker Compose."
     fi
     docker info >/dev/null 2>&1 || erro "O Docker não está rodando."
-    ok "Docker pronto."
 }
 
 ## ============================================================================
@@ -1171,26 +1253,26 @@ container_de() {
 }
 
 subir() {
-    info "Baixando as imagens (pode levar alguns minutos)..."
+    info "Baixando o sistema (pode levar alguns minutos)..."
     cd "$DIR" || erro "Pasta $DIR não encontrada."
     if [ "$MODO_DEPLOY" = stack ]; then
         local img
         for img in "$IMG_APP" "$IMG_REDIS" "$IMG_EVOLUTION" "$IMG_POSTGRES" "$IMG_MINIO"; do
             docker pull -q "$img" >/dev/null 2>&1 || aviso "Não consegui baixar $img agora (o Docker tenta de novo sozinho)."
         done
-        info "Subindo os serviços..."
+        info "Iniciando..."
         docker stack deploy --prune --resolve-image always -c "$PROJETO.yml" "$PROJETO" >/dev/null \
             || erro "Falha no docker stack deploy. Arquivo: $DIR/$PROJETO.yml"
     else
         docker compose -f "$PROJETO.yml" pull -q || erro "Não consegui baixar as imagens. Confira a internet da VPS."
-        info "Subindo os serviços..."
+        info "Iniciando..."
         docker compose -f "$PROJETO.yml" up -d --remove-orphans || erro "Falha ao subir os serviços. Arquivo: $DIR/$PROJETO.yml"
     fi
-    ok "Serviços enviados ao Docker."
+
 }
 
 configurar_minio() {
-    info "Preparando o S3 (bucket \"$S3_BUCKET\" e chaves de acesso)..."
+    info "Preparando o armazenamento de arquivos..."
     local cid="" i
     for i in $(seq 1 60); do
         cid="$(container_de hublabel-minio)"
@@ -1209,11 +1291,11 @@ configurar_minio() {
         || { falha "Não consegui criar a chave de acesso do S3."; return 1; }
     docker exec "$cid" mc admin policy attach local readwrite --user "$S3_ACCESS_KEY" >/dev/null 2>&1 \
         || docker exec "$cid" mc admin policy set local readwrite "user=$S3_ACCESS_KEY" >/dev/null 2>&1 || true
-    ok "S3 pronto."
+    ok "Armazenamento de arquivos pronto."
 }
 
 aguardar_sistema() {
-    info "Aguardando o sistema iniciar (até 5 minutos)..."
+    info "Aguardando o sistema ficar pronto (até 5 minutos)..."
     local i cid estado
     for i in $(seq 1 100); do
         cid="$(container_de hublabel-app)"
@@ -1241,15 +1323,15 @@ aguardar_sistema() {
 
 verificar_https() {
     [ "$MODO_ROTA" = manual ] && return 0
-    info "Conferindo o HTTPS de https://$APP_HOST ..."
+    info "Conferindo o acesso em https://$APP_HOST ..."
     local i codigo
     for i in $(seq 1 20); do
         codigo="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$APP_HOST:443:127.0.0.1" "https://$APP_HOST/health")"
-        [ "$codigo" = "200" ] && { ok "HTTPS respondendo."; return 0; }
+        [ "$codigo" = "200" ] && { ok "Acesso funcionando."; return 0; }
         sleep 6
     done
-    aviso "O endereço https://$APP_HOST ainda não respondeu pelo proxy (HTTP $codigo)."
-    aviso "Confira o DNS. O certificado pode levar alguns minutos para sair."
+    aviso "O endereço https://$APP_HOST ainda não abriu."
+    aviso "Confira o apontamento do domínio. O cadeado (HTTPS) pode levar alguns minutos para sair."
     return 1
 }
 
@@ -1269,12 +1351,12 @@ resumo_final() {
     echo "  Webhook Evolution:  https://$APP_HOST/webhook/agente-no-whatsapp"
     echo "  Senha padrão:       $SENHA_PADRAO_INTEGRACAO  (usuários criados por integração)"
     echo ""
-    echo -e "${amarelo}EVOLUTION API${reset}"
+    echo -e "${amarelo}WHATSAPP (EVOLUTION API)${reset}"
     echo "  URL:      https://$EVO_HOST"
     echo "  Manager:  https://$EVO_HOST/manager"
     echo "  API Key:  $EVOLUTION_API_KEY"
     echo ""
-    echo -e "${amarelo}S3 (MINIO)${reset}"
+    echo -e "${amarelo}ARQUIVOS (S3)${reset}"
     echo "  URL:         https://$S3_HOST"
     echo "  Bucket:      $S3_BUCKET  (https://$S3_HOST/$S3_BUCKET)"
     echo "  Access Key:  $S3_ACCESS_KEY"
@@ -1284,7 +1366,7 @@ resumo_final() {
     echo "  $SUPABASE_URL"
     echo ""
     if [ "$MODO_ROTA" = manual ]; then
-        echo -e "${amarelo}FALTA UM PASSO: APONTAR OS DOMÍNIOS NO SEU PAINEL/PROXY (com HTTPS)${reset}"
+        echo -e "${amarelo}FALTA UM PASSO: CADASTRAR OS DOMÍNIOS NO SEU PAINEL (com HTTPS)${reset}"
         echo "  https://$APP_HOST  →  http://127.0.0.1:$PORTA_APP"
         echo "  https://$EVO_HOST  →  http://127.0.0.1:$PORTA_EVO"
         echo "  https://$S3_HOST  →  http://127.0.0.1:$PORTA_S3"
@@ -1352,13 +1434,8 @@ main() {
     banner
     info "Analisando a VPS..."
     detectar_ambiente
-    echo ""
     descrever_ambiente
-    echo ""
-    echo "Vou pedir 5 informações: domínio, Supabase (URL e 2 chaves), as tabelas e a licença."
-    echo "Tenha em mãos o acesso ao painel do seu domínio e ao Supabase."
-    echo ""
-    enter "Aperte Enter para começar..."
+    sleep 2
 
     assistente
     banner
