@@ -929,6 +929,7 @@ services:
       S3_ACCESS_KEY_ID: "$S3_ACCESS_KEY"
       S3_SECRET_ACCESS_KEY: "$S3_SECRET_KEY"
       S3_BUCKET: "$S3_BUCKET"
+      S3_REGION: "eu-south"
       S3_PUBLIC_BASE_URL: "https://$S3_HOST/$S3_BUCKET"
       REDIS_URL: "redis://hublabel-redis:6379"
       SENHA_PADRAO_INTEGRACAO: "$SENHA_PADRAO_INTEGRACAO"
