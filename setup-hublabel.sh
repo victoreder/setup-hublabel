@@ -1,1836 +1,1255 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 ## ============================================================================
-## SETUP PERSONALIZADO HUBLABEL v1.8
-## Instala: Traefik, Portainer, Evolution API, MinIO, N8N, Disparador e dependências
-## Baseado exatamente no SetupOrion - sem Basic Auth
+## SETUP HUBLABEL v2.0
+## Instala: HubLabel Disparador (tudo em um) + Redis, Evolution API (+ Postgres
+## e Redis) e MinIO (S3). Sem N8N e sem Portainer.
 ##
-## COMANDO PARA INICIAR A INSTALAÇÃO:
-##   sudo bash setuppersonalizado-hublabel.sh
+## Funciona em VPS zerada e em VPS que já tem outro sistema:
+##   - VPS zerada ............... Docker + Caddy (HTTPS automático)
+##   - Traefik (Portainer, EasyPanel, Coolify, Dokploy...) ... usa o Traefik que já existe
+##   - Outro proxy (nginx...) ... sobe sem proxy e mostra o que apontar
 ##
-## Ou torne executável e rode:
-##   chmod +x setuppersonalizado-hublabel.sh
-##   sudo ./setuppersonalizado-hublabel.sh
+## COMANDO (como root):
+##   bash <(curl -sSL https://raw.githubusercontent.com/victoreder/setup-hublabel/main/setup-hublabel.sh)
+##
+## Rodar de novo atualiza a instalação (as configurações ficam em /opt/hublabel).
 ## ============================================================================
+
+set -uo pipefail
+
+VERSAO="2.0"
+DIR="/opt/hublabel"
+ENV_FILE="$DIR/.env"
+PROJETO="hublabel"
+LICENCA_URL="https://licencas.hublabel.com.br"
+
+IMG_APP="ghcr.io/victoreder/hublabel-disparador:latest"
+IMG_REDIS="redis:7-alpine"
+IMG_EVOLUTION="evoapicloud/evolution-api:latest"
+IMG_POSTGRES="postgres:14"
+IMG_MINIO="ghcr.io/victoreder/minio:RELEASE.2024-01-13T07-53-03Z"
+IMG_CADDY="caddy:2-alpine"
+
+S3_BUCKET="n8n"
+SENHA_PADRAO_INTEGRACAO="Padrao123456"
+## Tabelas conferidas depois do SQL (FollowupExecucao fica no fim do arquivo)
+TABELAS_SQL=(SAAS_Contas SAAS_Usuarios FollowupExecucao)
 
 amarelo="\e[33m"
 verde="\e[32m"
 branco="\e[97m"
 vermelho="\e[91m"
+ciano="\e[36m"
+cinza="\e[90m"
 reset="\e[0m"
 
-home_directory="$HOME"
-dados_vps="${home_directory}/dados_vps/dados_vps"
+## Lê do terminal mesmo quando o script vem por "curl | bash"
+TTY=/dev/tty
+{ : </dev/tty; } 2>/dev/null || TTY=/dev/stdin
 
-dados() {
-    nome_servidor=$(grep "Nome do Servidor:" "$dados_vps" 2>/dev/null | awk -F': ' '{print $2}')
-    nome_rede_interna=$(grep "Rede interna:" "$dados_vps" 2>/dev/null | awk -F': ' '{print $2}')
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+## ============================================================================
+## UTILITÁRIOS
+## ============================================================================
+
+info()  { echo -e "${amarelo}• $*${reset}"; }
+ok()    { echo -e "${verde}✔ $*${reset}"; }
+aviso() { echo -e "${amarelo}! $*${reset}"; }
+falha() { echo -e "${vermelho}✘ $*${reset}"; }
+erro()  { falha "$*"; exit 1; }
+
+banner() {
+    clear
+    echo ""
+    echo -e "${branco}  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
+    echo -e "${branco}  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
+    echo -e "${branco}  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
+    echo -e "${branco}  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
+    echo -e "${branco}  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
+    echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
+    echo ""
+    echo -e "${amarelo}====================================================================================${reset}"
+    echo -e "${amarelo}                          INSTALADOR HUBLABEL V${VERSAO}${reset}"
+    echo -e "${amarelo}====================================================================================${reset}"
+    echo ""
 }
 
-validar_senha() {
-    senha=$1
-    tamanho_minimo=$2
-    tem_erro=0
-    mensagem_erro=""
-
-    if [ ${#senha} -lt $tamanho_minimo ]; then
-        mensagem_erro+="\n- Senha precisa ter no mínimo $tamanho_minimo caracteres"
-        tem_erro=1
-    fi
-    if ! [[ $senha =~ [A-Z] ]]; then
-        mensagem_erro+="\n- Falta pelo menos uma letra maiúscula"
-        tem_erro=1
-    fi
-    if ! [[ $senha =~ [a-z] ]]; then
-        mensagem_erro+="\n- Falta pelo menos uma letra minúscula"
-        tem_erro=1
-    fi
-    if ! [[ $senha =~ [0-9] ]]; then
-        mensagem_erro+="\n- Falta pelo menos um número"
-        tem_erro=1
-    fi
-    if ! [[ $senha =~ [@_] ]]; then
-        mensagem_erro+="\n- Falta pelo menos um caractere especial (@ ou _)"
-        tem_erro=1
-    fi
-    if [[ $senha =~ [^A-Za-z0-9@_] ]]; then
-        mensagem_erro+="\n- Contém caracteres especiais não permitidos (use apenas @ ou _)"
-        tem_erro=1
-    fi
-
-    if [ $tem_erro -eq 1 ]; then
-        echo -e "Senha inválida! Corrija os seguintes problemas:$mensagem_erro"
-        return 1
-    fi
-    return 0
+## cabecalho_passo N TOTAL "Título"
+cabecalho_passo() {
+    banner
+    echo -e "${ciano}Passo $1 de $2 — $3${reset}"
+    echo -e "${cinza}(digite 0 e aperte Enter para voltar à etapa anterior)${reset}"
+    echo ""
 }
 
-wait_stack() {
-    echo "Este processo pode demorar um pouco. Se levar mais de 10 minutos, cancele."
-    for service in "$@"; do
-        while ! docker service ls --filter "name=$service" 2>/dev/null | grep -q "1/1"; do
-            sleep 10
-        done
-        echo -e "🟢 O serviço ${verde}$service${reset} está online."
-    done
+## Remove \r, espaços nas pontas e aspas em volta (comum ao copiar e colar)
+limpar() {
+    local v="$1"
+    v="${v//$'\r'/}"
+    v="$(printf '%s' "$v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+    printf '%s' "$v"
 }
 
-wait_30_sec() { sleep 30; }
-
-pull() {
-    for image in "$@"; do
-        while ! docker pull "$image" >/dev/null 2>&1; do
-            echo "Erro ao baixar $image. Tentando novamente..."
-            sleep 5
-        done
-    done
-}
-
-verificar_container_postgres() {
-    docker ps -q --filter "name=postgres_postgres" 2>/dev/null | grep -q . && return 0 || return 1
-}
-
-pegar_senha_postgres() {
+## perguntar VAR "texto" [padrão] → retorna 1 se a pessoa digitou 0 (voltar)
+perguntar() {
+    local __var="$1" __texto="$2" __padrao="${3:-}" __v
     while :; do
-        if [ -f /root/postgres.yaml ]; then
-            senha_postgres=$(grep "POSTGRES_PASSWORD" /root/postgres.yaml | sed 's/.*POSTGRES_PASSWORD=//' | tr -d ' \r\n')
-            [ -n "$senha_postgres" ] && break
+        if [ -n "$__padrao" ]; then
+            printf '%b' "${branco}${__texto}${reset} [${__padrao}]: "
+        else
+            printf '%b' "${branco}${__texto}${reset}: "
         fi
+        ler __v
+        __v="$(limpar "$__v")"
+        [ "$__v" = "0" ] && return 1
+        __v="${__v:-$__padrao}"
+        [ -n "$__v" ] && break
+        aviso "Este campo é obrigatório."
+    done
+    printf -v "$__var" '%s' "$__v"
+}
+
+## sim_nao "pergunta" S|N → 0 = sim, 1 = não, 2 = voltar (0)
+sim_nao() {
+    local resp padrao="${2:-S}"
+    while :; do
+        printf '%b' "${branco}$1${reset} ($([ "$padrao" = S ] && echo 'S/n' || echo 's/N')): "
+        ler resp
+        resp="$(limpar "$resp")"
+        [ "$resp" = "0" ] && return 2
+        resp="${resp:-$padrao}"
+        case "$resp" in
+            [sSyY]*) return 0 ;;
+            [nN]*) return 1 ;;
+        esac
+        aviso "Responda S ou N."
+    done
+}
+
+enter() {
+    printf '%b' "${cinza}${1:-Aperte Enter para continuar...}${reset}"
+    local _r; ler _r
+}
+
+## Lê uma linha do terminal; se o terminal fechar, encerra em vez de ficar em loop
+ler() {
+    IFS= read -r "$1" <"$TTY" || { echo; erro "Entrada encerrada. Rode o setup de novo."; }
+}
+
+aleatorio() { head -c "${1:-16}" /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+
+porta_em_uso() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$1\$"
+    else
+        netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$1\$"
+    fi
+}
+
+porta_livre_a_partir_de() {
+    local p="$1"
+    while porta_em_uso "$p"; do p=$((p + 1)); done
+    echo "$p"
+}
+
+ip_da_vps() {
+    local ip=""
+    for u in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+        ip="$(curl -fsS4 --max-time 5 "$u" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && { echo "$ip"; return; }
+    done
+    hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+ip_do_dominio() { getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+
+## Campo de um JWT (sem validar assinatura): jwt_campo TOKEN campo
+jwt_campo() {
+    local p
+    p="$(printf '%s' "$1" | cut -d. -f2 | tr '_-' '/+')"
+    case $((${#p} % 4)) in 2) p="$p==" ;; 3) p="$p=" ;; esac
+    printf '%s' "$p" | base64 -d 2>/dev/null | sed -n "s/.*\"$2\" *: *\"\([^\"]*\)\".*/\1/p"
+}
+
+## Cabeçalhos de autenticação do Supabase (chave nova sb_... vai só no apikey)
+supabase_curl() { # supabase_curl CHAVE URL → código HTTP (corpo em $TMP/resp)
+    local chave="$1" url="$2"
+    if [[ "$chave" == sb_* ]]; then
+        curl -s -o "$TMP/resp" -w '%{http_code}' --max-time 20 -H "apikey: $chave" "$url"
+    else
+        curl -s -o "$TMP/resp" -w '%{http_code}' --max-time 20 -H "apikey: $chave" -H "Authorization: Bearer $chave" "$url"
+    fi
+}
+
+## ============================================================================
+## DETECÇÃO DO AMBIENTE DA VPS
+## ============================================================================
+## Define:
+##   MODO_DEPLOY = compose | stack     (docker compose ou docker stack deploy)
+##   MODO_ROTA   = caddy | labels | file | manual
+##   PAINEL      = nome amigável do que foi encontrado
+
+## Lê a configuração de um Traefik (serviço do Swarm ou container) e imprime
+## variáveis TRAEFIK_* para o shell.
+analisar_traefik() { # analisar_traefik service|container NOME
+    docker "$([ "$1" = service ] && echo service || echo container)" inspect "$2" >"$TMP/traefik.json" 2>/dev/null || return 1
+    python3 - "$1" "$TMP/traefik.json" <<'PYEOF'
+import json, re, subprocess, sys, os
+
+tipo, arq = sys.argv[1], sys.argv[2]
+d = json.load(open(arq))[0]
+
+if tipo == "service":
+    cs = d["Spec"]["TaskTemplate"]["ContainerSpec"]
+    args = (cs.get("Command") or []) + (cs.get("Args") or [])
+    mounts = [(m.get("Source"), m.get("Target")) for m in (cs.get("Mounts") or []) if m.get("Type") == "bind"]
+    redes = []
+    for n in d["Spec"]["TaskTemplate"].get("Networks") or []:
+        try:
+            nome = subprocess.run(["docker", "network", "inspect", "-f", "{{.Name}}", n["Target"]],
+                                  capture_output=True, text=True).stdout.strip()
+        except Exception:
+            nome = ""
+        if nome:
+            redes.append(nome)
+else:
+    args = [d.get("Path", "")] + (d.get("Args") or [])
+    mounts = [(m.get("Source"), m.get("Destination")) for m in (d.get("Mounts") or []) if m.get("Type") == "bind"]
+    redes = list((d.get("NetworkSettings") or {}).get("Networks", {}).keys())
+
+def no_host(caminho):
+    """Converte um caminho de dentro do container para o caminho na VPS."""
+    melhor = None
+    for src, dst in mounts:
+        if dst and (caminho == dst or caminho.startswith(dst.rstrip("/") + "/")):
+            if melhor is None or len(dst) > len(melhor[1]):
+                melhor = (src, dst)
+    if not melhor:
+        return ""
+    return melhor[0] + caminho[len(melhor[1].rstrip("/")):]
+
+a = "\n".join(args)
+al = a.lower()
+
+## Arquivo de configuração estática (traefik.yml / .toml)
+texto = ""
+cfg = re.search(r"--configfile[= ](\S+)", a, re.I)
+candidatos = [cfg.group(1)] if cfg else ["/etc/traefik/traefik.yml", "/etc/traefik/traefik.yaml", "/etc/traefik/traefik.toml",
+                                         "/traefik.yml", "/traefik.yaml", "/traefik.toml"]
+for c in candidatos:
+    h = no_host(c)
+    if h and os.path.isfile(h):
+        texto = open(h, errors="ignore").read()
+        break
+if not texto and os.path.isdir("/etc/easypanel/traefik"):
+    for raiz, _, arquivos in os.walk("/etc/easypanel/traefik"):
+        for f in arquivos:
+            if f in ("traefik.yml", "traefik.yaml", "traefik.toml", "static.yaml", "static.yml"):
+                texto += open(os.path.join(raiz, f), errors="ignore").read() + "\n"
+tl = texto.lower()
+
+def primeiro(padroes, s, flags=re.M):
+    for p in padroes:
+        m = re.search(p, s, flags)
+        if m:
+            return m.group(1)
+    return ""
+
+resolver = primeiro([r"--certificatesresolvers\.([^.=\s]+)\."], a, re.I) or \
+    primeiro([r"^\s*certificatesresolvers:\s*\n\s+([A-Za-z0-9_-]+):", r"\[certificatesresolvers\.([A-Za-z0-9_-]+)"], texto, re.M | re.I)
+
+entrada = primeiro([r"--entrypoints\.([^.=\s]+)\.address=[^\s]*:443\b"], a, re.I) or \
+    primeiro([r"^\s*([A-Za-z0-9_-]+):\s*\n\s+address:\s*[\"']?[^\"'\n]*:443[\"']?",
+              r"\[entrypoints\.([A-Za-z0-9_-]+)\]\s*\n\s*address\s*=\s*\"[^\"]*:443\""], texto, re.M | re.I)
+
+swarm = "--providers.swarm" in al or re.search(r"^\s*swarm:\s*$", tl, re.M) is not None or "[providers.swarm]" in tl
+docker = "--providers.docker" in al or re.search(r"^\s*docker:\s*$", tl, re.M) is not None or "[providers.docker]" in tl
+rede = primeiro([r"--providers\.(?:swarm|docker)\.network=(\S+)"], a, re.I) or \
+    primeiro([r"^\s*network:\s*[\"']?([A-Za-z0-9_.-]+)", r"^\s*network\s*=\s*\"([A-Za-z0-9_.-]+)\""], texto, re.M)
+pasta = primeiro([r"--providers\.file\.directory=(\S+)"], a, re.I) or \
+    primeiro([r"^\s*directory:\s*[\"']?([^\"'\s]+)", r"^\s*directory\s*=\s*\"([^\"]+)\""], texto, re.M)
+
+if not rede:
+    for r in redes:
+        if r not in ("ingress", "bridge", "host", "none", "docker_gwbridge"):
+            rede = r
+            break
+
+if swarm:
+    rota, label = "labels", "traefik.swarm.network"
+elif docker:
+    rota, label = "labels", "traefik.docker.network"
+elif pasta:
+    rota, label = "file", ""
+else:
+    ## Sem nada declarado: o padrão do Traefik em Swarm (v3) ou container
+    rota = "labels"
+    label = "traefik.swarm.network" if tipo == "service" else "traefik.docker.network"
+
+pasta_host = no_host(pasta) if pasta else ""
+
+def seguro(v):
+    return re.sub(r"[^A-Za-z0-9_.:/@-]", "", v or "")
+
+print(f"TRAEFIK_RESOLVER='{seguro(resolver)}'")
+print(f"TRAEFIK_ENTRYPOINT='{seguro(entrada) or 'websecure'}'")
+print(f"TRAEFIK_REDE='{seguro(rede)}'")
+print(f"TRAEFIK_LABEL_REDE='{seguro(label)}'")
+print(f"TRAEFIK_PASTA_ARQUIVOS='{seguro(pasta_host)}'")
+print(f"TRAEFIK_ROTA='{rota}'")
+PYEOF
+}
+
+detectar_ambiente() {
+    MODO_DEPLOY="compose"
+    MODO_ROTA="caddy"
+    PAINEL="VPS zerada"
+    TRAEFIK_RESOLVER=""; TRAEFIK_ENTRYPOINT=""; TRAEFIK_REDE=""; TRAEFIK_LABEL_REDE=""
+    TRAEFIK_PASTA_ARQUIVOS=""; TRAEFIK_ROTA=""
+    HUBLABEL_V18=0
+
+    local tem_docker=0 alvo="" tipo=""
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && tem_docker=1
+
+    if [ "$tem_docker" = 1 ]; then
+        ## Instalação antiga do HubLabel (v1.8 com N8N)
+        docker service ls --format '{{.Name}}' 2>/dev/null | grep -Eq '^(disparador_disparador-inbound|n8n_n8n_editor)$' && HUBLABEL_V18=1
+
+        ## Traefik rodando como serviço do Swarm?
+        alvo="$(docker service ls --format '{{.Name}} {{.Image}}' 2>/dev/null | awk 'tolower($2) ~ /traefik/ {print $1; exit}')"
+        if [ -n "$alvo" ]; then
+            tipo="service"
+        else
+            alvo="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | awk 'tolower($2) ~ /traefik/ && $1 !~ /^hublabel/ {print $1; exit}')"
+            [ -n "$alvo" ] && tipo="container"
+        fi
+    fi
+
+    ## Nome do painel (só para mostrar)
+    local nome=""
+    if [ -d /etc/easypanel ] || { [ "$tem_docker" = 1 ] && docker service ls --format '{{.Name}}' 2>/dev/null | grep -qi easypanel; }; then
+        nome="EasyPanel"
+    elif [ -d /data/coolify ]; then
+        nome="Coolify"
+    elif [ -d /etc/dokploy ]; then
+        nome="Dokploy"
+    elif [ "$tem_docker" = 1 ] && docker ps --format '{{.Image}}' 2>/dev/null | grep -qi portainer; then
+        nome="Portainer"
+    fi
+
+    if [ -n "$tipo" ]; then
+        local saida
+        if saida="$(analisar_traefik "$tipo" "$alvo")"; then
+            eval "$saida"
+        fi
+        if [ -z "$TRAEFIK_REDE" ] || { [ "$TRAEFIK_ROTA" = file ] && [ -z "$TRAEFIK_PASTA_ARQUIVOS" ]; }; then
+            MODO_ROTA="manual"
+        else
+            MODO_ROTA="$TRAEFIK_ROTA"
+        fi
+        [ "$tipo" = service ] && MODO_DEPLOY="stack" || MODO_DEPLOY="compose"
+        ## Container comum não entra em rede overlay que não é "attachable": usa stack nesse caso
+        if [ "$MODO_DEPLOY" = compose ] && [ -n "$TRAEFIK_REDE" ] \
+            && [ "$(docker network inspect -f '{{.Driver}} {{.Attachable}}' "$TRAEFIK_REDE" 2>/dev/null)" = "overlay false" ]; then
+            MODO_DEPLOY="stack"
+        fi
+        PAINEL="${nome:+$nome + }Traefik"
+        return
+    fi
+
+    if porta_em_uso 80 || porta_em_uso 443; then
+        MODO_ROTA="manual"
+        MODO_DEPLOY="compose"
+        local quem=""
+        quem="$(ss -ltnpH 2>/dev/null | grep -E '[:.](80|443) ' | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -1)"
+        PAINEL="${nome:-${quem:-outro sistema}} (portas 80/443 já em uso)"
+        return
+    fi
+
+    [ -n "$nome" ] && PAINEL="$nome (sem proxy nas portas 80/443)"
+}
+
+descrever_ambiente() {
+    echo -e "${branco}Ambiente detectado:${reset} ${verde}$PAINEL${reset}"
+    case "$MODO_ROTA" in
+        caddy)  echo "  O sistema será instalado com Docker e HTTPS automático (Caddy). Sem Portainer." ;;
+        labels) echo "  Vou usar o Traefik que já existe nesta VPS (rede: $TRAEFIK_REDE${TRAEFIK_RESOLVER:+, certificado: $TRAEFIK_RESOLVER})." ;;
+        file)   echo "  Vou cadastrar os domínios no Traefik que já existe nesta VPS (rede: $TRAEFIK_REDE)." ;;
+        manual) echo "  Esta VPS já tem um proxy nas portas 80/443 que eu não consigo configurar sozinho."
+                echo "  Vou instalar tudo e, no final, mostrar para qual porta apontar cada domínio no seu painel." ;;
+    esac
+    if [ "$HUBLABEL_V18" = 1 ]; then
+        echo ""
+        aviso "Esta VPS já tem o HubLabel antigo (v1.8 com N8N)."
+        aviso "Esta instalação é separada: use subdomínios diferentes e um Supabase diferente do atual."
+    fi
+}
+
+## ============================================================================
+## ASSISTENTE (PERGUNTAS)
+## ============================================================================
+
+TOTAL_PASSOS=5
+
+passo_dominios() {
+    cabecalho_passo 1 $TOTAL_PASSOS "Domínios"
+    echo "Informe o domínio principal da sua empresa (sem https://)."
+    echo -e "${cinza}Exemplo: suaempresa.com.br${reset}"
+    echo ""
+    perguntar DOMINIO_BASE "Domínio principal" "${DOMINIO_BASE:-}" || return 1
+    DOMINIO_BASE="${DOMINIO_BASE,,}"
+    DOMINIO_BASE="${DOMINIO_BASE#http://}"; DOMINIO_BASE="${DOMINIO_BASE#https://}"
+    DOMINIO_BASE="${DOMINIO_BASE%%/*}"; DOMINIO_BASE="${DOMINIO_BASE#www.}"
+    if ! [[ "$DOMINIO_BASE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+        falha "Domínio inválido: $DOMINIO_BASE"
+        enter
+        passo_dominios; return
+    fi
+
+    echo ""
+    echo "Endereços que serão usados:"
+    echo -e "  Sistema (aplicativo): ${verde}${SUB_APP:-app}.$DOMINIO_BASE${reset}"
+    echo -e "  WhatsApp (Evolution): ${verde}${SUB_EVO:-wpp}.$DOMINIO_BASE${reset}"
+    echo -e "  Arquivos (S3):        ${verde}${SUB_S3:-s3}.$DOMINIO_BASE${reset}"
+    echo ""
+    sim_nao "Usar esses endereços?" S
+    case $? in
+        2) return 1 ;;
+        0) SUB_APP="${SUB_APP:-app}"; SUB_EVO="${SUB_EVO:-wpp}"; SUB_S3="${SUB_S3:-s3}" ;;
+        1)
+            echo ""
+            echo "Digite só a primeira parte (ex.: app)."
+            perguntar SUB_APP "Subdomínio do sistema" "${SUB_APP:-app}" || return 1
+            perguntar SUB_EVO "Subdomínio da Evolution" "${SUB_EVO:-wpp}" || return 1
+            perguntar SUB_S3 "Subdomínio do S3" "${SUB_S3:-s3}" || return 1
+            SUB_APP="${SUB_APP%%.*}"; SUB_EVO="${SUB_EVO%%.*}"; SUB_S3="${SUB_S3%%.*}"
+            SUB_APP="${SUB_APP,,}"; SUB_EVO="${SUB_EVO,,}"; SUB_S3="${SUB_S3,,}"
+            ;;
+    esac
+    APP_HOST="$SUB_APP.$DOMINIO_BASE"
+    EVO_HOST="$SUB_EVO.$DOMINIO_BASE"
+    S3_HOST="$SUB_S3.$DOMINIO_BASE"
+    if [ "$APP_HOST" = "$EVO_HOST" ] || [ "$APP_HOST" = "$S3_HOST" ] || [ "$EVO_HOST" = "$S3_HOST" ]; then
+        falha "Os três subdomínios precisam ser diferentes."
+        enter
+        passo_dominios; return
+    fi
+    verificar_dns
+}
+
+verificar_dns() {
+    local ip_vps tudo_ok resp h ip
+    ip_vps="$(ip_da_vps)"
+    while :; do
+        echo ""
+        echo -e "${branco}Conferindo o DNS (registros tipo A apontando para ${ip_vps:-esta VPS})...${reset}"
+        tudo_ok=1
+        for h in "$APP_HOST" "$EVO_HOST" "$S3_HOST"; do
+            ip="$(ip_do_dominio "$h")"
+            if [ -n "$ip" ] && { [ -z "$ip_vps" ] || [ "$ip" = "$ip_vps" ]; }; then
+                echo -e "  ${verde}✔${reset} $h → $ip"
+            else
+                echo -e "  ${vermelho}✘${reset} $h → ${ip:-não encontrado}"
+                tudo_ok=0
+            fi
+        done
+        [ "$tudo_ok" = 1 ] && { echo ""; ok "DNS certo."; sleep 1; return 0; }
+        echo ""
+        echo "No painel do seu domínio (Registro.br, Cloudflare, Hostinger...), crie um registro"
+        echo -e "tipo ${branco}A${reset} para cada endereço com ✘, apontando para ${branco}${ip_vps:-o IP desta VPS}${reset}."
+        echo -e "${cinza}Usa Cloudflare? Deixe a nuvem cinza (\"somente DNS\").${reset}"
+        echo -e "${cinza}A mudança pode levar alguns minutos para valer.${reset}"
+        echo ""
+        printf '%b' "${branco}Enter${reset} = conferir de novo  |  ${branco}C${reset} = continuar mesmo assim  |  ${branco}0${reset} = voltar e corrigir: "
+        ler resp
+        resp="$(limpar "$resp")"
+        case "$resp" in
+            0) passo_dominios; return ;;
+            [cC]*) aviso "Sem o DNS certo o HTTPS não funciona. Corrija assim que puder."; sleep 2; return 0 ;;
+        esac
+    done
+}
+
+## Deixa só https://host (tira /rest/v1, /auth/v1, barras, espaços...)
+normalizar_supabase_url() {
+    local u
+    u="$(limpar "$1")"
+    u="${u,,}"
+    u="${u%%\?*}"; u="${u%%#*}"
+    [[ "$u" =~ ^https?:// ]] || u="https://$u"
+    u="$(printf '%s' "$u" | sed -E 's#^(https?://[^/]+).*#\1#')"
+    case "$u" in
+        https://*:443) u="${u%:443}" ;;
+        http://*:80) u="${u%:80}" ;;
+    esac
+    printf '%s' "$u"
+}
+
+## Host como o sistema calcula para a licença (porta padrão some)
+host_instalacao() {
+    local h="${1#*://}"
+    case "$1" in
+        https://*) h="${h%:443}" ;;
+        http://*)  h="${h%:80}" ;;
+    esac
+    printf '%s' "$h"
+}
+
+ref_supabase() {
+    local h
+    h="$(host_instalacao "$SUPABASE_URL")"
+    [[ "$h" == *.supabase.co ]] && printf '%s' "${h%%.*}"
+}
+
+passo_supabase_url() {
+    cabecalho_passo 2 $TOTAL_PASSOS "Supabase"
+    echo "Abra o seu projeto no Supabase e vá em:"
+    echo -e "  ${branco}Project Settings → API${reset}  (ou o botão ${branco}Connect${reset} no topo)"
+    echo ""
+    echo -e "Copie a ${branco}Project URL${reset}. Ela parece com: https://abcdefgh.supabase.co"
+    echo ""
+    local u codigo
+    perguntar u "Project URL" "${SUPABASE_URL:-}" || return 1
+    SUPABASE_URL="$(normalizar_supabase_url "$u")"
+    [ "$SUPABASE_URL" != "$(limpar "$u")" ] && echo -e "${cinza}  Ajustei para: $SUPABASE_URL${reset}"
+    info "Conferindo..."
+    codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SUPABASE_URL/auth/v1/health")"
+    if [ "$codigo" = "000" ]; then
+        falha "Não consegui acessar $SUPABASE_URL. Confira se copiou a URL certa."
+        enter
+        passo_supabase_url; return
+    fi
+    ok "Supabase encontrado."
+
+    echo ""
+    echo -e "Agora, na mesma tela (${branco}API Keys${reset}), copie a chave ${branco}anon public${reset}."
+    echo -e "${cinza}É a chave pública. Começa com eyJ... ou sb_publishable_...${reset}"
+    echo ""
+    while :; do
+        local k papel ref
+        perguntar k "Chave anon public" "${SUPABASE_ANON_KEY:-}" || { passo_supabase_url; return; }
+        if [[ "$k" == sb_secret_* ]] || [ "$(jwt_campo "$k" role)" = "service_role" ]; then
+            falha "Essa é a chave service_role (secreta). Aqui vai a anon public."
+            continue
+        fi
+        if [[ "$k" != sb_publishable_* ]]; then
+            papel="$(jwt_campo "$k" role)"
+            if [ "$papel" != "anon" ]; then
+                falha "Isso não parece a chave anon public. Copie de novo, inteira."
+                continue
+            fi
+            ref="$(jwt_campo "$k" ref)"
+            if [ -n "$ref" ] && [ -n "$(ref_supabase)" ] && [ "$ref" != "$(ref_supabase)" ]; then
+                falha "Essa chave é de outro projeto do Supabase ($ref)."
+                continue
+            fi
+        fi
+        codigo="$(supabase_curl "$k" "$SUPABASE_URL/auth/v1/settings")"
+        if [ "$codigo" != "200" ]; then
+            falha "O Supabase recusou essa chave (HTTP $codigo). Copie de novo, inteira."
+            continue
+        fi
+        SUPABASE_ANON_KEY="$k"
+        ok "Chave anon public válida."
+        break
+    done
+}
+
+passo_supabase_service() {
+    cabecalho_passo 3 $TOTAL_PASSOS "Supabase — chave secreta"
+    echo -e "Na mesma tela do Supabase, copie a chave ${branco}service_role${reset} (clique em Reveal)."
+    echo -e "${cinza}É a chave secreta. Começa com eyJ... ou sb_secret_...${reset}"
+    echo ""
+    while :; do
+        local k ref codigo
+        perguntar k "Chave service_role" "${SUPABASE_SERVICE_ROLE_KEY:-}" || return 1
+        if [[ "$k" == sb_publishable_* ]] || [ "$(jwt_campo "$k" role)" = "anon" ]; then
+            falha "Essa é a chave anon public. Aqui vai a service_role (secreta)."
+            continue
+        fi
+        if [[ "$k" != sb_secret_* ]]; then
+            if [ "$(jwt_campo "$k" role)" != "service_role" ]; then
+                falha "Isso não parece a chave service_role. Copie de novo, inteira."
+                continue
+            fi
+            ref="$(jwt_campo "$k" ref)"
+            if [ -n "$ref" ] && [ -n "$(ref_supabase)" ] && [ "$ref" != "$(ref_supabase)" ]; then
+                falha "Essa chave é de outro projeto do Supabase ($ref)."
+                continue
+            fi
+        fi
+        codigo="$(supabase_curl "$k" "$SUPABASE_URL/auth/v1/admin/users?page=1&per_page=1")"
+        if [ "$codigo" != "200" ]; then
+            falha "O Supabase recusou essa chave (HTTP $codigo). Copie de novo, inteira."
+            continue
+        fi
+        SUPABASE_SERVICE_ROLE_KEY="$k"
+        ok "Chave service_role válida."
+        sleep 1
+        break
+    done
+}
+
+tabelas_faltando() {
+    local t codigo faltando=()
+    for t in "${TABELAS_SQL[@]}"; do
+        codigo="$(supabase_curl "$SUPABASE_SERVICE_ROLE_KEY" "$SUPABASE_URL/rest/v1/$t?select=*&limit=1")"
+        [ "$codigo" = "200" ] || faltando+=("$t")
+    done
+    printf '%s ' "${faltando[@]}"
+}
+
+passo_sql() {
+    cabecalho_passo 4 $TOTAL_PASSOS "Tabelas do sistema"
+    info "Conferindo as tabelas no seu Supabase..."
+    local falta resp link ref
+    falta="$(tabelas_faltando)"
+    if [ -z "${falta// /}" ]; then
+        ok "Tabelas do sistema encontradas."
+        sleep 1
+        return 0
+    fi
+    ref="$(ref_supabase)"
+    link="${ref:+https://supabase.com/dashboard/project/$ref/sql/new}"
+    while :; do
+        echo ""
+        echo "As tabelas do sistema ainda não existem no seu Supabase. Para criar:"
+        echo -e "  1. Abra o ${branco}SQL Editor${reset} do Supabase${link:+: ${verde}$link${reset}}"
+        echo -e "  2. Cole o conteúdo do arquivo SQL de criação das tabelas e clique em ${branco}Run${reset}"
+        echo -e "  3. Espere aparecer ${branco}Success${reset} e volte aqui"
+        echo ""
+        printf '%b' "Aperte ${branco}Enter${reset} depois de rodar o SQL (0 = voltar): "
+        ler resp
+        [ "$(limpar "$resp")" = "0" ] && return 1
+        info "Conferindo..."
+        falta="$(tabelas_faltando)"
+        if [ -z "${falta// /}" ]; then
+            ok "Tabelas criadas."
+            sleep 1
+            return 0
+        fi
+        falha "Ainda faltam as tabelas: $falta"
+        echo -e "${cinza}Confira se rodou o SQL no projeto certo ($SUPABASE_URL) e se terminou com Success.${reset}"
+    done
+}
+
+## Consulta o servidor de licenças do mesmo jeito que o sistema faz.
+## Retorna 0 = liberada, 1 = recusada (motivo em LICENCA_MOTIVO), 2 = servidor indisponível
+consultar_licenca() {
+    local host fingerprint corpo codigo payload json
+    host="$(host_instalacao "$SUPABASE_URL")"
+    fingerprint="$(printf 'hublabel:%s' "$host" | sha256sum | awk '{print $1}')"
+    corpo="$(printf '{"email":"%s","fingerprint":"%s","nonce":"%s","servico":"setup","versao":"setup-%s","instalacao":"%s","hostname":"%s"}' \
+        "$LICENCA_EMAIL" "$fingerprint" "$(aleatorio 16)" "$VERSAO" "$host" "$(hostname)")"
+    codigo="$(curl -s -o "$TMP/licenca" -w '%{http_code}' --max-time 20 -X POST \
+        -H 'content-type: application/json' -d "$corpo" "$LICENCA_URL/v1/validar")"
+    [ "$codigo" = "200" ] || return 2
+    payload="$(sed -n 's/.*"payload" *: *"\([^"]*\)".*/\1/p' "$TMP/licenca")"
+    json="$(printf '%s' "$payload" | base64 -d 2>/dev/null)"
+    [ -n "$json" ] || return 2
+    if printf '%s' "$json" | grep -q '"ok" *: *true'; then
+        return 0
+    fi
+    LICENCA_MOTIVO="$(printf '%s' "$json" | sed -n 's/.*"motivo" *: *"\([^"]*\)".*/\1/p')"
+    return 1
+}
+
+passo_licenca() {
+    cabecalho_passo 5 $TOTAL_PASSOS "Licença"
+    echo "Informe o e-mail usado na compra do HubLabel."
+    echo -e "${amarelo}Atenção: cada licença vale para uma instalação.${reset}"
+    echo ""
+    while :; do
+        local e resp
+        perguntar e "E-mail da licença" "${LICENCA_EMAIL:-}" || return 1
+        e="${e,,}"
+        if ! [[ "$e" =~ ^[^@[:space:]\"\']+@[^@[:space:]\"\']+\.[^@[:space:]\"\']+$ ]]; then
+            falha "E-mail inválido."
+            continue
+        fi
+        LICENCA_EMAIL="$e"
+        info "Verificando a licença..."
+        LICENCA_MOTIVO=""
+        consultar_licenca
+        case $? in
+            0)
+                ok "Licença liberada."
+                sleep 1
+                return 0
+                ;;
+            1)
+                falha "Licença não liberada: ${LICENCA_MOTIVO:-recusada}"
+                case "$LICENCA_MOTIVO" in
+                    *"sem licença"*) echo -e "${cinza}Confira se é exatamente o e-mail da compra. Se estiver certo, fale com o suporte.${reset}" ;;
+                    *) echo -e "${cinza}Fale com o suporte do HubLabel.${reset}" ;;
+                esac
+                ;;
+            2)
+                falha "Não consegui falar com o servidor de licenças agora."
+                printf '%b' "${branco}Enter${reset} = tentar de novo  |  ${branco}C${reset} = continuar sem verificar  |  ${branco}0${reset} = voltar: "
+                ler resp
+                resp="$(limpar "$resp")"
+                [ "$resp" = "0" ] && return 1
+                if [[ "$resp" =~ ^[cC] ]]; then
+                    aviso "O sistema verifica a licença sozinho quando subir."
+                    sleep 1
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+assistente() {
+    local passos=(passo_dominios passo_supabase_url passo_supabase_service passo_sql passo_licenca)
+    local i
+    while :; do
+        i=0
+        while [ $i -lt ${#passos[@]} ]; do
+            if ${passos[$i]}; then
+                i=$((i + 1))
+            else
+                [ $i -gt 0 ] && i=$((i - 1))
+            fi
+        done
+
+        banner
+        echo -e "${branco}Confira os dados:${reset}"
+        echo ""
+        echo -e "${amarelo}AMBIENTE${reset}       $PAINEL"
+        echo -e "${amarelo}SISTEMA${reset}        https://$APP_HOST"
+        echo -e "${amarelo}EVOLUTION${reset}      https://$EVO_HOST"
+        echo -e "${amarelo}S3${reset}             https://$S3_HOST"
+        echo -e "${amarelo}SUPABASE${reset}       $SUPABASE_URL"
+        echo -e "${amarelo}LICENÇA${reset}        $LICENCA_EMAIL"
+        echo ""
+        echo -e "${amarelo}====================================================================================${reset}"
+        local r
+        sim_nao "Está tudo certo? S = instalar  |  N = corrigir" S
+        r=$?
+        [ $r = 0 ] && return 0
+        echo -e "${cinza}Vamos refazer. Aperte Enter nas respostas que já estão certas.${reset}"
         sleep 2
     done
 }
 
-criar_banco_postgres_da_stack() {
-    local db_name="$1"
-    while :; do
-        if docker ps -q --filter "name=^postgres_postgres" 2>/dev/null | grep -q .; then
-            CONTAINER_ID=$(docker ps -q --filter "name=^postgres_postgres" | head -1)
-            if docker exec "$CONTAINER_ID" psql -U postgres -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$db_name"; then
-                break
-            fi
-            docker exec "$CONTAINER_ID" psql -U postgres -c "CREATE DATABASE $db_name;" 2>/dev/null
-            if docker exec "$CONTAINER_ID" psql -U postgres -lqt 2>/dev/null | cut -d \| -f 1 | grep -qw "$db_name"; then
-                break
-            fi
-        fi
-        sleep 3
-    done
-}
-
-recursos() {
-    vcpu_requerido=$1
-    ram_requerido=$2
-    if command -v neofetch >/dev/null 2>&1; then
-        vcpu_disponivel=$(neofetch --stdout 2>/dev/null | grep "CPU" | grep -oP '\(\d+\)' | tr -d '()')
-        ram_disponivel=$(neofetch --stdout 2>/dev/null | grep "Memory" | awk '{print $4}' | tr -d 'MiB' | awk '{print int($1/1024 + 0.5)}')
-    else
-        vcpu_disponivel=$(nproc 2>/dev/null || echo 2)
-        ram_disponivel=$(free -g 2>/dev/null | awk '/^Mem:/{print $2}')
-    fi
-    vcpu_disponivel=${vcpu_disponivel:-2}
-    ram_disponivel=${ram_disponivel:-2}
-    if [[ $vcpu_disponivel -ge $vcpu_requerido && $ram_disponivel -ge $ram_requerido ]]; then
-        return 0
-    else
-        echo -e "${vermelho}Recursos insuficientes. Requer: ${vcpu_requerido}vCPU e ${ram_requerido}GB RAM${reset}"
-        return 1
-    fi
-}
-
-stack_editavel() {
-    sudo apt install -y jq >/dev/null 2>&1
-    arquivo="/root/dados_vps/dados_portainer"
-    if [ ! -f "$arquivo" ]; then
-        echo "Erro: dados_portainer não encontrado. Execute primeiro Traefik+Portainer."
-        return 1
-    fi
-
-    ## Extrair variáveis ANTES de modificar o arquivo (igual SetupOrion)
-    PORTAINER_URL=$(grep "Dominio do portainer:" "$arquivo" 2>/dev/null | sed 's/.*Dominio do portainer: *//' | sed 's|https://||' | tr -d ' \r\n')
-    USUARIO=$(grep "Usuario:" "$arquivo" 2>/dev/null | sed 's/.*Usuario: *//' | tr -d '\r\n')
-    SENHA=$(grep "Senha:" "$arquivo" 2>/dev/null | sed 's/.*Senha: *//' | tr -d '\r\n')
-
-    ## Remove https:// do arquivo (igual SetupOrion) - preserva o restante
-    sed -i 's|Dominio do portainer: https://|Dominio do portainer: |' "$arquivo" 2>/dev/null
-
-    [ -z "$PORTAINER_URL" ] && { echo "Erro: Dominio do Portainer vazio em dados_portainer"; return 1; }
-    [ -z "$USUARIO" ] && { echo "Erro: Usuario vazio em dados_portainer"; return 1; }
-    [ -z "$SENHA" ] && { echo "Erro: Senha vazia em dados_portainer"; return 1; }
-
-    TOKEN=""
-    for i in $(seq 1 6); do
-        ## Tenta via 127.0.0.1 (evita hairpin NAT) e via URL direta (igual SetupOrion)
-        RESPONSE=$(curl -k -s -m 15 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -H "Host: $PORTAINER_URL" \
-            -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
-            "https://127.0.0.1/api/auth")
-        BODY=$(echo "$RESPONSE" | sed '$d')
-        HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
-        TOKEN=$(echo "$BODY" | jq -r '.jwt // empty' 2>/dev/null)
-        if [ -z "$TOKEN" ]; then
-            RESPONSE=$(curl -k -s -m 15 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" \
-                -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
-                "https://$PORTAINER_URL/api/auth")
-            BODY=$(echo "$RESPONSE" | sed '$d')
-            TOKEN=$(echo "$BODY" | jq -r '.jwt // empty' 2>/dev/null)
-        fi
-        [ -n "$TOKEN" ] && break
-        echo "Tentativa $i/6 - Aguardando Portainer..."
-        sleep 5
-    done
-
-    ## Fallback: se não obteve token, pede credenciais manualmente (igual SetupOrion)
-    if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-        echo ""
-        echo -e "${amarelo}Não foi possível obter o token automaticamente. Informe as credenciais do Portainer:${reset}"
-        echo ""
-        read -p "URL do Portainer (ex: painel.$dominio_base) [$PORTAINER_URL]: " input_url
-        PORTAINER_URL="${input_url:-$PORTAINER_URL}"
-        PORTAINER_URL="${PORTAINER_URL#https://}"
-        PORTAINER_URL="${PORTAINER_URL%%/*}"
-        read -p "Usuário do Portainer [$USUARIO]: " input_user
-        USUARIO="${input_user:-$USUARIO}"
-        echo -e "${amarelo}Senha não aparecerá ao digitar${reset}"
-        read -s -p "Senha do Portainer: " SENHA
-        echo ""
-        echo -e "[ PORTAINER ]\nDominio do portainer: https://$PORTAINER_URL\nUsuario: $USUARIO\nSenha: $SENHA\nToken: " > "$arquivo"
-        for i in 1 2 3; do
-            RESPONSE=$(curl -k -s -m 15 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" -H "Host: $PORTAINER_URL" \
-                -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
-                "https://127.0.0.1/api/auth")
-            BODY=$(echo "$RESPONSE" | sed '$d')
-            TOKEN=$(echo "$BODY" | jq -r '.jwt // empty' 2>/dev/null)
-            if [ -z "$TOKEN" ]; then
-                RESPONSE=$(curl -k -s -m 15 -w "\n%{http_code}" -X POST -H "Content-Type: application/json" \
-                    -d "{\"username\":\"$USUARIO\",\"password\":\"$SENHA\"}" \
-                    "https://$PORTAINER_URL/api/auth")
-                BODY=$(echo "$RESPONSE" | sed '$d')
-                TOKEN=$(echo "$BODY" | jq -r '.jwt // empty' 2>/dev/null)
-            fi
-            [ -n "$TOKEN" ] && break
-            echo "Tentativa $i/3 com novas credenciais..."
-            sleep 3
-        done
-        [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ] && { echo "Erro ao obter token Portainer. Verifique as credenciais."; return 1; }
-        echo "Token obtido com sucesso!"
-    fi
-
-    echo -e "[ PORTAINER ]\nDominio do portainer: https://$PORTAINER_URL\nUsuario: $USUARIO\nSenha: $SENHA\nToken: $TOKEN" > "$arquivo"
-
-    ENDPOINT_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
-    [ -z "$ENDPOINT_ID" ] || [ "$ENDPOINT_ID" = "null" ] && ENDPOINT_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints" | jq -r '.[] | select(.Name == "primary") | .Id')
-    SWARM_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
-    [ -z "$SWARM_ID" ] || [ "$SWARM_ID" = "null" ] && SWARM_ID=$(curl -k -s -m 15 -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/endpoints/$ENDPOINT_ID/docker/swarm" | jq -r .ID)
-
-    if [ ! -f "$(pwd)/${STACK_NAME}.yaml" ]; then
-        echo "Erro: ${STACK_NAME}.yaml não encontrado em $(pwd)"
-        return 1
-    fi
-
-    ## Tentar create via 127.0.0.1 (igual SetupOrion usa URL direta; 127.0.0.1 pode falhar em alguns ambientes)
-    http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X POST \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "Host: $PORTAINER_URL" \
-        -F "Name=$STACK_NAME" \
-        -F "file=@$(pwd)/${STACK_NAME}.yaml" \
-        -F "SwarmID=$SWARM_ID" \
-        -F "endpointId=$ENDPOINT_ID" \
-        "https://127.0.0.1/api/stacks/create/swarm/file" 2>/dev/null)
-
-    ## Se falhou, tentar via URL direta (igual SetupOrion)
-    if [ "$http_code" != "200" ]; then
-        http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X POST \
-            -H "Authorization: Bearer $TOKEN" \
-            -F "Name=$STACK_NAME" \
-            -F "file=@$(pwd)/${STACK_NAME}.yaml" \
-            -F "SwarmID=$SWARM_ID" \
-            -F "endpointId=$ENDPOINT_ID" \
-            "https://$PORTAINER_URL/api/stacks/create/swarm/file" 2>/dev/null)
-    fi
-
-    if [ "$http_code" -eq 200 ]; then
-        echo -e "10/10 - [ OK ] - Deploy da stack ${verde}$STACK_NAME${reset} feito com sucesso!"
-        return 0
-    fi
-
-    ## Se stack já existe, tentar update
-    STACK_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" -H "Host: $PORTAINER_URL" "https://127.0.0.1/api/stacks" 2>/dev/null | jq -r ".[] | select(.Name==\"$STACK_NAME\") | .Id")
-    [ -z "$STACK_ID" ] || [ "$STACK_ID" = "null" ] && STACK_ID=$(curl -k -s -H "Authorization: Bearer $TOKEN" "https://$PORTAINER_URL/api/stacks" 2>/dev/null | jq -r ".[] | select(.Name==\"$STACK_NAME\") | .Id")
-
-    if [ -n "$STACK_ID" ] && [ "$STACK_ID" != "null" ]; then
-        stack_file="$(pwd)/${STACK_NAME}.yaml"
-        file_content=$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$stack_file")
-        http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X PUT \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Content-Type: application/json" \
-            -H "Host: $PORTAINER_URL" \
-            -d "{\"stackFileContent\":$file_content,\"prune\":true,\"pullImage\":true}" \
-            "https://127.0.0.1/api/stacks/$STACK_ID" 2>/dev/null)
-        if [ "$http_code" != "200" ]; then
-            http_code=$(curl -s -o /tmp/stack_response -w "%{http_code}" -k -X PUT \
-                -H "Authorization: Bearer $TOKEN" \
-                -H "Content-Type: application/json" \
-                -d "{\"stackFileContent\":$file_content,\"prune\":true,\"pullImage\":true}" \
-                "https://$PORTAINER_URL/api/stacks/$STACK_ID" 2>/dev/null)
-        fi
-        if [ "$http_code" -eq 200 ]; then
-            echo -e "10/10 - [ OK ] - Update da stack ${verde}$STACK_NAME${reset} feito com sucesso!"
-            return 0
-        fi
-    fi
-
-    ## Fallback: docker stack deploy direto (igual SetupOrion tem comentado)
-    echo "10/10 - [ OFF ] - Portainer API falhou (HTTP $http_code). Tentando docker stack deploy..."
-    if [ -f /tmp/stack_response ] && [ -s /tmp/stack_response ]; then
-        echo "Resposta Portainer: $(cat /tmp/stack_response | jq . 2>/dev/null || cat /tmp/stack_response)"
-    fi
-    if docker stack deploy --prune --resolve-image always -c "$(pwd)/${STACK_NAME}.yaml" "$STACK_NAME" 2>/dev/null; then
-        echo -e "10/10 - [ OK ] - Deploy da stack ${verde}$STACK_NAME${reset} via docker feito com sucesso!"
-        return 0
-    fi
-
-    echo "10/10 - [ OFF ] - Erro ao fazer deploy. HTTP $http_code"
-    return 1
-}
-
 ## ============================================================================
-## COLETA DE INFORMAÇÕES - TUDO NO INÍCIO
-## ============================================================================
-
-coletar_informacoes() {
-    clear
-    echo ""
-    echo -e "${branco}  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
-    echo -e "${branco}  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
-    echo -e "${branco}  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
-    echo -e "${branco}  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
-    echo -e "${branco}  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
-    echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
-    echo ""
-    echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${amarelo}                         INSTALADOR HUBLABEL V1.8                                                   ${reset}"
-    echo -e "${amarelo}====================================================================================================${reset}"
-    echo ""
-    echo -e "${branco}Informe todas as informações abaixo. Depois a instalação será feita automaticamente.${reset}"
-    echo ""
-
-    ## Email e domínio base
-    read -p "Email para Let's Encrypt (ex: contato@seudominio.com): " email_ssl
-    read -p "Domínio base (ex: victoreder.com.br): " dominio_base
-    dominio_base="${dominio_base#https://}"
-    dominio_base="${dominio_base#http://}"
-    dominio_base="${dominio_base%%/*}"
-    dominio_base="${dominio_base,,}"
-    dominio_base="${dominio_base#www.}"
-    echo ""
-
-    read -p "Os subdominios usados são os padroes? (Y/N): " subdominios_padrao
-    subdominios_padrao="${subdominios_padrao:-N}"
-
-    if [ "${subdominios_padrao^^}" = "Y" ]; then
-        sub_portainer="painel"
-        sub_evolution="wpp"
-        sub_minio="imagens"
-        sub_s3="s3"
-        sub_n8n="back"
-        sub_webhook="app"
-        echo ""
-        echo -e "${verde}Subdomínios padrão aplicados:${reset}"
-        echo "  Portainer: painel | Evolution: wpp | MinIO: imagens | S3: s3 | N8N Editor: back | N8N Webhook: app"
-        echo ""
-    else
-        echo ""
-        echo -e "${branco}Agora informe apenas o subdomínio para cada serviço. Será usado: subdominio.$dominio_base${reset}"
-        echo ""
-
-        ## Traefik + Portainer
-        echo -e "${verde}[1/4] Traefik e Portainer${reset}"
-        read -p "Subdomínio do Portainer (ex: painel): " sub_portainer
-        sub_portainer="${sub_portainer:-painel}"
-        echo ""
-
-        ## Evolution API
-        echo -e "${verde}[2/4] Evolution API${reset}"
-        read -p "Subdomínio da Evolution API (ex: evolution): " sub_evolution
-        sub_evolution="${sub_evolution:-evolution}"
-        echo ""
-
-        ## MinIO
-        echo -e "${verde}[3/4] MinIO${reset}"
-        read -p "Subdomínio do painel MinIO (ex: minio): " sub_minio
-        sub_minio="${sub_minio:-minio}"
-        read -p "Subdomínio da API S3 (ex: s3): " sub_s3
-        sub_s3="${sub_s3:-s3}"
-        echo ""
-
-        ## N8N
-        echo -e "${verde}[4/4] N8N${reset}"
-        read -p "Subdomínio do N8N Editor (ex: n8n): " sub_n8n
-        sub_n8n="${sub_n8n:-n8n}"
-        read -p "Subdomínio do Webhook N8N (ex: hook): " sub_webhook
-        sub_webhook="${sub_webhook:-hook}"
-        echo ""
-    fi
-
-    url_portainer="${sub_portainer}.${dominio_base}"
-    user_portainer="admin"
-    pass_portainer="EjGse3_0@t50OPo"
-    dominio_sem_sufixo="${dominio_base%%.*}"
-    nome_servidor="$dominio_sem_sufixo"
-    nome_rede_interna="Rede$dominio_sem_sufixo"
-    url_evolution="${sub_evolution}.${dominio_base}"
-    url_minio="${sub_minio}.${dominio_base}"
-    url_s3="${sub_s3}.${dominio_base}"
-    user_minio="admin"
-    senha_minio="EjGse3_0@t50OPo"
-    minio_image="ghcr.io/victoreder/minio:RELEASE.2024-01-13T07-53-03Z"
-    url_editorn8n="${sub_n8n}.${dominio_base}"
-    url_webhookn8n="${sub_webhook}.${dominio_base}"
-    email_smtp_n8n="suporte@$dominio_base"
-    usuario_smtp_n8n="suporte@$dominio_base"
-    senha_smtp_n8n="123"
-    host_smtp_n8n="smtp"
-    porta_smtp_n8n="465"
-    smtp_secure_smtp_n8n=true
-    echo ""
-
-    ## Supabase (usado pelo Disparador)
-    echo -e "${verde}[Supabase]${reset}"
-    read -p "URL do Supabase (ex: https://xxxxx.supabase.co): " supabase_url
-    read -p "Service Role Key do Supabase: " supabase_service_role_key
-    echo ""
-
-    ## Remover barras ou caracteres extras
-    url_portainer="${url_portainer%%/*}"
-    url_evolution="${url_evolution%%/*}"
-    url_minio="${url_minio%%/*}"
-    url_s3="${url_s3%%/*}"
-    url_editorn8n="${url_editorn8n%%/*}"
-    url_webhookn8n="${url_webhookn8n%%/*}"
-    supabase_url="${supabase_url%/}"
-
-    ## Confirmação
-    clear
-    echo ""
-    echo -e "${branco}  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
-    echo -e "${branco}  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
-    echo -e "${branco}  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
-    echo -e "${branco}  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
-    echo -e "${branco}  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
-    echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
-    echo ""
-    echo -e "${amarelo}====================================================================================================${reset}"
-    echo -e "${branco}Verifique os dados:${reset}"
-    echo ""
-    echo -e "${amarelo}PORTAINER${reset}"
-    echo "  https://$url_portainer  (User: $user_portainer)"
-    echo ""
-    echo -e "${amarelo}EVOLUTION${reset}"
-    echo "  https://$url_evolution"
-    echo ""
-    echo -e "${amarelo}MINIO${reset}"
-    echo "  https://$url_minio"
-    echo ""
-    echo -e "${amarelo}S3${reset}"
-    echo "  https://$url_s3"
-    echo ""
-    echo -e "${amarelo}N8N${reset}"
-    echo "  https://$url_editorn8n"
-    echo ""
-    echo -e "${amarelo}N8N WEBHOOK / APP (Disparador)${reset}"
-    echo "  https://$url_webhookn8n"
-    echo ""
-    echo -e "${amarelo}SUPABASE${reset}"
-    echo "  URL: $supabase_url"
-    echo "  Service Role: (informada)"
-    echo ""
-    echo -e "${amarelo}EMAIL${reset}"
-    echo "  $email_ssl"
-    echo -e "${amarelo}====================================================================================================${reset}"
-    read -p "Confirmar e iniciar instalação? (Y/N): " conf
-    [[ "${conf^^}" != "Y" ]] && { echo "Cancelado."; exit 1; }
-}
-
-## ============================================================================
-## VERIFICAÇÕES INICIAIS (igual SetupOrion)
+## PREPARAÇÃO DA VPS
 ## ============================================================================
 
 verificacoes_iniciais() {
-    clear
-    echo -e "${amarelo}Verificando ambiente...${reset}"
-
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${vermelho}Execute como root: sudo bash setuppersonalizado-hublabel.sh${reset}"
-        exit 1
+    [ "$(id -u)" -eq 0 ] || erro "Rode como root (sudo -i) e tente de novo."
+    command -v curl >/dev/null 2>&1 || {
+        command -v apt-get >/dev/null 2>&1 || erro "Instale o curl e rode de novo."
+        apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null
+    }
+    if ! command -v python3 >/dev/null 2>&1; then
+        command -v apt-get >/dev/null 2>&1 || erro "Instale o python3 e rode de novo."
+        info "Instalando dependências..."
+        apt-get update -qq && apt-get install -y -qq python3 >/dev/null
     fi
-
-    if [ ! -f /etc/debian_version ]; then
-        echo -e "${vermelho}Este instalador foi preparado para sistemas baseados em Debian/Ubuntu.${reset}"
-        exit 1
+    local ram
+    ram="$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)"
+    if [ -n "$ram" ] && [ "$ram" -lt 1800 ]; then
+        aviso "Esta VPS tem ${ram}MB de memória. O recomendado é 2GB ou mais."
+        sleep 2
     fi
-
-    if ! command -v apt-get >/dev/null 2>&1; then
-        echo -e "${vermelho}apt-get não encontrado.${reset}"
-        exit 1
-    fi
-
-    recursos 1 1 || exit 1
-    echo -e "${verde}✓ Verificações concluídas${reset}"
-    echo ""
 }
 
-## ============================================================================
-## INSTALAÇÃO TRAEFIK + PORTAINER
-## ============================================================================
-
-instalar_traefik_portainer() {
-    echo -e "${amarelo}• Instalando Traefik e Portainer...${reset}"
-    cd /root
-
-    mkdir -p dados_vps
-    cat > dados_vps/dados_vps <<EOL
-[DADOS DA VPS]
-Nome do Servidor: $nome_servidor
-Rede interna: $nome_rede_interna
-Email para SSL: $email_ssl
-Link do Portainer: $url_portainer
-EOL
-
-    ## Atualizar VPS
-    apt-get update -qq && apt upgrade -y -qq
-    timedatectl set-timezone America/Sao_Paulo 2>/dev/null || true
-    apt-get install -y -qq apt-utils apparmor-utils
-    hostnamectl set-hostname "$nome_servidor" 2>/dev/null || true
-    sed -i "s/127.0.0.1[[:space:]]localhost/127.0.0.1 $nome_servidor/" /etc/hosts 2>/dev/null || true
-
-    ## Docker
+instalar_docker() {
     if ! command -v docker >/dev/null 2>&1; then
-        curl -fsSL https://get.docker.com | bash
+        info "Instalando o Docker (pode levar alguns minutos)..."
+        command -v apt-get >/dev/null 2>&1 || erro "Não encontrei o apt-get. Instale o Docker e rode de novo."
+        apt-get update -qq
+        timedatectl set-timezone America/Sao_Paulo 2>/dev/null || true
+        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 || erro "Não consegui instalar o Docker."
     fi
-    systemctl enable docker
-    systemctl start docker
+    systemctl enable --now docker >/dev/null 2>&1 || true
+    if [ "$MODO_DEPLOY" = compose ] && ! docker compose version >/dev/null 2>&1; then
+        info "Instalando o Docker Compose..."
+        apt-get update -qq
+        apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
+            || erro "Não consegui instalar o Docker Compose."
+    fi
+    docker info >/dev/null 2>&1 || erro "O Docker não está rodando."
+    ok "Docker pronto."
+}
 
-    ## Swarm
-    ip=$(hostname -I | awk '{print $1}')
-    docker swarm init --advertise-addr "$ip" 2>/dev/null || true
+## ============================================================================
+## CONFIGURAÇÃO SALVA (/opt/hublabel/.env)
+## ============================================================================
 
-    ## Rede e Volumes
-    docker network create --driver=overlay "$nome_rede_interna" 2>/dev/null || true
-    docker volume create volume_swarm_shared 2>/dev/null || true
-    docker volume create volume_swarm_certificates 2>/dev/null || true
-    docker volume create portainer_data 2>/dev/null || true
+VARS_SALVAS=(MODO_DEPLOY MODO_ROTA PAINEL TRAEFIK_RESOLVER TRAEFIK_ENTRYPOINT TRAEFIK_REDE TRAEFIK_LABEL_REDE
+    TRAEFIK_PASTA_ARQUIVOS REDE_INTERNA PORTA_APP PORTA_EVO PORTA_S3
+    DOMINIO_BASE SUB_APP SUB_EVO SUB_S3 APP_HOST EVO_HOST S3_HOST
+    SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY LICENCA_EMAIL
+    EVOLUTION_API_KEY POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY)
 
-    ## Traefik (Python evita problema com backticks no heredoc)
-    python3 - "$nome_rede_interna" "$email_ssl" << 'PYEOF'
-import sys
-rede = sys.argv[1]
-email = sys.argv[2]
-with open('/root/traefik.yaml', 'w') as f:
-    f.write(f'''version: "3.7"
-services:
+salvar_config() {
+    mkdir -p "$DIR"
+    local v
+    {
+        echo "## HubLabel — configuração do setup v$VERSAO ($(date '+%d/%m/%Y %H:%M'))"
+        echo "## Para mudar algo, rode o setup de novo e escolha \"Refazer a configuração\"."
+        for v in "${VARS_SALVAS[@]}"; do
+            printf "%s='%s'\n" "$v" "${!v:-}"
+        done
+    } >"$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+}
 
-## --------------------------- HUBLABEL --------------------------- ##
+carregar_config() {
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+}
 
-  traefik:
-    image: traefik:latest  ## Versão do Traefik
-    command:
-      - "--api.dashboard=true"
-      - "--providers.swarm=true"
-      - "--providers.swarm.endpoint=unix:///var/run/docker.sock"
-      - "--providers.swarm.exposedbydefault=false"
-      - "--providers.swarm.network={rede}"  ## Nome da rede interna
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
-      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
-      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
-      - "--entrypoints.websecure.address=:443"
-      - "--entrypoints.web.transport.respondingTimeouts.idleTimeout=3600"
-      - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge=true"
-      - "--certificatesresolvers.letsencryptresolver.acme.httpchallenge.entrypoint=web"
-      - "--certificatesresolvers.letsencryptresolver.acme.storage=/etc/traefik/letsencrypt/acme.json"
-      - "--certificatesresolvers.letsencryptresolver.acme.email={email}"  ## Email para receber as notificações
-      - "--log.level=DEBUG"
-      - "--log.format=common"
-      - "--log.filePath=/var/log/traefik/traefik.log"
-      - "--accesslog=true"
-      - "--accesslog.filepath=/var/log/traefik/access-log"
-
-    volumes:
-      - vol_certificates:/etc/traefik/letsencrypt
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    ports:
-      - target: 80
-        published: 80
-        mode: host
-      - target: 443
-        published: 443
-        mode: host
-
-    deploy:
-      placement:
-        constraints:
-          - node.role == manager
-      labels:
-        - traefik.enable=true
-        - traefik.http.middlewares.redirect-https.redirectscheme.scheme=https
-        - traefik.http.middlewares.redirect-https.redirectscheme.permanent=true
-        - "traefik.http.routers.http-catchall.rule=Host(`{{host:.+}}`)"
-        - traefik.http.routers.http-catchall.entrypoints=web
-        - traefik.http.routers.http-catchall.middlewares=redirect-https@docker
-        - traefik.http.routers.http-catchall.priority=1
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-volumes:
-  vol_shared:
-    external: true
-    name: volume_swarm_shared
-  vol_certificates:
-    external: true
-    name: volume_swarm_certificates
-
-networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    attachable: true
-    name: {rede}  ## Nome da rede interna
-''')
-PYEOF
-
-    pull traefik:v3.5.3
-    docker stack deploy --prune --resolve-image always -c traefik.yaml traefik
-    wait_stack traefik_traefik
-    wait_30_sec
-
-    ## Setup token do Portainer (obrigatório desde 2.43 / 2.39.4)
-    ## Docs: https://docs.portainer.io/faqs/installing/setup-token
-    portainer_setup_token=$(openssl rand -hex 32)
-
-    ## Portainer (Python evita problema com backticks no heredoc)
-    python3 - "$url_portainer" "$nome_rede_interna" "$portainer_setup_token" << 'PYEOF'
-import sys
-url = sys.argv[1]
-rede = sys.argv[2]
-setup_token = sys.argv[3]
-with open('/root/portainer.yaml', 'w') as f:
-    f.write(f'''version: "3.7"
-services:
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-  agent:
-    image: portainer/agent:latest  ## Versão Agent do Portainer
-
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - /var/lib/docker/volumes:/var/lib/docker/volumes
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    deploy:
-      mode: global
-      placement:
-        constraints:
-          - node.platform.os == linux
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-  portainer:
-    image: portainer/portainer-ce:latest  ## Versão do Portainer
-    command:
-      - -H
-      - tcp://tasks.agent:9001
-      - --tlsskipverify
-      - --setup-token
-      - {setup_token}
-
-    volumes:
-      - portainer_data:/data
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      labels:
-        - traefik.enable=true
-        - traefik.http.routers.portainer.rule=Host(`{url}`)  ## Dominio do Portainer
-        - traefik.http.services.portainer.loadbalancer.server.port=9000
-        - traefik.http.routers.portainer.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.portainer.service=portainer
-        - traefik.swarm.network={rede}  ## Nome da rede interna
-        - traefik.http.routers.portainer.entrypoints=websecure
-        - traefik.http.routers.portainer.priority=1
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-volumes:
-  portainer_data:
-    external: true
-    name: portainer_data
-
-networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    attachable: true
-    name: {rede}  ## Nome da rede interna
-''')
-PYEOF
-
-    pull portainer/agent:latest portainer/portainer-ce:latest
-    docker stack deploy --prune --resolve-image always -c portainer.yaml portainer
-    wait_stack portainer_portainer
-    sleep 30
-
-    ## Criar conta Portainer com X-Setup-Token (127.0.0.1 evita hairpin NAT)
-    conta_criada=false
-    for i in 1 2 3 4 5; do
-        resp=$(curl -k -s -X POST \
-            -H "Host: $url_portainer" \
-            -H "Content-Type: application/json" \
-            -H "X-Setup-Token: $portainer_setup_token" \
-            -d "{\"Username\": \"$user_portainer\", \"Password\": \"$pass_portainer\"}" \
-            "https://127.0.0.1/api/users/admin/init")
-        if echo "$resp" | grep -q "\"Username\":\"$user_portainer\""; then
-            echo -e "${verde}✓ Conta admin do Portainer criada${reset}"
-            conta_criada=true
-            break
+gerar_segredos() {
+    EVOLUTION_API_KEY="${EVOLUTION_API_KEY:-$(aleatorio 16)}"
+    POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(aleatorio 16)}"
+    MINIO_ROOT_USER="${MINIO_ROOT_USER:-hublabel}"
+    MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$(aleatorio 16)}"
+    S3_ACCESS_KEY="${S3_ACCESS_KEY:-$(head -c 200 /dev/urandom | tr -dc 'A-Z0-9' | head -c 20)}"
+    S3_SECRET_KEY="${S3_SECRET_KEY:-$(head -c 400 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 40)}"
+    local cliente="${DOMINIO_BASE%%.*}"
+    cliente="$(printf '%s' "$cliente" | tr -cd 'a-zA-Z0-9')"
+    if [ -z "${REDE_INTERNA:-}" ]; then
+        REDE_INTERNA="Rede${cliente^}"
+        ## Rede com esse nome já existe e não é nossa (ex.: setup antigo) → usa outro nome
+        if docker network inspect "$REDE_INTERNA" >/dev/null 2>&1 \
+            && [ "$(docker network inspect -f '{{index .Labels "com.docker.compose.project"}}' "$REDE_INTERNA" 2>/dev/null)" != "$PROJETO" ]; then
+            REDE_INTERNA="hublabel_rede"
         fi
-        echo "Tentando criar conta no Portainer ${i}/5..."
-        sleep 15
-    done
-
-    if [ "$conta_criada" != true ]; then
-        echo -e "${vermelho}⚠ Não foi possível criar a conta admin do Portainer automaticamente.${reset}"
-        echo "Resposta: $resp"
-        echo "Crie manualmente em https://$url_portainer (pode ser necessário o setup token dos logs)."
     fi
-
-    token=""
-    for i in 1 2 3 4 5; do
-        RESPONSE=$(curl -k -s -m 15 -w "\n%{http_code}" -X POST -H "Host: $url_portainer" -H "Content-Type: application/json" \
-            -d "{\"username\":\"$user_portainer\",\"password\":\"$pass_portainer\"}" \
-            "https://127.0.0.1/api/auth")
-        BODY=$(echo "$RESPONSE" | sed '$d')
-        token=$(echo "$BODY" | jq -r '.jwt // empty' 2>/dev/null)
-        [ -n "$token" ] && break
-        sleep 10
-    done
-
-    mkdir -p dados_vps
-    echo -e "[ PORTAINER ]\nDominio do portainer: https://$url_portainer\nUsuario: $user_portainer\nSenha: $pass_portainer\nToken: $token" > dados_vps/dados_portainer
-
-    dados
-    echo -e "${verde}✓ Traefik e Portainer instalados${reset}"
-}
-
-## ============================================================================
-## INSTALAÇÃO POSTGRESQL
-## ============================================================================
-
-instalar_postgres() {
-    echo -e "${amarelo}• Instalando PostgreSQL...${reset}"
-    cd /root
-    dados
-
-    senha_postgres=$(openssl rand -hex 16)
-    docker volume create postgres_data 2>/dev/null || true
-
-    python3 - "$nome_rede_interna" "$senha_postgres" << 'PYEOF'
-import sys
-rede, pgpass = sys.argv[1], sys.argv[2]
-with open('/root/postgres.yaml', 'w') as f:
-    f.write(f'''version: "3.7"
-services:
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-  postgres:
-    image: postgres:14  ## Versão do postgres
-    command:
-      - postgres
-      - -c
-      - max_connections=500
-      - -c
-      - shared_buffers=64MB
-      - -c
-      - timezone=America/Sao_Paulo
-
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    ## Descomente as linhas abaixo para uso externo
-    #ports:
-    #  - 5432:5432
-
-    environment:
-    ## Senha do Postgres
-      - POSTGRES_PASSWORD={pgpass}
-
-    ## Timezone
-      - TZ=America/Sao_Paulo
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1024M
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-volumes:
-  postgres_data:
-    external: true
-    name: postgres_data
-
-networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    name: {rede}  ## Nome da rede interna
-''')
-PYEOF
-
-    STACK_NAME="postgres"
-    stack_editavel
-    wait_stack postgres_postgres
-    echo "$senha_postgres" > /root/.senha_postgres_tmp
-    echo -e "${verde}✓ PostgreSQL instalado${reset}"
-}
-
-## ============================================================================
-## INSTALAÇÃO EVOLUTION API
-## ============================================================================
-
-instalar_evolution() {
-    echo -e "${amarelo}• Instalando Evolution API...${reset}"
-    cd /root
-    dados
-
-    pegar_senha_postgres
-    apikeyglobal=$(openssl rand -hex 16)
-
-    docker volume create evolution_instances 2>/dev/null || true
-    docker volume create evolution_redis 2>/dev/null || true
-
-    criar_banco_postgres_da_stack evolution
-
-    python3 - "$nome_rede_interna" "$url_evolution" "$apikeyglobal" "$senha_postgres" "$dominio_sem_sufixo" << 'PYEOF'
-import sys
-rede, url, apikey, pgpass, cliente = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
-with open('/root/evolution.yaml', 'w') as f:
-    f.write(f'''version: "3.7"
-services:
-  evolution_api:
-    image: evoapicloud/evolution-api:latest
-    volumes: [ evolution_instances:/evolution/instances ]
-    networks: [ {rede} ]
-    environment:
-    ## ⚙️ Configuracoes Gerais
-      - SERVER_URL=https://{url}
-      - AUTHENTICATION_API_KEY={apikey}
-      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
-      - DEL_INSTANCE=false
-      - QRCODE_LIMIT=1902
-      - LANGUAGE=pt-BR
-
-    ## 📱 Configuracao do Cliente
-      - CONFIG_SESSION_PHONE_CLIENT={cliente}
-      - CONFIG_SESSION_PHONE_NAME=Chrome
-
-    ## 🗄️ Configuracao do Banco de Dados
-      - DATABASE_ENABLED=true
-      - DATABASE_PROVIDER=postgresql
-      - DATABASE_CONNECTION_URI=postgresql://postgres:{pgpass}@postgres_postgres:5432/evolution
-      - DATABASE_CONNECTION_CLIENT_NAME=evolution
-      - DATABASE_SAVE_DATA_INSTANCE=true
-      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
-      - DATABASE_SAVE_MESSAGE_UPDATE=false
-      - DATABASE_SAVE_DATA_CONTACTS=false
-      - DATABASE_SAVE_DATA_CHATS=false
-      - DATABASE_SAVE_DATA_LABELS=false
-      - DATABASE_SAVE_DATA_HISTORIC=false
-
-    ## 🤖 Integracao com N8N
-      - N8N_ENABLED=true
-
-    ## 🤖 Integracao com EvoAI
-      - EVOAI_ENABLED=true
-
-    ## 🤖 Integracao com OpenAI
-      - OPENAI_ENABLED=true
-
-    ## 🌐 Integracao com Dify
-      - DIFY_ENABLED=true
-
-    ## 💬 Integracao com Typebot
-      - TYPEBOT_ENABLED=true
-      - TYPEBOT_API_VERSION=latest
-
-    ## 🗣️ Integracao com Chatwoot
-      - CHATWOOT_ENABLED=true
-      - CHATWOOT_MESSAGE_READ=true
-      - CHATWOOT_MESSAGE_DELETE=true
-      - CHATWOOT_IMPORT_DATABASE_CONNECTION_URI=postgresql://postgres:SENHA_DO_PGVECTOR@pgvector:5432/chatwoot?sslmode=disable
-      - CHATWOOT_IMPORT_PLACEHOLDER_MEDIA_MESSAGE=false
-
-    ## 🧊 Configuracao do Cache
-      - CACHE_REDIS_ENABLED=true
-      - CACHE_REDIS_URI=redis://evolution_redis:6379/1
-      - CACHE_REDIS_PREFIX_KEY=evolution
-      - CACHE_REDIS_SAVE_INSTANCES=false
-      - CACHE_LOCAL_ENABLED=false
-
-    ## ☁️ Configuracao do S3
-      - S3_ENABLED=false
-      - S3_ACCESS_KEY=
-      - S3_SECRET_KEY=
-      - S3_BUCKET=evolution
-      - S3_PORT=443
-      - S3_ENDPOINT=
-      - S3_USE_SSL=true
-
-    ## 💼 Configuracao do WhatsApp Business
-      - WA_BUSINESS_TOKEN_WEBHOOK=evolution
-      - WA_BUSINESS_URL=https://graph.facebook.com
-      - WA_BUSINESS_VERSION=v23.0
-      - WA_BUSINESS_LANGUAGE=pt_BR
-
-    ## 📊 Telemetria
-      - TELEMETRY=false
-      - TELEMETRY_URL=
-
-    ## 🌐 Configuracao do WebSocket
-      - WEBSOCKET_ENABLED=false
-      - WEBSOCKET_GLOBAL_EVENTS=false
-
-    ## 📨 Configuracao do SQS
-      - SQS_ENABLED=false
-      - SQS_ACCESS_KEY_ID=
-      - SQS_SECRET_ACCESS_KEY=
-      - SQS_ACCOUNT_ID=
-      - SQS_REGION=
-
-    ## 🐇 Configuracao do RabbitMQ
-      - RABBITMQ_ENABLED=false
-      - RABBITMQ_FRAME_MAX=8192
-      - RABBITMQ_URI=amqp://USER:PASS@rabbitmq:5672/evolution
-      - RABBITMQ_EXCHANGE_NAME=evolution
-      - RABBITMQ_GLOBAL_ENABLED=false
-      - RABBITMQ_EVENTS_APPLICATION_STARTUP=false
-      - RABBITMQ_EVENTS_INSTANCE_CREATE=false
-      - RABBITMQ_EVENTS_INSTANCE_DELETE=false
-      - RABBITMQ_EVENTS_QRCODE_UPDATED=false
-      - RABBITMQ_EVENTS_SEND_MESSAGE_UPDATE=false
-      - RABBITMQ_EVENTS_MESSAGES_SET=false
-      - RABBITMQ_EVENTS_MESSAGES_UPSERT=true
-      - RABBITMQ_EVENTS_MESSAGES_EDITED=false
-      - RABBITMQ_EVENTS_MESSAGES_UPDATE=false
-      - RABBITMQ_EVENTS_MESSAGES_DELETE=false
-      - RABBITMQ_EVENTS_SEND_MESSAGE=false
-      - RABBITMQ_EVENTS_CONTACTS_SET=false
-      - RABBITMQ_EVENTS_CONTACTS_UPSERT=false
-      - RABBITMQ_EVENTS_CONTACTS_UPDATE=false
-      - RABBITMQ_EVENTS_PRESENCE_UPDATE=false
-      - RABBITMQ_EVENTS_CHATS_SET=false
-      - RABBITMQ_EVENTS_CHATS_UPSERT=false
-      - RABBITMQ_EVENTS_CHATS_UPDATE=false
-      - RABBITMQ_EVENTS_CHATS_DELETE=false
-      - RABBITMQ_EVENTS_GROUPS_UPSERT=false
-      - RABBITMQ_EVENTS_GROUP_UPDATE=false
-      - RABBITMQ_EVENTS_GROUP_PARTICIPANTS_UPDATE=false
-      - RABBITMQ_EVENTS_CONNECTION_UPDATE=true
-      - RABBITMQ_EVENTS_CALL=false
-      - RABBITMQ_EVENTS_TYPEBOT_START=false
-      - RABBITMQ_EVENTS_TYPEBOT_CHANGE_STATUS=false
-
-    ## 🌐 Configuracao do Webhook
-      - WEBHOOK_GLOBAL_ENABLED=false
-      - WEBHOOK_GLOBAL_URL=
-      - WEBHOOK_GLOBAL_WEBHOOK_BY_EVENTS=false
-      - WEBHOOK_EVENTS_APPLICATION_STARTUP=false
-      - WEBHOOK_EVENTS_QRCODE_UPDATED=false
-      - WEBHOOK_EVENTS_MESSAGES_SET=false
-      - WEBHOOK_EVENTS_SEND_MESSAGE_UPDATE=false
-      - WEBHOOK_EVENTS_MESSAGES_UPSERT=false
-      - WEBHOOK_EVENTS_MESSAGES_EDITED=false
-      - WEBHOOK_EVENTS_MESSAGES_UPDATE=false
-      - WEBHOOK_EVENTS_MESSAGES_DELETE=false
-      - WEBHOOK_EVENTS_SEND_MESSAGE=false
-      - WEBHOOK_EVENTS_CONTACTS_SET=false
-      - WEBHOOK_EVENTS_CONTACTS_UPSERT=false
-      - WEBHOOK_EVENTS_CONTACTS_UPDATE=false
-      - WEBHOOK_EVENTS_PRESENCE_UPDATE=false
-      - WEBHOOK_EVENTS_CHATS_SET=false
-      - WEBHOOK_EVENTS_CHATS_UPSERT=false
-      - WEBHOOK_EVENTS_CHATS_UPDATE=false
-      - WEBHOOK_EVENTS_CHATS_DELETE=false
-      - WEBHOOK_EVENTS_GROUPS_UPSERT=false
-      - WEBHOOK_EVENTS_GROUPS_UPDATE=false
-      - WEBHOOK_EVENTS_GROUP_PARTICIPANTS_UPDATE=false
-      - WEBHOOK_EVENTS_CONNECTION_UPDATE=false
-      - WEBHOOK_EVENTS_LABELS_EDIT=false
-      - WEBHOOK_EVENTS_LABELS_ASSOCIATION=false
-      - WEBHOOK_EVENTS_CALL=false
-      - WEBHOOK_EVENTS_TYPEBOT_START=false
-      - WEBHOOK_EVENTS_TYPEBOT_CHANGE_STATUS=false
-      - WEBHOOK_EVENTS_ERRORS=false
-      - WEBHOOK_EVENTS_ERRORS_WEBHOOK=
-      - WEBHOOK_REQUEST_TIMEOUT_MS=60000
-      - WEBHOOK_RETRY_MAX_ATTEMPTS=10
-      - WEBHOOK_RETRY_INITIAL_DELAY_SECONDS=5
-      - WEBHOOK_RETRY_USE_EXPONENTIAL_BACKOFF=true
-      - WEBHOOK_RETRY_MAX_DELAY_SECONDS=300
-      - WEBHOOK_RETRY_JITTER_FACTOR=0.2
-      - WEBHOOK_RETRY_NON_RETRYABLE_STATUS_CODES=400,401,403,404,422
-
-    ## 🔌 Configuracao do Provider
-      - PROVIDER_ENABLED=false
-      - PROVIDER_HOST=127.0.0.1
-      - PROVIDER_PORT=5656
-      - PROVIDER_PREFIX=evolution
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement: {{ constraints: [node.role == manager] }}
-      labels:
-        - traefik.enable=1
-        - traefik.http.routers.evolution.rule=Host(`{url}`)
-        - traefik.http.routers.evolution.entrypoints=websecure
-        - traefik.http.routers.evolution.priority=1
-        - traefik.http.routers.evolution.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.evolution.service=evolution_api
-        - traefik.http.services.evolution_api.loadbalancer.server.port=8080
-        - traefik.http.services.evolution_api.loadbalancer.passHostHeader=true
-        - traefik.swarm.network={rede}
-  evolution_redis:
-    image: redis:latest
-    command: [ "redis-server", "--appendonly", "yes", "--port", "6379" ]
-    volumes: [ evolution_redis:/data ]
-    networks: [ {rede} ]
-    deploy:
-      placement: {{ constraints: [node.role == manager] }}
-      resources:
-        limits:
-          cpus: "1"
-          memory: 2048M
-volumes:
-  evolution_instances: {{ external: true, name: evolution_instances }}
-  evolution_redis: {{ external: true, name: evolution_redis }}
-networks:
-  {rede}: {{ external: true, name: {rede} }}
-''')
-PYEOF
-
-    STACK_NAME="evolution"
-    stack_editavel
-    wait_stack evolution_evolution_redis evolution_evolution_api
-    echo -e "${verde}✓ Evolution API instalada | API Key: $apikeyglobal${reset}"
-}
-
-## ============================================================================
-## INSTALAÇÃO MINIO
-## ============================================================================
-
-instalar_minio() {
-    echo -e "${amarelo}• Instalando MinIO...${reset}"
-    cd /root
-    dados
-
-    docker volume create minio_data 2>/dev/null || true
-
-    python3 - "$nome_rede_interna" "$minio_image" "$user_minio" "$senha_minio" "$url_minio" "$url_s3" << 'PYEOF'
-import sys
-rede, ver, user, pwd, url_minio, url_s3 = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
-with open('/root/minio.yaml', 'w') as f:
-    f.write(f'''version: "3.7"
-services:
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-  minio:
-    image: {ver}  ## Imagem própria do MinIO (console completo)
-    command: server /data --console-address ":9001"
-
-    volumes:
-      - minio_data:/data
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    environment:
-    ## 🔑 Dados de acesso
-      - MINIO_ROOT_USER={user}
-      - MINIO_ROOT_PASSWORD={pwd}
-
-    ## 🌐 URL do MinIO
-      - MINIO_BROWSER_REDIRECT_URL=https://{url_minio}
-      - MINIO_SERVER_URL=https://{url_s3}
-
-    ## 📍 Região
-      - MINIO_REGION_NAME=eu-south
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      labels:
-        - traefik.enable=true
-        ## Console
-        - traefik.http.routers.minio_public.rule=Host(`{url_s3}`)
-        - traefik.http.routers.minio_public.entrypoints=websecure
-        - traefik.http.routers.minio_public.tls.certresolver=letsencryptresolver
-        - traefik.http.services.minio_public.loadbalancer.server.port=9000
-        - traefik.http.services.minio_public.loadbalancer.passHostHeader=true
-        - traefik.http.routers.minio_public.service=minio_public
-        ## API S3
-        - traefik.http.routers.minio_console.rule=Host(`{url_minio}`)
-        - traefik.http.routers.minio_console.entrypoints=websecure
-        - traefik.http.routers.minio_console.tls.certresolver=letsencryptresolver
-        - traefik.http.services.minio_console.loadbalancer.server.port=9001
-        - traefik.http.services.minio_console.loadbalancer.passHostHeader=true
-        - traefik.http.routers.minio_console.service=minio_console
-        - traefik.swarm.network={rede}
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-volumes:
-  minio_data:
-    external: true
-    name: minio_data
-
-networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    name: {rede}  ## Nome da rede interna
-''')
-PYEOF
-
-    STACK_NAME="minio"
-    stack_editavel
-    wait_stack minio_minio
-    sleep 20
-    criar_bucket_minio_n8n
-    echo -e "${verde}✓ MinIO instalado${reset}"
-}
-
-## ============================================================================
-## BUCKET N8N + ACCESS KEY NO MINIO
-## ============================================================================
-
-criar_bucket_minio_n8n() {
-    echo -e "${amarelo}• Criando bucket n8n e Access Key no MinIO...${reset}"
-
-    local BUCKET_NAME="n8n"
-    local MINIO_CONTAINER
-    local MC_CMD
-    local S3_ENDPOINT=""
-    local endpoint
-
-    MINIO_CONTAINER=$(docker ps --filter "name=minio" -q | head -n1)
-    if [ -z "$MINIO_CONTAINER" ]; then
-        echo -e "${vermelho}Container MinIO não encontrado. Bucket/keys não foram criados.${reset}"
-        return 1
+    if [ "$MODO_ROTA" = manual ]; then
+        PORTA_APP="${PORTA_APP:-$(porta_livre_a_partir_de 3090)}"
+        PORTA_EVO="${PORTA_EVO:-$(porta_livre_a_partir_de 8080)}"
+        PORTA_S3="${PORTA_S3:-$(porta_livre_a_partir_de 9000)}"
     fi
+}
 
-    MC_CMD="docker exec -i $MINIO_CONTAINER mc"
+## ============================================================================
+## ARQUIVOS DE DEPLOY
+## ============================================================================
 
-    for endpoint in "http://localhost:9000" "http://minio:9000" "http://127.0.0.1:9000"; do
-        if $MC_CMD alias set admin "$endpoint" "$user_minio" "$senha_minio" >/dev/null 2>&1; then
-            S3_ENDPOINT="$endpoint"
-            echo -e "${verde}✓ Conectado ao MinIO via $S3_ENDPOINT${reset}"
-            break
-        fi
-    done
+## Nome do serviço como o proxy enxerga (stack prefixa com o nome da stack)
+nome_dns() { [ "$MODO_DEPLOY" = stack ] && echo "${PROJETO}_$1" || echo "$1"; }
 
-    if [ -z "$S3_ENDPOINT" ]; then
-        echo -e "${vermelho}Falha ao conectar no MinIO para criar bucket/keys.${reset}"
-        return 1
+labels_traefik() { # labels_traefik ROUTER HOST PORTA INDENT
+    local n="$1" h="$2" p="$3" ind="$4"
+    printf '%s- traefik.enable=true\n' "$ind"
+    printf '%s- traefik.http.routers.%s.rule=Host(`%s`)\n' "$ind" "$n" "$h"
+    printf '%s- traefik.http.routers.%s.entrypoints=%s\n' "$ind" "$n" "$TRAEFIK_ENTRYPOINT"
+    printf '%s- traefik.http.routers.%s.tls=true\n' "$ind" "$n"
+    [ -n "$TRAEFIK_RESOLVER" ] && printf '%s- traefik.http.routers.%s.tls.certresolver=%s\n' "$ind" "$n" "$TRAEFIK_RESOLVER"
+    printf '%s- traefik.http.routers.%s.service=%s\n' "$ind" "$n" "$n"
+    printf '%s- traefik.http.services.%s.loadbalancer.server.port=%s\n' "$ind" "$n" "$p"
+    printf '%s- traefik.http.services.%s.loadbalancer.passhostheader=true\n' "$ind" "$n"
+    [ -n "$TRAEFIK_LABEL_REDE" ] && printf '%s- %s=%s\n' "$ind" "$TRAEFIK_LABEL_REDE" "$TRAEFIK_REDE"
+}
+
+## Bloco final de cada serviço: redes, portas, labels e deploy/restart.
+## extras SERVICO PUBLICO(0|1) [ROUTER HOST PORTA PORTA_LOCAL] [MEMORIA]
+extras() {
+    local publico="$2" router="${3:-}" host="${4:-}" porta="${5:-}" porta_local="${6:-}" mem="${7:-512M}"
+    echo "    networks:"
+    echo "      - interna"
+    if [ "$publico" = 1 ] && { [ "$MODO_ROTA" = labels ] || [ "$MODO_ROTA" = file ]; }; then
+        echo "      - proxy"
     fi
-
-    if $MC_CMD ls admin/"$BUCKET_NAME" >/dev/null 2>&1; then
-        echo -e "${amarelo}Bucket '$BUCKET_NAME' já existe, continuando...${reset}"
-    else
-        if $MC_CMD mb admin/"$BUCKET_NAME" >/dev/null 2>&1; then
-            echo -e "${verde}✓ Bucket '$BUCKET_NAME' criado${reset}"
+    if [ "$publico" = 1 ] && [ "$MODO_ROTA" = manual ] && [ -n "$porta_local" ]; then
+        echo "    ports:"
+        if [ "$MODO_DEPLOY" = stack ]; then
+            echo "      - { target: $porta, published: $porta_local, mode: host }"
         else
-            echo -e "${amarelo}Não foi possível criar o bucket '$BUCKET_NAME' (pode já existir).${reset}"
+            echo "      - \"127.0.0.1:$porta_local:$porta\""
         fi
     fi
-
-    if $MC_CMD anonymous set public admin/"$BUCKET_NAME" >/dev/null 2>&1; then
-        echo -e "${verde}✓ Política pública aplicada ao bucket '$BUCKET_NAME'${reset}"
+    if [ "$MODO_DEPLOY" = stack ]; then
+        echo "    deploy:"
+        echo "      placement:"
+        echo "        constraints:"
+        echo "          - node.role == manager"
+        echo "      resources:"
+        echo "        limits:"
+        echo "          memory: $mem"
+        echo "      restart_policy:"
+        echo "        condition: any"
+        echo "        delay: 5s"
+        if [ "$publico" = 1 ] && [ "$MODO_ROTA" = labels ]; then
+            echo "      labels:"
+            labels_traefik "$router" "$host" "$porta" "        "
+        fi
     else
-        echo -e "${amarelo}Falha ao aplicar política pública ao bucket '$BUCKET_NAME'${reset}"
+        echo "    restart: unless-stopped"
+        echo "    logging: *log"
+        if [ "$publico" = 1 ] && [ "$MODO_ROTA" = labels ]; then
+            echo "    labels:"
+            labels_traefik "$router" "$host" "$porta" "      "
+        fi
     fi
+}
 
-    minio_n8n_access_key=$(head /dev/urandom | tr -dc A-Z0-9 | head -c 20)
-    minio_n8n_secret_key=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 40)
-
-    if $MC_CMD admin user add admin "$minio_n8n_access_key" "$minio_n8n_secret_key" >/dev/null 2>&1; then
-        echo -e "${verde}✓ Access Key criada no MinIO${reset}"
-    else
-        echo -e "${vermelho}Falha ao criar Access Key no MinIO${reset}"
-        return 1
-    fi
-
-    if $MC_CMD admin policy attach admin readwrite --user "$minio_n8n_access_key" >/dev/null 2>&1; then
-        echo -e "${verde}✓ Política readwrite anexada à Access Key${reset}"
-    else
-        # Fallback para versões antigas do mc
-        if $MC_CMD admin policy set admin readwrite user="$minio_n8n_access_key" >/dev/null 2>&1; then
-            echo -e "${verde}✓ Política readwrite anexada à Access Key${reset}"
+gerar_arquivo_deploy() {
+    local f="$DIR/$PROJETO.yml"
+    local cliente="${DOMINIO_BASE%%.*}"
+    {
+        if [ "$MODO_DEPLOY" = stack ]; then
+            echo 'version: "3.7"'
         else
-            echo -e "${amarelo}Falha ao anexar política à Access Key${reset}"
+            echo "name: $PROJETO"
+            echo ""
+            echo "x-log: &log"
+            echo "  driver: json-file"
+            echo "  options: { max-size: \"20m\", max-file: \"3\" }"
         fi
-    fi
+        cat <<EOF
 
-    mkdir -p /root/dados_vps
-    cat > /root/dados_vps/dados_minio <<EOL
-[ MINIO ]
-
-Painel: https://$url_minio
-S3: https://$url_s3
-Usuario Root: $user_minio
-Senha Root: $senha_minio
-
-Bucket: $BUCKET_NAME
-Access Key: $minio_n8n_access_key
-Secret Key: $minio_n8n_secret_key
-EOL
-
-    echo -e "${verde}✓ Credenciais MinIO salvas em /root/dados_vps/dados_minio${reset}"
-}
-
-## ============================================================================
-## INSTALAÇÃO N8N
-## ============================================================================
-
-instalar_n8n() {
-    echo -e "${amarelo}• Instalando N8N...${reset}"
-    cd /root
-    dados
-
-    pegar_senha_postgres
-    encryption_key=$(openssl rand -hex 16)
-    criar_banco_postgres_da_stack n8n_queue
-
-    docker volume create n8n_redis 2>/dev/null || true
-
-    python3 - "$nome_rede_interna" "$senha_postgres" "$encryption_key" "$url_editorn8n" "$url_webhookn8n" \
-        "$email_smtp_n8n" "$usuario_smtp_n8n" "$senha_smtp_n8n" "$host_smtp_n8n" "$porta_smtp_n8n" "$smtp_secure_smtp_n8n" << 'PYEOF'
-import sys
-a = sys.argv
-rede, pgpass, enc, url_ed, url_wh = a[1], a[2], a[3], a[4], a[5]
-smtp_sender, smtp_user, smtp_pass, smtp_host, smtp_port, smtp_ssl = a[6], a[7], a[8], a[9], a[10], a[11]
-with open('/root/n8n.yaml', 'w') as f:
-    f.write(f'''version: "3.7"
+## Gerado pelo setup HubLabel v$VERSAO — para mudar, rode o setup de novo.
 services:
 
-## --------------------------- HUBLABEL --------------------------- ##
+## --------------------------- HUBLABEL (tudo em um) --------------------------- ##
 
-  n8n_editor:
-    image: n8nio/n8n:latest  ## Versão do N8N
-    command: start
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
+  hublabel-app:
+    image: $IMG_APP
+    command: ["node", "src/all.js"]
     environment:
-    ## 🗄️ Banco de Dados (PostgreSQL)
-      - N8N_FIX_MIGRATIONS=true
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_DATABASE=n8n_queue
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_USER=postgres
-      - DB_POSTGRESDB_PASSWORD={pgpass}
-      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
-
-    ## 🔐 Criptografia
-      - N8N_ENCRYPTION_KEY={enc}
-
-      ## 🌐 URLs e Configurações de Acesso
-      - N8N_HOST={url_ed}
-      - N8N_EDITOR_BASE_URL=https://{url_ed}/
-      - WEBHOOK_URL=https://{url_wh}/
-      - N8N_PROTOCOL=https
-      - N8N_PROXY_HOPS=1
-      - N8N_ONBOARDING_FLOW_DISABLED=true
-      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
-      - N8N_SKIP_AUTH_ON_OAUTH_CALLBACK=false
-
-    ## ⚙️ Ambiente de Execução
-      - NODE_ENV=production
-      - EXECUTIONS_MODE=queue
-      - EXECUTIONS_TIMEOUT=3600
-      - EXECUTIONS_TIMEOUT_MAX=7200
-      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
-      - N8N_RUNNERS_ENABLED=true
-      - N8N_RUNNERS_MODE=internal
-      - N8N_RESTRICT_FILE_ACCESS_TO="~/.n8n-files"
-      - NODES_EXCLUDE="[]"
-
-    ## 📦 Pacotes e Nós Comunitários
-      - N8N_REINSTALL_MISSING_PACKAGES=true
-      - N8N_COMMUNITY_PACKAGES_ENABLED=true
-      - N8N_NODE_PATH=/home/node/.n8n/nodes
-      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-
-    ## 📧 SMTP (Envio de E-mails)
-      - N8N_SMTP_SENDER={smtp_sender}
-      - N8N_SMTP_USER={smtp_user}
-      - N8N_SMTP_PASS={smtp_pass}
-      - N8N_SMTP_HOST={smtp_host}
-      - N8N_SMTP_PORT={smtp_port}
-      - N8N_SMTP_SSL={smtp_ssl}
-
-    ## 🔁 Redis (Fila de Execução)
-      - QUEUE_BULL_REDIS_HOST=n8n_redis
-      - QUEUE_BULL_REDIS_PORT=6379
-      - QUEUE_BULL_REDIS_DB=1
-
-    ## 📊 Métricas
-      - N8N_METRICS=true
-
-    ## ⏱️ Execuções e Limpeza
-      - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=6
-
-    ## 🧠 Recursos de IA
-      - N8N_AI_ENABLED=false
-      - N8N_AI_PROVIDER=openai
-      - N8N_AI_OPENAI_API_KEY=
-
-    ## 🧰 Permissões em Funções Personalizadas
-      - NODE_FUNCTION_ALLOW_BUILTIN=*
-      - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash
-
-    ## 🕒 Fuso Horário
-      - GENERIC_TIMEZONE=America/Sao_Paulo
-      - TZ=America/Sao_Paulo
-      #- N8N_DEFAULT_LOCALE=pt-BR
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1024M
-      labels:
-        - traefik.enable=true
-        - traefik.http.routers.n8n_editor.rule=Host(`{url_ed}`)
-        - traefik.http.routers.n8n_editor.entrypoints=websecure
-        - traefik.http.routers.n8n_editor.priority=10
-        - traefik.http.routers.n8n_editor.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.n8n_editor.service=n8n_editor
-        - traefik.http.services.n8n_editor.loadbalancer.server.port=5678
-        - traefik.http.services.n8n_editor.loadbalancer.passHostHeader=1
-        - traefik.swarm.network={rede}
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-  n8n_webhook:
-    image: n8nio/n8n:latest  ## Versão do N8N
-    command: webhook
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    environment:
-    ## 🗄️ Banco de Dados (PostgreSQL)
-      - N8N_FIX_MIGRATIONS=true
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_DATABASE=n8n_queue
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_USER=postgres
-      - DB_POSTGRESDB_PASSWORD={pgpass}
-      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
-
-    ## 🔐 Criptografia
-      - N8N_ENCRYPTION_KEY={enc}
-
-      ## 🌐 URLs e Configurações de Acesso
-      - N8N_HOST={url_ed}
-      - N8N_EDITOR_BASE_URL=https://{url_ed}/
-      - WEBHOOK_URL=https://{url_wh}/
-      - N8N_PROTOCOL=https
-      - N8N_PROXY_HOPS=1
-      - N8N_ONBOARDING_FLOW_DISABLED=true
-      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
-      - N8N_SKIP_AUTH_ON_OAUTH_CALLBACK=false
-
-    ## ⚙️ Ambiente de Execução
-      - NODE_ENV=production
-      - EXECUTIONS_MODE=queue
-      - EXECUTIONS_TIMEOUT=3600
-      - EXECUTIONS_TIMEOUT_MAX=7200
-      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
-      - N8N_RUNNERS_ENABLED=true
-      - N8N_RUNNERS_MODE=internal
-      - N8N_RESTRICT_FILE_ACCESS_TO="~/.n8n-files"
-      - NODES_EXCLUDE="[]"
-
-    ## 📦 Pacotes e Nós Comunitários
-      - N8N_REINSTALL_MISSING_PACKAGES=true
-      - N8N_COMMUNITY_PACKAGES_ENABLED=true
-      - N8N_NODE_PATH=/home/node/.n8n/nodes
-      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-
-    ## 📧 SMTP (Envio de E-mails)
-      - N8N_SMTP_SENDER={smtp_sender}
-      - N8N_SMTP_USER={smtp_user}
-      - N8N_SMTP_PASS={smtp_pass}
-      - N8N_SMTP_HOST={smtp_host}
-      - N8N_SMTP_PORT={smtp_port}
-      - N8N_SMTP_SSL={smtp_ssl}
-
-    ## 🔁 Redis (Fila de Execução)
-      - QUEUE_BULL_REDIS_HOST=n8n_redis
-      - QUEUE_BULL_REDIS_PORT=6379
-      - QUEUE_BULL_REDIS_DB=1
-
-    ## 📊 Métricas
-      - N8N_METRICS=true
-
-    ## ⏱️ Execuções e Limpeza
-      - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=6
-
-    ## 🧠 Recursos de IA
-      - N8N_AI_ENABLED=false
-      - N8N_AI_PROVIDER=openai
-      - N8N_AI_OPENAI_API_KEY=
-
-    ## 🧰 Permissões em Funções Personalizadas
-      - NODE_FUNCTION_ALLOW_BUILTIN=*
-      - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash
-
-    ## 🕒 Fuso Horário
-      - GENERIC_TIMEZONE=America/Sao_Paulo
-      - TZ=America/Sao_Paulo
-      #- N8N_DEFAULT_LOCALE=pt-BR
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 2048M
-      labels:
-        - traefik.enable=true
-        - traefik.http.routers.n8n_webhook.rule=Host(`{url_wh}`)
-        - traefik.http.routers.n8n_webhook.entrypoints=websecure
-        - traefik.http.routers.n8n_webhook.priority=5
-        - traefik.http.routers.n8n_webhook.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.n8n_webhook.service=n8n_webhook
-        - traefik.http.services.n8n_webhook.loadbalancer.server.port=5678
-        - traefik.http.services.n8n_webhook.loadbalancer.passHostHeader=1
-        - traefik.swarm.network={rede}
-        - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.regex=^/(.*)
-        - traefik.http.middlewares.n8n-webhook-strip.replacepathregex.replacement=/webhook/$$1
-        - traefik.http.routers.n8n_webhook.middlewares=redirect-root,n8n-webhook-strip
-        - traefik.http.middlewares.redirect-root.redirectregex.regex=^https://{url_wh}/?$$
-        - traefik.http.middlewares.redirect-root.redirectregex.replacement=https://{url_wh}/login
-        - traefik.http.middlewares.redirect-root.redirectregex.permanent=true
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-  n8n_worker:
-    image: n8nio/n8n:latest  ## Versão do N8N
-    command: worker --concurrency=10
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    environment:
-    ## 🗄️ Banco de Dados (PostgreSQL)
-      - N8N_FIX_MIGRATIONS=true
-      - DB_TYPE=postgresdb
-      - DB_POSTGRESDB_DATABASE=n8n_queue
-      - DB_POSTGRESDB_HOST=postgres
-      - DB_POSTGRESDB_PORT=5432
-      - DB_POSTGRESDB_USER=postgres
-      - DB_POSTGRESDB_PASSWORD={pgpass}
-      - N8N_INSECURE_DISABLE_WEBHOOK_IFRAME_SANDBOX=true
-
-    ## 🔐 Criptografia
-      - N8N_ENCRYPTION_KEY={enc}
-
-      ## 🌐 URLs e Configurações de Acesso
-      - N8N_HOST={url_ed}
-      - N8N_EDITOR_BASE_URL=https://{url_ed}/
-      - WEBHOOK_URL=https://{url_wh}/
-      - N8N_PROTOCOL=https
-      - N8N_PROXY_HOPS=1
-      - N8N_ONBOARDING_FLOW_DISABLED=true
-      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
-      - N8N_SKIP_AUTH_ON_OAUTH_CALLBACK=false
-
-    ## ⚙️ Ambiente de Execução
-      - NODE_ENV=production
-      - EXECUTIONS_MODE=queue
-      - EXECUTIONS_TIMEOUT=3600
-      - EXECUTIONS_TIMEOUT_MAX=7200
-      - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
-      - N8N_RUNNERS_ENABLED=true
-      - N8N_RUNNERS_MODE=internal
-      - N8N_RESTRICT_FILE_ACCESS_TO="~/.n8n-files"
-      - NODES_EXCLUDE="[]"
-
-    ## 📦 Pacotes e Nós Comunitários
-      - N8N_REINSTALL_MISSING_PACKAGES=true
-      - N8N_COMMUNITY_PACKAGES_ENABLED=true
-      - N8N_NODE_PATH=/home/node/.n8n/nodes
-      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-
-    ## 📧 SMTP (Envio de E-mails)
-      - N8N_SMTP_SENDER={smtp_sender}
-      - N8N_SMTP_USER={smtp_user}
-      - N8N_SMTP_PASS={smtp_pass}
-      - N8N_SMTP_HOST={smtp_host}
-      - N8N_SMTP_PORT={smtp_port}
-      - N8N_SMTP_SSL={smtp_ssl}
-
-    ## 🔁 Redis (Fila de Execução)
-      - QUEUE_BULL_REDIS_HOST=n8n_redis
-      - QUEUE_BULL_REDIS_PORT=6379
-      - QUEUE_BULL_REDIS_DB=1
-
-    ## 📊 Métricas
-      - N8N_METRICS=true
-
-    ## ⏱️ Execuções e Limpeza
-      - EXECUTIONS_DATA_PRUNE=true
-      - EXECUTIONS_DATA_MAX_AGE=6
-
-    ## 🧠 Recursos de IA
-      - N8N_AI_ENABLED=false
-      - N8N_AI_PROVIDER=openai
-      - N8N_AI_OPENAI_API_KEY=
-
-    ## 🧰 Permissões em Funções Personalizadas
-      - NODE_FUNCTION_ALLOW_BUILTIN=*
-      - NODE_FUNCTION_ALLOW_EXTERNAL=moment,lodash
-
-    ## 🕒 Fuso Horário
-      - GENERIC_TIMEZONE=America/Sao_Paulo
-      - TZ=America/Sao_Paulo
-      #- N8N_DEFAULT_LOCALE=pt-BR
-
-    deploy:
-      mode: replicated
-      replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 2048M
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-  n8n_redis:
-    image: redis:latest  ## Versão do Redis
-    command:
-      - redis-server
-      - --appendonly
-      - yes
-      - --port
-      - "6379"
-
-    volumes:
-      - n8n_redis:/data
-
-    networks:
-      - {rede}  ## Nome da rede interna
-
-    ## Descomente as linhas abaixo para uso externo
-    #ports:
-    #  - 6379:6379
-
-    deploy:
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1024M
-
-## --------------------------- HUBLABEL --------------------------- ##
-
-volumes:
-  n8n_redis:
-    external: true
-    name: n8n_redis
-
-networks:
-  {rede}:  ## Nome da rede interna
-    external: true
-    name: {rede}  ## Nome da rede interna
-''')
-PYEOF
-
-    ## Baixando imagens (igual SetupOrion)
-    pull redis:latest n8nio/n8n:latest
-
-    STACK_NAME="n8n"
-    stack_editavel || { echo -e "${vermelho}Erro ao criar stack N8N. Verifique o Portainer.${reset}"; return 1; }
-    wait_stack n8n_n8n_redis n8n_n8n_editor n8n_n8n_webhook n8n_n8n_worker
-    echo -e "${verde}✓ N8N instalado${reset}"
-}
-
-## ============================================================================
-## INSTALAÇÃO DISPARADOR (Meta + Evolution + Inbound)
-## ============================================================================
-
-instalar_disparador() {
-    echo -e "${amarelo}• Instalando Disparador Hublabel...${reset}"
-    cd /root
-    dados
-
-    if [ -z "${minio_n8n_access_key:-}" ] || [ -z "${minio_n8n_secret_key:-}" ]; then
-        if [ -f /root/dados_vps/dados_minio ]; then
-            minio_n8n_access_key=$(grep "Access Key:" /root/dados_vps/dados_minio | sed 's/.*Access Key: *//')
-            minio_n8n_secret_key=$(grep "Secret Key:" /root/dados_vps/dados_minio | sed 's/.*Secret Key: *//')
-        fi
-    fi
-
-    python3 - \
-        "$nome_rede_interna" \
-        "$supabase_url" \
-        "$supabase_service_role_key" \
-        "$url_evolution" \
-        "$apikeyglobal" \
-        "$url_webhookn8n" \
-        "$url_s3" \
-        "${minio_n8n_access_key}" \
-        "${minio_n8n_secret_key}" << 'PYEOF'
-import sys
-rede = sys.argv[1]
-supabase_url = sys.argv[2]
-supabase_key = sys.argv[3]
-url_evolution = sys.argv[4]
-evo_key = sys.argv[5]
-url_app = sys.argv[6]
-url_s3 = sys.argv[7]
-s3_access = sys.argv[8]
-s3_secret = sys.argv[9]
-
-with open('/root/disparador.yaml', 'w') as f:
-    f.write(f'''version: "3.7"
-services:
-
-## --------------------------- HUBLABEL DISPARADOR META --------------------------- ##
-
-  disparador-meta:
-    image: ghcr.io/victoreder/hublabel-disparador:latest
-
-    environment:
-      SUPABASE_URL: {supabase_url}
-      SUPABASE_SERVICE_ROLE_KEY: {supabase_key}
-      META_GRAPH_API_VERSION: v25.0
-      PORT: "3080"
-      SEND_INTERVAL_MS: "2000"
-      POLL_IDLE_MS: "2000"
-      MAX_RETRIES: "3"
-      NODE_ENV: production
-
-    networks:
-      - {rede}
-
-    deploy:
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
-      restart_policy:
-        condition: any
-        delay: 5s
-
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3080/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-
-## --------------------------- HUBLABEL DISPARADOR EVOLUTION --------------------------- ##
-
-  disparador-evolution:
-    image: ghcr.io/victoreder/hublabel-disparador:latest
-    command: ["node", "src/workers/evolution.js"]
-
-    environment:
-      SUPABASE_URL: {supabase_url}
-      SUPABASE_SERVICE_ROLE_KEY: {supabase_key}
-      EVOLUTION_BASE_URL: https://{url_evolution}
-      EVOLUTION_API_KEY: {evo_key}
-      NODE_ENV: production
-
-    networks:
-      - {rede}
-
-    deploy:
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
-      restart_policy:
-        condition: any
-        delay: 5s
-
-    healthcheck:
-      disable: true
-
-## --------------------------- HUBLABEL DISPARADOR INBOUND --------------------------- ##
-
-  disparador-inbound:
-    image: ghcr.io/victoreder/hublabel-disparador:latest
-    command: ["node", "src/inbound.js"]
-
-    environment:
-      SUPABASE_URL: {supabase_url}
-      SUPABASE_SERVICE_ROLE_KEY: {supabase_key}
-      BACK_URL: https://{url_app}
-      EVOLUTION_BASE_URL: https://{url_evolution}
-      EVOLUTION_API_KEY: {evo_key}
-      S3_ENDPOINT: https://{url_s3}
-      S3_ACCESS_KEY_ID: {s3_access}
-      S3_SECRET_ACCESS_KEY: {s3_secret}
-      S3_PUBLIC_BASE_URL: https://{url_s3}/n8n
-      REDIS_URL: redis://n8n_redis:6379
-      NODE_ENV: production
-
-    networks:
-      - {rede}
-
-    deploy:
-      placement:
-        constraints:
-          - node.role == manager
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512M
-      restart_policy:
-        condition: any
-        delay: 5s
-      labels:
-        - traefik.enable=true
-        - traefik.swarm.network={rede}
-        - traefik.http.middlewares.disparador_inbound_strip.stripprefix.prefixes=/webhook
-        - traefik.http.routers.disparador_inbound_health.rule=Host(`{url_app}`) && Path(`/health`)
-        - traefik.http.routers.disparador_inbound_health.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_health.priority=1000
-        - traefik.http.routers.disparador_inbound_health.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_health.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_health.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_eventsmeta.rule=Host(`{url_app}`) && Path(`/eventsmeta`)
-        - traefik.http.routers.disparador_inbound_eventsmeta.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_eventsmeta.priority=1000
-        - traefik.http.routers.disparador_inbound_eventsmeta.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_eventsmeta.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_eventsmeta.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_evo.rule=Host(`{url_app}`) && Path(`/agente-no-whatsapp`)
-        - traefik.http.routers.disparador_inbound_evo.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_evo.priority=1000
-        - traefik.http.routers.disparador_inbound_evo.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_evo.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_evo.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_meta_token.rule=Host(`{url_app}`) && Path(`/meta-token`)
-        - traefik.http.routers.disparador_inbound_meta_token.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_meta_token.priority=1000
-        - traefik.http.routers.disparador_inbound_meta_token.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_meta_token.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_meta_token.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_meta_criar_tpl.rule=Host(`{url_app}`) && Path(`/meta-criar-template`)
-        - traefik.http.routers.disparador_inbound_meta_criar_tpl.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_meta_criar_tpl.priority=1000
-        - traefik.http.routers.disparador_inbound_meta_criar_tpl.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_meta_criar_tpl.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_meta_criar_tpl.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.rule=Host(`{url_app}`) && Path(`/meta-excluir-template`)
-        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.priority=1000
-        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_meta_excluir_tpl.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_meta_perfil.rule=Host(`{url_app}`) && Path(`/meta-perfil`)
-        - traefik.http.routers.disparador_inbound_meta_perfil.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_meta_perfil.priority=1000
-        - traefik.http.routers.disparador_inbound_meta_perfil.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_meta_perfil.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_meta_perfil.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_meta_renovar.rule=Host(`{url_app}`) && Path(`/meta-renovar-token`)
-        - traefik.http.routers.disparador_inbound_meta_renovar.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_meta_renovar.priority=1000
-        - traefik.http.routers.disparador_inbound_meta_renovar.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_meta_renovar.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_meta_renovar.service=disparador_inbound
-        - traefik.http.routers.disparador_inbound_meta_renovar_cron.rule=Host(`{url_app}`) && Path(`/meta-renovar-token-cron`)
-        - traefik.http.routers.disparador_inbound_meta_renovar_cron.entrypoints=websecure
-        - traefik.http.routers.disparador_inbound_meta_renovar_cron.priority=1000
-        - traefik.http.routers.disparador_inbound_meta_renovar_cron.tls.certresolver=letsencryptresolver
-        - traefik.http.routers.disparador_inbound_meta_renovar_cron.middlewares=disparador_inbound_strip
-        - traefik.http.routers.disparador_inbound_meta_renovar_cron.service=disparador_inbound
-        - traefik.http.services.disparador_inbound.loadbalancer.server.port=3090
-        - traefik.http.services.disparador_inbound.loadbalancer.passHostHeader=1
-
+      NODE_ENV: "production"
+      LICENCA_EMAIL: "$LICENCA_EMAIL"
+      SUPABASE_URL: "$SUPABASE_URL"
+      SUPABASE_SERVICE_ROLE_KEY: "$SUPABASE_SERVICE_ROLE_KEY"
+      SUPABASE_ANON_KEY: "$SUPABASE_ANON_KEY"
+      BACK_URL: "https://$APP_HOST/webhook"
+      EVOLUTION_BASE_URL: "https://$EVO_HOST"
+      EVOLUTION_API_KEY: "$EVOLUTION_API_KEY"
+      S3_ENDPOINT: "http://hublabel-minio:9000"
+      S3_ACCESS_KEY_ID: "$S3_ACCESS_KEY"
+      S3_SECRET_ACCESS_KEY: "$S3_SECRET_KEY"
+      S3_BUCKET: "$S3_BUCKET"
+      S3_PUBLIC_BASE_URL: "https://$S3_HOST/$S3_BUCKET"
+      REDIS_URL: "redis://hublabel-redis:6379"
+      SENHA_PADRAO_INTEGRACAO: "$SENHA_PADRAO_INTEGRACAO"
+      TZ_SISTEMA: "America/Sao_Paulo"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3090/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 40s
+EOF
+        [ "$MODO_DEPLOY" = compose ] && echo "    depends_on: [hublabel-redis, hublabel-minio]"
+        extras hublabel-app 1 hublabel_app "$APP_HOST" 3090 "${PORTA_APP:-}" 1024M
 
-networks:
-  {rede}:
-    external: true
-    name: {rede}
-''')
-PYEOF
+        cat <<EOF
 
-    pull ghcr.io/victoreder/hublabel-disparador:latest
+  hublabel-redis:
+    image: $IMG_REDIS
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - hublabel_redis:/data
+EOF
+        extras hublabel-redis 0 "" "" "" "" 256M
 
-    STACK_NAME="disparador"
-    stack_editavel || { echo -e "${vermelho}Erro ao criar stack Disparador. Verifique o Portainer.${reset}"; return 1; }
-    wait_stack disparador_disparador-meta disparador_disparador-evolution disparador_disparador-inbound
-    echo -e "${verde}✓ Disparador instalado${reset}"
+        cat <<EOF
+
+## --------------------------- EVOLUTION API --------------------------- ##
+
+  hublabel-evolution:
+    image: $IMG_EVOLUTION
+    volumes:
+      - evolution_instances:/evolution/instances
+    environment:
+      SERVER_URL: "https://$EVO_HOST"
+      AUTHENTICATION_API_KEY: "$EVOLUTION_API_KEY"
+      AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES: "true"
+      DEL_INSTANCE: "false"
+      QRCODE_LIMIT: "1902"
+      LANGUAGE: "pt-BR"
+      CONFIG_SESSION_PHONE_CLIENT: "$cliente"
+      CONFIG_SESSION_PHONE_NAME: "Chrome"
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: "postgresql"
+      DATABASE_CONNECTION_URI: "postgresql://postgres:$POSTGRES_PASSWORD@hublabel-evolution-db:5432/evolution"
+      DATABASE_CONNECTION_CLIENT_NAME: "evolution"
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "false"
+      DATABASE_SAVE_DATA_CONTACTS: "false"
+      DATABASE_SAVE_DATA_CHATS: "false"
+      DATABASE_SAVE_DATA_LABELS: "false"
+      DATABASE_SAVE_DATA_HISTORIC: "false"
+      N8N_ENABLED: "false"
+      EVOAI_ENABLED: "true"
+      OPENAI_ENABLED: "true"
+      DIFY_ENABLED: "true"
+      TYPEBOT_ENABLED: "true"
+      TYPEBOT_API_VERSION: "latest"
+      CHATWOOT_ENABLED: "true"
+      CHATWOOT_MESSAGE_READ: "true"
+      CHATWOOT_MESSAGE_DELETE: "true"
+      CHATWOOT_IMPORT_PLACEHOLDER_MEDIA_MESSAGE: "false"
+      CACHE_REDIS_ENABLED: "true"
+      CACHE_REDIS_URI: "redis://hublabel-evolution-redis:6379/1"
+      CACHE_REDIS_PREFIX_KEY: "evolution"
+      CACHE_REDIS_SAVE_INSTANCES: "false"
+      CACHE_LOCAL_ENABLED: "false"
+      S3_ENABLED: "false"
+      WA_BUSINESS_TOKEN_WEBHOOK: "evolution"
+      WA_BUSINESS_URL: "https://graph.facebook.com"
+      WA_BUSINESS_VERSION: "v23.0"
+      WA_BUSINESS_LANGUAGE: "pt_BR"
+      TELEMETRY: "false"
+      WEBSOCKET_ENABLED: "false"
+      RABBITMQ_ENABLED: "false"
+      SQS_ENABLED: "false"
+      WEBHOOK_GLOBAL_ENABLED: "false"
+      WEBHOOK_REQUEST_TIMEOUT_MS: "60000"
+      WEBHOOK_RETRY_MAX_ATTEMPTS: "10"
+      WEBHOOK_RETRY_INITIAL_DELAY_SECONDS: "5"
+      WEBHOOK_RETRY_USE_EXPONENTIAL_BACKOFF: "true"
+      WEBHOOK_RETRY_MAX_DELAY_SECONDS: "300"
+      WEBHOOK_RETRY_JITTER_FACTOR: "0.2"
+      WEBHOOK_RETRY_NON_RETRYABLE_STATUS_CODES: "400,401,403,404,422"
+      PROVIDER_ENABLED: "false"
+EOF
+        [ "$MODO_DEPLOY" = compose ] && echo "    depends_on: [hublabel-evolution-db, hublabel-evolution-redis]"
+        extras hublabel-evolution 1 hublabel_evolution "$EVO_HOST" 8080 "${PORTA_EVO:-}" 1024M
+
+        cat <<EOF
+
+  hublabel-evolution-db:
+    image: $IMG_POSTGRES
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=64MB", "-c", "timezone=America/Sao_Paulo"]
+    environment:
+      POSTGRES_PASSWORD: "$POSTGRES_PASSWORD"
+      POSTGRES_DB: "evolution"
+      TZ: "America/Sao_Paulo"
+    volumes:
+      - evolution_postgres:/var/lib/postgresql/data
+EOF
+        extras hublabel-evolution-db 0 "" "" "" "" 512M
+
+        cat <<EOF
+
+  hublabel-evolution-redis:
+    image: $IMG_REDIS
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - evolution_redis:/data
+EOF
+        extras hublabel-evolution-redis 0 "" "" "" "" 256M
+
+        cat <<EOF
+
+## --------------------------- MINIO (S3) --------------------------- ##
+
+  hublabel-minio:
+    image: $IMG_MINIO
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: "$MINIO_ROOT_USER"
+      MINIO_ROOT_PASSWORD: "$MINIO_ROOT_PASSWORD"
+      MINIO_SERVER_URL: "https://$S3_HOST"
+      MINIO_BROWSER: "off"
+      MINIO_REGION_NAME: "eu-south"
+    volumes:
+      - minio_data:/data
+EOF
+        extras hublabel-minio 1 hublabel_s3 "$S3_HOST" 9000 "${PORTA_S3:-}" 512M
+
+        if [ "$MODO_ROTA" = caddy ]; then
+            cat <<EOF
+
+## --------------------------- CADDY (HTTPS automático) --------------------------- ##
+
+  caddy:
+    image: $IMG_CADDY
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+EOF
+            extras caddy 0 "" "" "" "" 256M
+        fi
+
+        echo ""
+        echo "volumes:"
+        echo "  hublabel_redis:"
+        echo "  evolution_instances:"
+        echo "  evolution_postgres:"
+        echo "  evolution_redis:"
+        echo "  minio_data:"
+        if [ "$MODO_ROTA" = caddy ]; then
+            echo "  caddy_data:"
+            echo "  caddy_config:"
+        fi
+        echo ""
+        echo "networks:"
+        echo "  interna:"
+        if [ "$MODO_DEPLOY" = stack ]; then
+            echo "    driver: overlay"
+        else
+            echo "    name: $REDE_INTERNA"
+        fi
+        if [ "$MODO_ROTA" = labels ] || [ "$MODO_ROTA" = file ]; then
+            echo "  proxy:"
+            echo "    external: true"
+            echo "    name: $TRAEFIK_REDE"
+        fi
+    } >"$f"
+    chmod 600 "$f"
+
+    if [ "$MODO_ROTA" = caddy ]; then
+        cat >"$DIR/Caddyfile" <<EOF
+$APP_HOST {
+    encode gzip
+    reverse_proxy hublabel-app:3090
+}
+
+$EVO_HOST {
+    reverse_proxy hublabel-evolution:8080
+}
+
+$S3_HOST {
+    reverse_proxy hublabel-minio:9000
+}
+EOF
+    fi
+
+    if [ "$MODO_ROTA" = file ]; then
+        local app evo s3
+        app="$(nome_dns hublabel-app)"; evo="$(nome_dns hublabel-evolution)"; s3="$(nome_dns hublabel-minio)"
+        {
+            echo "## Gerado pelo setup HubLabel v$VERSAO"
+            echo "http:"
+            echo "  routers:"
+            for r in "hublabel_app $APP_HOST" "hublabel_evolution $EVO_HOST" "hublabel_s3 $S3_HOST"; do
+                set -- $r
+                echo "    $1:"
+                echo "      rule: \"Host(\`$2\`)\""
+                echo "      entryPoints: [\"$TRAEFIK_ENTRYPOINT\"]"
+                echo "      service: $1"
+                if [ -n "$TRAEFIK_RESOLVER" ]; then
+                    echo "      tls:"
+                    echo "        certResolver: $TRAEFIK_RESOLVER"
+                else
+                    echo "      tls: {}"
+                fi
+            done
+            echo "  services:"
+            echo "    hublabel_app:"
+            echo "      loadBalancer:"
+            echo "        servers: [{ url: \"http://$app:3090\" }]"
+            echo "    hublabel_evolution:"
+            echo "      loadBalancer:"
+            echo "        servers: [{ url: \"http://$evo:8080\" }]"
+            echo "    hublabel_s3:"
+            echo "      loadBalancer:"
+            echo "        servers: [{ url: \"http://$s3:9000\" }]"
+        } >"$TRAEFIK_PASTA_ARQUIVOS/hublabel-rotas.yml"
+    fi
+}
+
+## ============================================================================
+## SUBIR / ATUALIZAR
+## ============================================================================
+
+## ID do container de um serviço (compose ou stack)
+container_de() {
+    if [ "$MODO_DEPLOY" = stack ]; then
+        docker ps -q -f "label=com.docker.swarm.service.name=${PROJETO}_$1" | head -1
+    else
+        docker ps -q -f "label=com.docker.compose.project=$PROJETO" -f "label=com.docker.compose.service=$1" | head -1
+    fi
+}
+
+subir() {
+    info "Baixando as imagens (pode levar alguns minutos)..."
+    cd "$DIR" || erro "Pasta $DIR não encontrada."
+    if [ "$MODO_DEPLOY" = stack ]; then
+        local img
+        for img in "$IMG_APP" "$IMG_REDIS" "$IMG_EVOLUTION" "$IMG_POSTGRES" "$IMG_MINIO"; do
+            docker pull -q "$img" >/dev/null 2>&1 || aviso "Não consegui baixar $img agora (o Docker tenta de novo sozinho)."
+        done
+        info "Subindo os serviços..."
+        docker stack deploy --prune --resolve-image always -c "$PROJETO.yml" "$PROJETO" >/dev/null \
+            || erro "Falha no docker stack deploy. Arquivo: $DIR/$PROJETO.yml"
+    else
+        docker compose -f "$PROJETO.yml" pull -q || erro "Não consegui baixar as imagens. Confira a internet da VPS."
+        info "Subindo os serviços..."
+        docker compose -f "$PROJETO.yml" up -d --remove-orphans || erro "Falha ao subir os serviços. Arquivo: $DIR/$PROJETO.yml"
+    fi
+    ok "Serviços enviados ao Docker."
+}
+
+configurar_minio() {
+    info "Preparando o S3 (bucket \"$S3_BUCKET\" e chaves de acesso)..."
+    local cid="" i
+    for i in $(seq 1 60); do
+        cid="$(container_de hublabel-minio)"
+        if [ -n "$cid" ] && docker exec "$cid" mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; then
+            break
+        fi
+        cid=""
+        sleep 3
+    done
+    [ -n "$cid" ] || { falha "O MinIO não respondeu. As mídias não vão funcionar até isso ser resolvido."; return 1; }
+
+    docker exec "$cid" mc mb -p "local/$S3_BUCKET" >/dev/null 2>&1
+    docker exec "$cid" mc anonymous set download "local/$S3_BUCKET" >/dev/null 2>&1 \
+        || aviso "Não consegui deixar o bucket com leitura pública."
+    docker exec "$cid" mc admin user add local "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1 \
+        || { falha "Não consegui criar a chave de acesso do S3."; return 1; }
+    docker exec "$cid" mc admin policy attach local readwrite --user "$S3_ACCESS_KEY" >/dev/null 2>&1 \
+        || docker exec "$cid" mc admin policy set local readwrite "user=$S3_ACCESS_KEY" >/dev/null 2>&1 || true
+    ok "S3 pronto."
+}
+
+aguardar_sistema() {
+    info "Aguardando o sistema iniciar (até 5 minutos)..."
+    local i cid estado
+    for i in $(seq 1 100); do
+        cid="$(container_de hublabel-app)"
+        if [ -n "$cid" ]; then
+            estado="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null)"
+            if [ "$estado" = healthy ] || docker exec "$cid" wget -qO- http://127.0.0.1:3090/health >/dev/null 2>&1; then
+                ok "Sistema no ar."
+                return 0
+            fi
+        fi
+        sleep 3
+    done
+    echo ""
+    falha "O sistema não respondeu. Últimas linhas do log:"
+    if [ "$MODO_DEPLOY" = stack ]; then
+        docker service logs --tail 30 "${PROJETO}_hublabel-app" 2>&1 | tail -30
+    else
+        docker compose -f "$DIR/$PROJETO.yml" logs --tail 30 hublabel-app 2>&1 | tail -30
+    fi
+    echo ""
+    aviso "Problemas comuns: licença (e-mail errado ou já usada) e chaves do Supabase."
+    aviso "Depois de corrigir, rode o setup de novo e escolha \"Refazer a configuração\"."
+    return 1
+}
+
+verificar_https() {
+    [ "$MODO_ROTA" = manual ] && return 0
+    info "Conferindo o HTTPS de https://$APP_HOST ..."
+    local i codigo
+    for i in $(seq 1 20); do
+        codigo="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$APP_HOST:443:127.0.0.1" "https://$APP_HOST/health")"
+        [ "$codigo" = "200" ] && { ok "HTTPS respondendo."; return 0; }
+        sleep 6
+    done
+    aviso "O endereço https://$APP_HOST ainda não respondeu pelo proxy (HTTP $codigo)."
+    aviso "Confira o DNS. O certificado pode levar alguns minutos para sair."
+    return 1
 }
 
 ## ============================================================================
@@ -1838,65 +1257,112 @@ PYEOF
 ## ============================================================================
 
 resumo_final() {
-    clear
+    banner
+    echo -e "${verde}====================================================================================${reset}"
+    echo -e "${verde}                        INSTALAÇÃO CONCLUÍDA!${reset}"
+    echo -e "${verde}====================================================================================${reset}"
     echo ""
-    echo -e "${branco}  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
-    echo -e "${branco}  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
-    echo -e "${branco}  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
-    echo -e "${branco}  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
-    echo -e "${branco}  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
-    echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
+    echo -e "${amarelo}SISTEMA${reset}"
+    echo "  Acesso:             https://$APP_HOST/webhook/login"
+    echo "  Webhook Meta:       https://$APP_HOST/webhook/eventsmeta"
+    echo "  Webhook Evolution:  https://$APP_HOST/webhook/agente-no-whatsapp"
+    echo "  Senha padrão:       $SENHA_PADRAO_INTEGRACAO  (usuários criados por integração)"
     echo ""
-    echo -e "${verde}====================================================================================================${reset}"
-    echo -e "${verde}                    INSTALAÇÃO CONCLUÍDA COM SUCESSO!                                                ${reset}"
-    echo -e "${verde}====================================================================================================${reset}"
-    echo -e "${amarelo}PORTAINER:${reset}"
-    echo "  URL:    https://$url_portainer"
-    echo "  User:   $user_portainer"
+    echo -e "${amarelo}EVOLUTION API${reset}"
+    echo "  URL:      https://$EVO_HOST"
+    echo "  Manager:  https://$EVO_HOST/manager"
+    echo "  API Key:  $EVOLUTION_API_KEY"
     echo ""
-    echo -e "${amarelo}EVOLUTION${reset}"
-    echo "  URL:    https://$url_evolution"
+    echo -e "${amarelo}S3 (MINIO)${reset}"
+    echo "  URL:         https://$S3_HOST"
+    echo "  Bucket:      $S3_BUCKET  (https://$S3_HOST/$S3_BUCKET)"
+    echo "  Access Key:  $S3_ACCESS_KEY"
+    echo "  Secret Key:  $S3_SECRET_KEY"
     echo ""
-    echo -e "${amarelo}APIKEY${reset}"
-    echo "  $apikeyglobal"
+    echo -e "${amarelo}SUPABASE${reset}"
+    echo "  $SUPABASE_URL"
     echo ""
-    echo -e "${amarelo}MINIO${reset}"
-    echo "  Painel: https://$url_minio"
-    echo "  S3:     https://$url_s3"
-    echo "  User:   $user_minio"
-    echo "  Bucket: n8n (público)"
-    if [ -n "${minio_n8n_access_key:-}" ]; then
-        echo "  Access Key: $minio_n8n_access_key"
-        echo "  Secret Key: $minio_n8n_secret_key"
+    if [ "$MODO_ROTA" = manual ]; then
+        echo -e "${amarelo}FALTA UM PASSO: APONTAR OS DOMÍNIOS NO SEU PAINEL/PROXY (com HTTPS)${reset}"
+        echo "  https://$APP_HOST  →  http://127.0.0.1:$PORTA_APP"
+        echo "  https://$EVO_HOST  →  http://127.0.0.1:$PORTA_EVO"
+        echo "  https://$S3_HOST  →  http://127.0.0.1:$PORTA_S3"
+        echo ""
     fi
+    echo -e "${amarelo}PARA ATUALIZAR${reset}"
+    echo "  Rode o mesmo comando de instalação de novo e escolha \"Atualizar\"."
     echo ""
-    echo -e "${amarelo}N8N${reset}"
-    echo "  Editor:  https://$url_editorn8n"
-    echo "  Webhook: https://$url_webhookn8n"
-    echo ""
-    echo -e "${amarelo}DISPARADOR${reset}"
-    echo "  App/Webhook: https://$url_webhookn8n"
-    echo "  Supabase:    $supabase_url"
-    echo ""
-    echo "Arquivos de configuração em /root/"
-    echo "Dados da VPS em /root/dados_vps/"
+    echo -e "${cinza}Anote estes dados em um lugar seguro.${reset}"
     echo ""
 }
 
 ## ============================================================================
-## MAIN
+## FLUXOS
 ## ============================================================================
 
-main() {
-    coletar_informacoes
-    verificacoes_iniciais
-    instalar_traefik_portainer
-    instalar_postgres
-    instalar_evolution
-    instalar_minio
-    instalar_n8n
-    instalar_disparador
+instalar() {
+    gerar_segredos
+    salvar_config
+    gerar_arquivo_deploy
+    subir
+    configurar_minio
+    aguardar_sistema
+    verificar_https
     resumo_final
+}
+
+menu_instalacao_existente() {
+    carregar_config
+    banner
+    echo -e "${branco}Já existe uma instalação do HubLabel nesta VPS${reset} (https://${APP_HOST:-?})."
+    echo ""
+    echo "  1) Atualizar para a versão mais nova (mantém tudo como está)"
+    echo "  2) Refazer a configuração (Enter mantém cada resposta atual)"
+    echo "  3) Sair"
+    echo ""
+    local op
+    perguntar op "Escolha" "1" || op=3
+    case "$op" in
+        1)
+            gerar_arquivo_deploy
+            subir
+            configurar_minio
+            aguardar_sistema
+            echo ""
+            ok "Atualização concluída."
+            exit 0
+            ;;
+        2)
+            assistente
+            instalar
+            exit 0
+            ;;
+        *) exit 0 ;;
+    esac
+}
+
+main() {
+    verificacoes_iniciais
+
+    if [ -f "$ENV_FILE" ]; then
+        menu_instalacao_existente
+    fi
+
+    banner
+    info "Analisando a VPS..."
+    detectar_ambiente
+    echo ""
+    descrever_ambiente
+    echo ""
+    echo "Vou pedir 5 informações: domínio, Supabase (URL e 2 chaves), as tabelas e a licença."
+    echo "Tenha em mãos o acesso ao painel do seu domínio e ao Supabase."
+    echo ""
+    enter "Aperte Enter para começar..."
+
+    assistente
+    banner
+    instalar_docker
+    instalar
 }
 
 main "$@"
