@@ -44,9 +44,10 @@ amarelo="\e[33m"
 verde="\e[92m"
 branco="\e[97m"
 vermelho="\e[91m"
-ciano="\e[96m"
-azul="\e[94m"
-roxo="\e[95m"
+## Paleta única em amarelo (verde e vermelho só para ✔ e ✘)
+ciano="\e[93m"
+azul="\e[33m"
+roxo="\e[33m"
 cinza="\e[90m"
 negrito="\e[1m"
 reset="\e[0m"
@@ -96,12 +97,12 @@ digitar() { # digitar "texto" [cor]
 banner() {
     clear
     echo ""
-    echo -e "\e[96m  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
-    echo -e "\e[96m  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
-    echo -e "\e[94m  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
-    echo -e "\e[94m  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
-    echo -e "\e[95m  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
-    echo -e "\e[95m  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
+    echo -e "\e[93m  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
+    echo -e "\e[93m  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
+    echo -e "\e[93m  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
+    echo -e "\e[93m  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
+    echo -e "\e[93m  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
+    echo -e "\e[93m  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
     echo -e "  ${cinza}$(linha 66 ━)${reset}"
     echo -e "  ${negrito}${branco}Instalador oficial${reset}  ${cinza}•  versão $VERSAO${reset}"
     echo ""
@@ -601,16 +602,34 @@ descrever_ambiente() {
 ## ============================================================================
 
 ## ---------------------------------------------------------------- Passo 1: domínios
+## Deixa só o domínio: tira http(s)://, www., caminho, porta, espaços e ponto no fim
+## Ex.: "HTTPS://www.SuaEmpresa.com.br/login" → "suaempresa.com.br"
+normalizar_dominio() {
+    local d
+    d="$(limpar "$1")"
+    d="${d,,}"
+    d="${d// /}"
+    d="$(printf '%s' "$d" | sed -E 's#^[a-z]+:/*##; s#^[^@/]*@##; s#[/?\#].*$##; s#:[0-9]*$##; s#\.+$##; s#^(www\.)+##')"
+    printf '%s' "$d"
+}
+
+## Subdomínio: só a primeira parte (ex.: "https://app.suaempresa.com.br" → "app")
+normalizar_sub() {
+    local d
+    d="$(normalizar_dominio "$1")"
+    printf '%s' "${d%%.*}"
+}
+
 passo_dominios() {
     while :; do
         cabecalho_passo 1 "DOMÍNIOS"
         texto "Qual é o domínio da sua empresa?"
         dica "Exemplo: suaempresa.com.br  (sem https:// e sem www)"
         echo ""
-        perguntar DOMINIO_BASE "Domínio" "${DOMINIO_BASE:-}" || return 1
-        DOMINIO_BASE="${DOMINIO_BASE,,}"
-        DOMINIO_BASE="${DOMINIO_BASE#http://}"; DOMINIO_BASE="${DOMINIO_BASE#https://}"
-        DOMINIO_BASE="${DOMINIO_BASE%%/*}"; DOMINIO_BASE="${DOMINIO_BASE#www.}"
+        local d
+        perguntar d "Domínio" "${DOMINIO_BASE:-}" || return 1
+        DOMINIO_BASE="$(normalizar_dominio "$d")"
+        [ "$DOMINIO_BASE" != "$(limpar "$d")" ] && dica "  Ajustei para: $DOMINIO_BASE"
         if ! [[ "$DOMINIO_BASE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
             falha "Domínio inválido: $DOMINIO_BASE"
             enter
@@ -633,8 +652,7 @@ passo_dominios() {
                 perguntar SUB_APP "Sistema" "${SUB_APP:-app}" || continue
                 perguntar SUB_EVO "WhatsApp" "${SUB_EVO:-wpp}" || continue
                 perguntar SUB_S3 "Arquivos" "${SUB_S3:-s3}" || continue
-                SUB_APP="${SUB_APP%%.*}"; SUB_EVO="${SUB_EVO%%.*}"; SUB_S3="${SUB_S3%%.*}"
-                SUB_APP="${SUB_APP,,}"; SUB_EVO="${SUB_EVO,,}"; SUB_S3="${SUB_S3,,}"
+                SUB_APP="$(normalizar_sub "$SUB_APP")"; SUB_EVO="$(normalizar_sub "$SUB_EVO")"; SUB_S3="$(normalizar_sub "$SUB_S3")"
                 ;;
         esac
         APP_HOST="$SUB_APP.$DOMINIO_BASE"
@@ -841,7 +859,7 @@ tabelas_faltando() {
 
 passo_sql() {
     cabecalho_passo 3 "TABELAS"
-    local falta resp link ref
+    local falta resp
     info "Conferindo as tabelas no seu Supabase..."
     falta="$(tabelas_faltando)"
     if [ -z "${falta// /}" ]; then
@@ -849,15 +867,14 @@ passo_sql() {
         sleep 1
         return 0
     fi
-    ref="$(ref_supabase)"
-    link="${ref:+https://supabase.com/dashboard/project/$ref/sql/new}"
     echo ""
-    texto "Falta criar as tabelas do sistema no seu Supabase. É rapidinho:"
+    falha "As tabelas do sistema ainda não existem no seu Supabase."
     echo ""
-    instrucao "1." "Abra o ${branco}SQL Editor${reset} do Supabase"
-    [ -n "$link" ] && echo -e "      ${verde}$link${reset}"
-    instrucao "2." "Abra o arquivo abaixo, copie tudo ${cinza}(Ctrl+A e Ctrl+C)${reset} e cole no SQL Editor"
+    texto "Siga o ${branco}vídeo de instalação${reset} para criar as tabelas:"
+    echo ""
+    instrucao "1." "Copie o ${branco}SQL${reset} que está na ${branco}descrição do vídeo${reset} ou neste link:"
     echo -e "      ${verde}$SQL_URL${reset}"
+    instrucao "2." "Abra o ${branco}SQL Editor${reset} do seu Supabase e cole o SQL"
     instrucao "3." "Clique em ${branco}Run${reset} e espere aparecer ${branco}Success${reset}"
     echo ""
     while :; do
@@ -1009,7 +1026,7 @@ assistente() {
         banner
         trilha $((TOTAL_PASSOS + 1))
         echo ""
-        titulo_caixa "CONFIRA OS DADOS" "$verde"
+        titulo_caixa "CONFIRA OS DADOS"
         echo ""
         abrir_bloco "ENDEREÇOS" "$azul"
         item "Sistema" "https://$APP_HOST"
@@ -1647,9 +1664,9 @@ PYEOF
 
 resumo_final() {
     banner
-    titulo_caixa "🎉  INSTALAÇÃO CONCLUÍDA!" "$verde"
+    titulo_caixa "🎉  INSTALAÇÃO CONCLUÍDA!"
     echo ""
-    abrir_bloco "ACESSE SEU SISTEMA" "$verde"
+    abrir_bloco "ACESSE SEU SISTEMA" "$azul"
     item "Endereço" "https://$APP_HOST${BACK_PATH:-}/login"
     if [ -n "${ADMIN_EMAIL:-}" ]; then
         item "E-mail" "$ADMIN_EMAIL"
@@ -1661,11 +1678,6 @@ resumo_final() {
         item "Perfil" "Super administrador"
     fi
     fechar_bloco
-    abrir_bloco "WEBHOOKS" "$azul"
-    item "Meta" "https://$APP_HOST${BACK_PATH:-}/eventsmeta"
-    item "Evolution" "https://$APP_HOST${BACK_PATH:-}/agente-no-whatsapp"
-    item "Senha padrão" "$SENHA_PADRAO_INTEGRACAO  (usuários criados por integração)"
-    fechar_bloco
     abrir_bloco "WHATSAPP (EVOLUTION API)" "$roxo"
     item "Endereço" "https://$EVO_HOST"
     item "Manager" "https://$EVO_HOST/manager"
@@ -1673,11 +1685,8 @@ resumo_final() {
     fechar_bloco
     abrir_bloco "ARQUIVOS (S3)" "$roxo"
     item "Endereço" "https://$S3_HOST"
-    item "Bucket" "$S3_BUCKET  (https://$S3_HOST/$S3_BUCKET)"
-    item "Access Key" "$S3_ACCESS_KEY"
-    item "Secret Key" "$S3_SECRET_KEY"
     fechar_bloco
-    abrir_bloco "SUPABASE" "$cinza"
+    abrir_bloco "SUPABASE" "$azul"
     item "Projeto" "$SUPABASE_URL"
     fechar_bloco
     if [ "$MODO_ROTA" = manual ]; then
