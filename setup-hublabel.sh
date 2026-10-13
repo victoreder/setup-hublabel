@@ -1678,11 +1678,6 @@ resumo_final() {
         item "Perfil" "Super administrador"
     fi
     fechar_bloco
-    abrir_bloco "WEBHOOKS" "$azul"
-    item "Meta" "https://$APP_HOST${BACK_PATH:-}/eventsmeta"
-    item "Evolution" "https://$APP_HOST${BACK_PATH:-}/agente-no-whatsapp"
-    item "Senha padrão" "$SENHA_PADRAO_INTEGRACAO  (usuários criados por integração)"
-    fechar_bloco
     abrir_bloco "WHATSAPP (EVOLUTION API)" "$roxo"
     item "Endereço" "https://$EVO_HOST"
     item "Manager" "https://$EVO_HOST/manager"
@@ -1690,9 +1685,6 @@ resumo_final() {
     fechar_bloco
     abrir_bloco "ARQUIVOS (S3)" "$roxo"
     item "Endereço" "https://$S3_HOST"
-    item "Bucket" "$S3_BUCKET  (https://$S3_HOST/$S3_BUCKET)"
-    item "Access Key" "$S3_ACCESS_KEY"
-    item "Secret Key" "$S3_SECRET_KEY"
     fechar_bloco
     abrir_bloco "SUPABASE" "$azul"
     item "Projeto" "$SUPABASE_URL"
