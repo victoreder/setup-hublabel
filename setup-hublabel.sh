@@ -41,11 +41,14 @@ SQL_URL="https://raw.githubusercontent.com/victoreder/setup-hublabel/main/sql/cr
 TABELAS_SQL=(SAAS_Contas SAAS_Usuarios FollowupExecucao SAAS_Personalizacao)
 
 amarelo="\e[33m"
-verde="\e[32m"
+verde="\e[92m"
 branco="\e[97m"
 vermelho="\e[91m"
-ciano="\e[36m"
+ciano="\e[96m"
+azul="\e[94m"
+roxo="\e[95m"
 cinza="\e[90m"
+negrito="\e[1m"
 reset="\e[0m"
 
 ## Lê do terminal mesmo quando o script vem por "curl | bash"
@@ -53,40 +56,158 @@ TTY=/dev/tty
 { : </dev/tty; } 2>/dev/null || TTY=/dev/stdin
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"; printf "\e[?25h"' EXIT
 
 ## ============================================================================
-## UTILITÁRIOS
+## VISUAL (cores, caixas, efeitos)
 ## ============================================================================
 
-info()  { echo -e "${amarelo}• $*${reset}"; }
-ok()    { echo -e "${verde}✔ $*${reset}"; }
-aviso() { echo -e "${amarelo}! $*${reset}"; }
-falha() { echo -e "${vermelho}✘ $*${reset}"; }
+LARGURA=62
+NOMES_PASSOS=("Domínios" "Supabase" "Tabelas" "Licença" "Seu sistema")
+TOTAL_PASSOS=${#NOMES_PASSOS[@]}
+QUADROS=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+info()  { echo -e "  ${ciano}›${reset} $*"; }
+ok()    { echo -e "  ${verde}✔${reset} $*"; }
+aviso() { echo -e "  ${amarelo}!${reset} ${amarelo}$*${reset}"; }
+falha() { echo -e "  ${vermelho}✘ $*${reset}"; }
 erro()  { falha "$*"; exit 1; }
+dica()  { echo -e "  ${cinza}$*${reset}"; }
+texto() { echo -e "  $*"; }
+
+## linha [largura] [caractere]
+linha() { local n="${1:-$LARGURA}" c="${2:-─}"; [ "$n" -gt 0 ] && printf "%.0s$c" $(seq 1 "$n"); }
+
+## Efeito de máquina de escrever (desligado fora do terminal ou com SEM_EFEITO=1)
+digitar() { # digitar "texto" [cor]
+    local t="$1" cor="${2:-}" i
+    printf '%b' "$cor"
+    if [ -t 1 ] && [ -z "${SEM_EFEITO:-}" ]; then
+        for ((i = 0; i < ${#t}; i++)); do
+            printf '%s' "${t:i:1}"
+            sleep 0.012
+        done
+    else
+        printf '%s' "$t"
+    fi
+    printf '%b\n' "$reset"
+}
 
 banner() {
     clear
     echo ""
-    echo -e "${branco}  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
-    echo -e "${branco}  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
-    echo -e "${branco}  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
-    echo -e "${branco}  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
-    echo -e "${branco}  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
-    echo -e "${branco}  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
-    echo ""
-    echo -e "${amarelo}====================================================================================${reset}"
-    echo -e "${amarelo}                          INSTALADOR HUBLABEL V${VERSAO}${reset}"
-    echo -e "${amarelo}====================================================================================${reset}"
+    echo -e "\e[96m  ██╗  ██╗██╗   ██╗██████╗ ██╗      █████╗ ██████╗ ███████╗██╗     ${reset}"
+    echo -e "\e[96m  ██║  ██║██║   ██║██╔══██╗██║     ██╔══██╗██╔══██╗██╔════╝██║     ${reset}"
+    echo -e "\e[94m  ███████║██║   ██║██████╔╝██║     ███████║██████╔╝█████╗  ██║     ${reset}"
+    echo -e "\e[94m  ██╔══██║██║   ██║██╔══██╗██║     ██╔══██║██╔══██╗██╔══╝  ██║     ${reset}"
+    echo -e "\e[95m  ██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██████╔╝███████╗███████╗${reset}"
+    echo -e "\e[95m  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝${reset}"
+    echo -e "  ${cinza}$(linha 66 ━)${reset}"
+    echo -e "  ${negrito}${branco}Instalador oficial${reset}  ${cinza}•  versão $VERSAO${reset}"
     echo ""
 }
 
-## cabecalho_passo N TOTAL "Título"
+## Trilha com os passos: ✔ feitos, ● atual, ○ próximos
+trilha() {
+    local atual="$1" i n s=""
+    for i in "${!NOMES_PASSOS[@]}"; do
+        n=$((i + 1))
+        if [ "$n" -lt "$atual" ]; then
+            s+="${verde}✔ ${NOMES_PASSOS[$i]}${reset}"
+        elif [ "$n" -eq "$atual" ]; then
+            s+="${negrito}${ciano}● ${NOMES_PASSOS[$i]}${reset}"
+        else
+            s+="${cinza}○ ${NOMES_PASSOS[$i]}${reset}"
+        fi
+        [ "$n" -lt "$TOTAL_PASSOS" ] && s+="${cinza} ─ ${reset}"
+    done
+    echo -e "  $s"
+}
+
+## Título em caixa: titulo_caixa "TEXTO" [cor]
+titulo_caixa() {
+    local cor="${2:-$ciano}"
+    echo -e "  ${cor}╭$(linha "$LARGURA")${reset}"
+    printf '  %b│%b  ' "$cor" "$reset"
+    digitar "$1" "${negrito}${branco}"
+    echo -e "  ${cor}╰$(linha "$LARGURA")${reset}"
+}
+
+## cabecalho_passo N "Título"
 cabecalho_passo() {
     banner
-    echo -e "${ciano}Passo $1 de $2 — $3${reset}"
-    echo -e "${cinza}(digite 0 e aperte Enter para voltar à etapa anterior)${reset}"
+    trilha "$1"
     echo ""
+    titulo_caixa "PASSO $1 DE $TOTAL_PASSOS  ·  $2"
+    dica "Digite 0 e aperte Enter para voltar ao passo anterior."
+    echo ""
+}
+
+## Bloco de informações: abrir_bloco "TÍTULO" [cor] / item "Rótulo" "valor" / fechar_bloco
+## Quantidade de caracteres (não de bytes), em qualquer idioma do terminal
+tamanho() { printf '%s' "$1" | LC_ALL=C tr -d '\200-\277' | LC_ALL=C wc -c; }
+
+## Texto completado com espaços até N caracteres
+completar() { local n; n=$(tamanho "$1"); printf '%s%*s' "$1" $(($2 > n ? $2 - n : 0)) ''; }
+
+abrir_bloco() {
+    BLOCO_COR="${2:-$roxo}"
+    echo -e "  ${BLOCO_COR}┌─ ${negrito}${branco}$1${reset} ${BLOCO_COR}$(linha $((LARGURA - $(tamanho "$1") - 3)))${reset}"
+}
+item() { printf '  %b│%b  %b%s%b %s\n' "$BLOCO_COR" "$reset" "$cinza" "$(completar "$1" 14)" "$reset" "$2"; }
+fechar_bloco() { echo -e "  ${BLOCO_COR}└$(linha "$LARGURA")${reset}"; echo ""; }
+
+## Item já respondido dentro de um passo
+feito() { printf '  %b✔%b %b%s%b %s\n' "$verde" "$reset" "$cinza" "$(completar "$1" 18)" "$reset" "$2"; }
+
+## Numeração das instruções: instrucao N "texto"
+instrucao() { echo -e "  ${ciano}${negrito}$1${reset}  $2"; }
+
+## girar "mensagem" comando... → roda com animação; saída em $TMP/ultimo.log
+girar() {
+    local msg="$1" pid rc i=0
+    shift
+    "$@" >"$TMP/ultimo.log" 2>&1 &
+    pid=$!
+    printf '\e[?25l'
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r  %b%s%b %s' "$ciano" "${QUADROS[i % 10]}" "$reset" "$msg"
+        i=$((i + 1))
+        sleep 0.1
+    done
+    wait "$pid"
+    rc=$?
+    printf '\e[?25h'
+    if [ "$rc" = 0 ]; then
+        printf '\r  %b✔%b %s\e[K\n' "$verde" "$reset" "$msg"
+    else
+        printf '\r  %b✘%b %s\e[K\n' "$vermelho" "$reset" "$msg"
+    fi
+    return "$rc"
+}
+
+## esperar "mensagem" SEGUNDOS comando... → repete o comando até dar certo (com animação)
+esperar() {
+    local msg="$1" limite="$2" inicio i=0
+    shift 2
+    inicio=$SECONDS
+    printf '\e[?25l'
+    while :; do
+        if "$@" >/dev/null 2>&1; then
+            printf '\e[?25h\r  %b✔%b %s\e[K\n' "$verde" "$reset" "$msg"
+            return 0
+        fi
+        if [ $((SECONDS - inicio)) -ge "$limite" ]; then
+            printf '\e[?25h\r  %b✘%b %s\e[K\n' "$vermelho" "$reset" "$msg"
+            return 1
+        fi
+        local f
+        for f in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            printf '\r  %b%s%b %s' "$ciano" "${QUADROS[i % 10]}" "$reset" "$msg"
+            i=$((i + 1))
+            sleep 0.1
+        done
+    done
 }
 
 ## Remove \r, espaços nas pontas e aspas em volta (comum ao copiar e colar)
@@ -103,9 +224,9 @@ perguntar() {
     local __var="$1" __texto="$2" __padrao="${3:-}" __v
     while :; do
         if [ -n "$__padrao" ]; then
-            printf '%b' "${branco}${__texto}${reset} [${__padrao}]: "
+            printf '%b' "  ${ciano}➜${reset} ${branco}${__texto}${reset} ${cinza}[${__padrao}]${reset}: "
         else
-            printf '%b' "${branco}${__texto}${reset}: "
+            printf '%b' "  ${ciano}➜${reset} ${branco}${__texto}${reset}: "
         fi
         ler __v
         __v="$(limpar "$__v")"
@@ -121,7 +242,7 @@ perguntar() {
 sim_nao() {
     local resp padrao="${2:-S}"
     while :; do
-        printf '%b' "${branco}$1${reset} ($([ "$padrao" = S ] && echo 'S/n' || echo 's/N')): "
+        printf '%b' "  ${ciano}➜${reset} ${branco}$1${reset} ${cinza}($([ "$padrao" = S ] && echo 'S/n' || echo 's/N'))${reset}: "
         ler resp
         resp="$(limpar "$resp")"
         [ "$resp" = "0" ] && return 2
@@ -135,7 +256,7 @@ sim_nao() {
 }
 
 enter() {
-    printf '%b' "${cinza}${1:-Aperte Enter para continuar...}${reset}"
+    printf '%b' "  ${cinza}${1:-Aperte Enter para continuar...}${reset}"
     local _r; ler _r
 }
 
@@ -469,7 +590,7 @@ detectar_ambiente() {
 }
 
 descrever_ambiente() {
-    ok "Ambiente detectado: $PAINEL"
+    ok "Ambiente detectado: ${negrito}$PAINEL${reset}"
     if [ "$HUBLABEL_V18" = 1 ]; then
         aviso "Esta VPS já tem o HubLabel antigo. Use subdomínios e um Supabase diferentes dos atuais."
     fi
@@ -479,89 +600,94 @@ descrever_ambiente() {
 ## ASSISTENTE (PERGUNTAS)
 ## ============================================================================
 
-TOTAL_PASSOS=6
-
+## ---------------------------------------------------------------- Passo 1: domínios
 passo_dominios() {
-    cabecalho_passo 1 $TOTAL_PASSOS "Domínios"
-    echo "Informe o domínio principal da sua empresa (sem https://)."
-    echo -e "${cinza}Exemplo: suaempresa.com.br${reset}"
-    echo ""
-    perguntar DOMINIO_BASE "Domínio principal" "${DOMINIO_BASE:-}" || return 1
-    DOMINIO_BASE="${DOMINIO_BASE,,}"
-    DOMINIO_BASE="${DOMINIO_BASE#http://}"; DOMINIO_BASE="${DOMINIO_BASE#https://}"
-    DOMINIO_BASE="${DOMINIO_BASE%%/*}"; DOMINIO_BASE="${DOMINIO_BASE#www.}"
-    if ! [[ "$DOMINIO_BASE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
-        falha "Domínio inválido: $DOMINIO_BASE"
-        enter
-        passo_dominios; return
-    fi
+    while :; do
+        cabecalho_passo 1 "DOMÍNIOS"
+        texto "Qual é o domínio da sua empresa?"
+        dica "Exemplo: suaempresa.com.br  (sem https:// e sem www)"
+        echo ""
+        perguntar DOMINIO_BASE "Domínio" "${DOMINIO_BASE:-}" || return 1
+        DOMINIO_BASE="${DOMINIO_BASE,,}"
+        DOMINIO_BASE="${DOMINIO_BASE#http://}"; DOMINIO_BASE="${DOMINIO_BASE#https://}"
+        DOMINIO_BASE="${DOMINIO_BASE%%/*}"; DOMINIO_BASE="${DOMINIO_BASE#www.}"
+        if ! [[ "$DOMINIO_BASE" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+            falha "Domínio inválido: $DOMINIO_BASE"
+            enter
+            continue
+        fi
 
-    echo ""
-    echo "Endereços que serão usados:"
-    echo -e "  Sistema (aplicativo): ${verde}${SUB_APP:-app}.$DOMINIO_BASE${reset}"
-    echo -e "  WhatsApp (Evolution): ${verde}${SUB_EVO:-wpp}.$DOMINIO_BASE${reset}"
-    echo -e "  Arquivos (S3):        ${verde}${SUB_S3:-s3}.$DOMINIO_BASE${reset}"
-    echo ""
-    sim_nao "Usar esses endereços?" S
-    case $? in
-        2) return 1 ;;
-        0) SUB_APP="${SUB_APP:-app}"; SUB_EVO="${SUB_EVO:-wpp}"; SUB_S3="${SUB_S3:-s3}" ;;
-        1)
-            echo ""
-            echo "Digite só a primeira parte (ex.: app)."
-            perguntar SUB_APP "Subdomínio do sistema" "${SUB_APP:-app}" || return 1
-            perguntar SUB_EVO "Subdomínio da Evolution" "${SUB_EVO:-wpp}" || return 1
-            perguntar SUB_S3 "Subdomínio do S3" "${SUB_S3:-s3}" || return 1
-            SUB_APP="${SUB_APP%%.*}"; SUB_EVO="${SUB_EVO%%.*}"; SUB_S3="${SUB_S3%%.*}"
-            SUB_APP="${SUB_APP,,}"; SUB_EVO="${SUB_EVO,,}"; SUB_S3="${SUB_S3,,}"
-            ;;
-    esac
-    APP_HOST="$SUB_APP.$DOMINIO_BASE"
-    EVO_HOST="$SUB_EVO.$DOMINIO_BASE"
-    S3_HOST="$SUB_S3.$DOMINIO_BASE"
-    if [ "$APP_HOST" = "$EVO_HOST" ] || [ "$APP_HOST" = "$S3_HOST" ] || [ "$EVO_HOST" = "$S3_HOST" ]; then
-        falha "Os três subdomínios precisam ser diferentes."
-        enter
-        passo_dominios; return
-    fi
-    verificar_dns
+        echo ""
+        abrir_bloco "ENDEREÇOS DO SEU SISTEMA" "$azul"
+        item "Sistema" "${SUB_APP:-app}.$DOMINIO_BASE"
+        item "WhatsApp" "${SUB_EVO:-wpp}.$DOMINIO_BASE"
+        item "Arquivos" "${SUB_S3:-s3}.$DOMINIO_BASE"
+        fechar_bloco
+        sim_nao "Usar esses endereços?" S
+        case $? in
+            2) continue ;;
+            0) SUB_APP="${SUB_APP:-app}"; SUB_EVO="${SUB_EVO:-wpp}"; SUB_S3="${SUB_S3:-s3}" ;;
+            1)
+                echo ""
+                dica "Digite só a primeira parte do endereço (ex.: app)."
+                perguntar SUB_APP "Sistema" "${SUB_APP:-app}" || continue
+                perguntar SUB_EVO "WhatsApp" "${SUB_EVO:-wpp}" || continue
+                perguntar SUB_S3 "Arquivos" "${SUB_S3:-s3}" || continue
+                SUB_APP="${SUB_APP%%.*}"; SUB_EVO="${SUB_EVO%%.*}"; SUB_S3="${SUB_S3%%.*}"
+                SUB_APP="${SUB_APP,,}"; SUB_EVO="${SUB_EVO,,}"; SUB_S3="${SUB_S3,,}"
+                ;;
+        esac
+        APP_HOST="$SUB_APP.$DOMINIO_BASE"
+        EVO_HOST="$SUB_EVO.$DOMINIO_BASE"
+        S3_HOST="$SUB_S3.$DOMINIO_BASE"
+        if [ "$APP_HOST" = "$EVO_HOST" ] || [ "$APP_HOST" = "$S3_HOST" ] || [ "$EVO_HOST" = "$S3_HOST" ]; then
+            falha "Os três endereços precisam ser diferentes."
+            enter
+            continue
+        fi
+        verificar_dns && return 0
+    done
 }
 
+## Retorna 0 = DNS ok (ou seguir mesmo assim), 1 = voltar e corrigir os domínios
 verificar_dns() {
     local ip_vps tudo_ok resp h ip ips
     ip_vps="$(ip_da_vps)"
     while :; do
         echo ""
-        echo -e "${branco}Conferindo se os endereços já apontam para esta VPS (${ip_vps:-IP desconhecido})...${reset}"
+        info "Conferindo se os endereços já apontam para esta VPS ${cinza}(${ip_vps:-IP desconhecido})${reset}..."
         tudo_ok=1
         for h in "$APP_HOST" "$EVO_HOST" "$S3_HOST"; do
             ips="$(ips_do_dominio "$h")"
             if [ -n "$ips" ] && { [ -z "$ip_vps" ] || printf '%s\n' "$ips" | grep -qxF "$ip_vps"; }; then
-                echo -e "  ${verde}✔${reset} $h"
+                echo -e "    ${verde}✔${reset} $h"
             else
                 ip="$(printf '%s\n' "$ips" | head -1)"
-                echo -e "  ${vermelho}✘${reset} $h → ${ip:-não encontrado}"
+                echo -e "    ${vermelho}✘${reset} $h ${cinza}→ ${ip:-não encontrado}${reset}"
                 tudo_ok=0
             fi
         done
-        [ "$tudo_ok" = 1 ] && { echo ""; ok "DNS certo."; sleep 1; return 0; }
+        [ "$tudo_ok" = 1 ] && { echo ""; ok "Tudo certo com os endereços!"; sleep 1; return 0; }
         echo ""
-        echo "No painel do seu domínio (Registro.br, Cloudflare, Hostinger...), crie um registro"
-        echo -e "tipo ${branco}A${reset} para cada endereço com ✘:"
-        echo -e "  Nome: a primeira parte do endereço (ex.: ${branco}$SUB_APP${reset})   Valor: ${branco}${ip_vps:-o IP desta VPS}${reset}"
-        echo -e "${cinza}Usa Cloudflare? Deixe a nuvem cinza (\"somente DNS\").${reset}"
-        echo -e "${cinza}A mudança pode levar alguns minutos para valer.${reset}"
+        abrir_bloco "COMO APONTAR" "$amarelo"
+        item "Onde" "no painel do seu domínio (Registro.br, Cloudflare, Hostinger...)"
+        item "Tipo" "A"
+        item "Nome" "a primeira parte de cada endereço com ✘ (ex.: $SUB_APP)"
+        item "Valor" "${ip_vps:-o IP desta VPS}"
+        fechar_bloco
+        dica "Usa Cloudflare? Deixe a nuvem cinza (\"somente DNS\"). Pode levar alguns minutos para valer."
         echo ""
-        printf '%b' "${branco}Enter${reset} = conferir de novo  |  ${branco}C${reset} = continuar mesmo assim  |  ${branco}0${reset} = voltar e corrigir: "
+        printf '%b' "  ${branco}Enter${reset} conferir de novo  ${cinza}•${reset}  ${branco}C${reset} continuar assim  ${cinza}•${reset}  ${branco}0${reset} corrigir os endereços: "
         ler resp
         resp="$(limpar "$resp")"
         case "$resp" in
-            0) passo_dominios; return ;;
-            [cC]*) aviso "Sem o DNS certo o HTTPS não funciona. Corrija assim que puder."; sleep 2; return 0 ;;
+            0) return 1 ;;
+            [cC]*) aviso "Sem o apontamento certo o sistema não abre. Corrija assim que puder."; sleep 2; return 0 ;;
         esac
     done
 }
 
+## ---------------------------------------------------------------- Passo 2: Supabase
 ## Deixa só https://host (tira /rest/v1, /auth/v1, barras, espaços...)
 normalizar_supabase_url() {
     local u
@@ -593,33 +719,32 @@ ref_supabase() {
     [[ "$h" == *.supabase.co ]] && printf '%s' "${h%%.*}"
 }
 
-passo_supabase_url() {
-    cabecalho_passo 2 $TOTAL_PASSOS "Supabase"
-    echo "Abra o seu projeto no Supabase e vá em:"
-    echo -e "  ${branco}Project Settings → API${reset}  (ou o botão ${branco}Connect${reset} no topo)"
-    echo ""
-    echo -e "Copie a ${branco}Project URL${reset}. Ela parece com: https://abcdefgh.supabase.co"
+## Esconde o meio de uma chave: eyJhbGci…x1Yz
+resumir_chave() { local k="$1"; [ "${#k}" -gt 16 ] && printf '%s…%s' "${k:0:8}" "${k: -4}" || printf '%s' "$k"; }
+
+supabase_pedir_url() {
+    instrucao "1." "Copie a ${branco}Project URL${reset} ${cinza}(parece com https://abcdefgh.supabase.co)${reset}"
     echo ""
     local u codigo
-    perguntar u "Project URL" "${SUPABASE_URL:-}" || return 1
-    SUPABASE_URL="$(normalizar_supabase_url "$u")"
-    [ "$SUPABASE_URL" != "$(limpar "$u")" ] && echo -e "${cinza}  Ajustei para: $SUPABASE_URL${reset}"
-    info "Conferindo..."
-    codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SUPABASE_URL/auth/v1/health")"
-    if [ "$codigo" = "000" ]; then
-        falha "Não consegui acessar $SUPABASE_URL. Confira se copiou a URL certa."
-        enter
-        passo_supabase_url; return
-    fi
-    ok "Supabase encontrado."
-
-    echo ""
-    echo -e "Agora, na mesma tela (${branco}API Keys${reset}), copie a chave ${branco}anon public${reset}."
-    echo -e "${cinza}É a chave pública. Começa com eyJ... ou sb_publishable_...${reset}"
-    echo ""
     while :; do
-        local k papel ref
-        perguntar k "Chave anon public" "${SUPABASE_ANON_KEY:-}" || { passo_supabase_url; return; }
+        perguntar u "Project URL" "${SUPABASE_URL:-}" || return 1
+        SUPABASE_URL="$(normalizar_supabase_url "$u")"
+        [ "$SUPABASE_URL" != "$(limpar "$u")" ] && dica "  Ajustei para: $SUPABASE_URL"
+        codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SUPABASE_URL/auth/v1/health")"
+        if [ "$codigo" = "000" ]; then
+            falha "Não consegui acessar $SUPABASE_URL. Confira se copiou a URL certa."
+            continue
+        fi
+        return 0
+    done
+}
+
+supabase_pedir_anon() {
+    instrucao "2." "Copie a chave ${branco}anon public${reset} ${cinza}(começa com eyJ... ou sb_publishable_...)${reset}"
+    echo ""
+    local k papel ref codigo
+    while :; do
+        perguntar k "Chave anon public" "${SUPABASE_ANON_KEY:-}" || return 1
         if [[ "$k" == sb_secret_* ]] || [ "$(jwt_campo "$k" role)" = "service_role" ]; then
             falha "Essa é a chave service_role (secreta). Aqui vai a anon public."
             continue
@@ -642,18 +767,15 @@ passo_supabase_url() {
             continue
         fi
         SUPABASE_ANON_KEY="$k"
-        ok "Chave anon public válida."
-        break
+        return 0
     done
 }
 
-passo_supabase_service() {
-    cabecalho_passo 3 $TOTAL_PASSOS "Supabase — chave secreta"
-    echo -e "Na mesma tela do Supabase, copie a chave ${branco}service_role${reset} (clique em Reveal)."
-    echo -e "${cinza}É a chave secreta. Começa com eyJ... ou sb_secret_...${reset}"
+supabase_pedir_service() {
+    instrucao "3." "Copie a chave ${branco}service_role${reset} ${cinza}(clique em Reveal; começa com eyJ... ou sb_secret_...)${reset}"
     echo ""
+    local k ref codigo
     while :; do
-        local k ref codigo
         perguntar k "Chave service_role" "${SUPABASE_SERVICE_ROLE_KEY:-}" || return 1
         if [[ "$k" == sb_publishable_* ]] || [ "$(jwt_campo "$k" role)" = "anon" ]; then
             falha "Essa é a chave anon public. Aqui vai a service_role (secreta)."
@@ -676,12 +798,38 @@ passo_supabase_service() {
             continue
         fi
         SUPABASE_SERVICE_ROLE_KEY="$k"
-        ok "Chave service_role válida."
-        sleep 1
-        break
+        return 0
     done
 }
 
+passo_supabase() {
+    local sub=0
+    while :; do
+        cabecalho_passo 2 "SUPABASE"
+        texto "Abra o seu projeto no ${branco}Supabase${reset} e vá em ${branco}Project Settings → API${reset}."
+        dica "(ou clique no botão Connect, no topo da tela do projeto)"
+        echo ""
+        [ "$sub" -gt 0 ] && feito "Project URL" "$SUPABASE_URL"
+        [ "$sub" -gt 1 ] && feito "Chave anon public" "$(resumir_chave "$SUPABASE_ANON_KEY")"
+        [ "$sub" -gt 0 ] && echo ""
+        case "$sub" in
+            0) supabase_pedir_url || return 1; sub=1 ;;
+            1) if supabase_pedir_anon; then sub=2; else sub=0; fi ;;
+            2)
+                if supabase_pedir_service; then
+                    feito "Chave service_role" "$(resumir_chave "$SUPABASE_SERVICE_ROLE_KEY")"
+                    echo ""
+                    ok "Supabase conectado!"
+                    sleep 1
+                    return 0
+                fi
+                sub=1
+                ;;
+        esac
+    done
+}
+
+## ---------------------------------------------------------------- Passo 3: tabelas
 tabelas_faltando() {
     local t codigo faltando=()
     for t in "${TABELAS_SQL[@]}"; do
@@ -692,41 +840,44 @@ tabelas_faltando() {
 }
 
 passo_sql() {
-    cabecalho_passo 4 $TOTAL_PASSOS "Tabelas do sistema"
-    info "Conferindo as tabelas no seu Supabase..."
+    cabecalho_passo 3 "TABELAS"
     local falta resp link ref
+    info "Conferindo as tabelas no seu Supabase..."
     falta="$(tabelas_faltando)"
     if [ -z "${falta// /}" ]; then
-        ok "Tabelas do sistema encontradas."
+        ok "Tabelas do sistema encontradas!"
         sleep 1
         return 0
     fi
     ref="$(ref_supabase)"
     link="${ref:+https://supabase.com/dashboard/project/$ref/sql/new}"
+    echo ""
+    texto "Falta criar as tabelas do sistema no seu Supabase. É rapidinho:"
+    echo ""
+    instrucao "1." "Abra o ${branco}SQL Editor${reset} do Supabase"
+    [ -n "$link" ] && echo -e "      ${verde}$link${reset}"
+    instrucao "2." "Abra o arquivo abaixo, copie tudo ${cinza}(Ctrl+A e Ctrl+C)${reset} e cole no SQL Editor"
+    echo -e "      ${verde}$SQL_URL${reset}"
+    instrucao "3." "Clique em ${branco}Run${reset} e espere aparecer ${branco}Success${reset}"
+    echo ""
     while :; do
-        echo ""
-        echo "As tabelas do sistema ainda não existem no seu Supabase. Para criar:"
-        echo -e "  1. Abra o ${branco}SQL Editor${reset} do Supabase${link:+: ${verde}$link${reset}}"
-        echo -e "  2. Abra este arquivo, copie tudo (Ctrl+A, Ctrl+C) e cole no SQL Editor:"
-        echo -e "     ${verde}$SQL_URL${reset}"
-        echo -e "  3. Clique em ${branco}Run${reset}"
-        echo -e "  4. Espere aparecer ${branco}Success${reset} e volte aqui"
-        echo ""
-        printf '%b' "Aperte ${branco}Enter${reset} depois de rodar o SQL (0 = voltar): "
+        printf '%b' "  ${ciano}➜${reset} Aperte ${branco}Enter${reset} depois de rodar o SQL ${cinza}(0 = voltar)${reset}: "
         ler resp
         [ "$(limpar "$resp")" = "0" ] && return 1
         info "Conferindo..."
         falta="$(tabelas_faltando)"
         if [ -z "${falta// /}" ]; then
-            ok "Tabelas criadas."
+            ok "Tabelas criadas!"
             sleep 1
             return 0
         fi
         falha "As tabelas ainda não foram encontradas."
-        echo -e "${cinza}Confira se rodou o SQL no projeto certo ($SUPABASE_URL) e se terminou com Success.${reset}"
+        dica "Confira se rodou o SQL no projeto certo ($SUPABASE_URL) e se terminou com Success."
+        echo ""
     done
 }
 
+## ---------------------------------------------------------------- Passo 4: licença
 ## Consulta o servidor de licenças do mesmo jeito que o sistema faz.
 ## Retorna 0 = liberada, 1 = recusada (motivo em LICENCA_MOTIVO), 2 = servidor indisponível
 consultar_licenca() {
@@ -749,9 +900,9 @@ consultar_licenca() {
 }
 
 passo_licenca() {
-    cabecalho_passo 5 $TOTAL_PASSOS "Licença"
-    echo "Informe o e-mail usado na compra do HubLabel."
-    echo -e "${amarelo}Atenção: cada licença vale para uma instalação.${reset}"
+    cabecalho_passo 4 "LICENÇA"
+    texto "Informe o e-mail usado na compra do HubLabel."
+    echo -e "  ${amarelo}⚠  Cada licença vale para uma instalação.${reset}"
     echo ""
     while :; do
         local e resp
@@ -762,25 +913,26 @@ passo_licenca() {
             continue
         fi
         LICENCA_EMAIL="$e"
-        info "Verificando a licença..."
         LICENCA_MOTIVO=""
+        info "Verificando a licença..."
         consultar_licenca
         case $? in
             0)
-                ok "Licença liberada."
+                ok "Licença liberada!"
                 sleep 1
                 return 0
                 ;;
             1)
                 falha "Licença não liberada: ${LICENCA_MOTIVO:-recusada}"
                 case "$LICENCA_MOTIVO" in
-                    *"sem licença"*) echo -e "${cinza}Confira se é exatamente o e-mail da compra. Se estiver certo, fale com o suporte.${reset}" ;;
-                    *) echo -e "${cinza}Fale com o suporte do HubLabel.${reset}" ;;
+                    *"sem licença"*) dica "Confira se é exatamente o e-mail da compra. Se estiver certo, fale com o suporte." ;;
+                    *) dica "Fale com o suporte do HubLabel." ;;
                 esac
+                echo ""
                 ;;
             2)
                 falha "Não consegui falar com o servidor de licenças agora."
-                printf '%b' "${branco}Enter${reset} = tentar de novo  |  ${branco}C${reset} = continuar sem verificar  |  ${branco}0${reset} = voltar: "
+                printf '%b' "  ${branco}Enter${reset} tentar de novo  ${cinza}•${reset}  ${branco}C${reset} continuar sem verificar  ${cinza}•${reset}  ${branco}0${reset} voltar: "
                 ler resp
                 resp="$(limpar "$resp")"
                 [ "$resp" = "0" ] && return 1
@@ -794,6 +946,7 @@ passo_licenca() {
     done
 }
 
+## ---------------------------------------------------------------- Passo 5: seu sistema
 ## Busca um usuário do sistema pelo e-mail → imprime o id (vazio se não existe)
 usuario_por_email() {
     local q
@@ -803,37 +956,46 @@ usuario_por_email() {
 }
 
 passo_acesso() {
-    cabecalho_passo 6 $TOTAL_PASSOS "Seu sistema"
-    echo "Qual nome você quer dar ao seu sistema? Ele aparece nas telas e na aba do navegador."
-    echo -e "${cinza}Você pode mudar depois no painel de administrador.${reset}"
-    echo ""
-    perguntar NOME_SISTEMA "Nome do sistema" "${NOME_SISTEMA:-}" || return 1
-    NOME_SISTEMA="$(printf '%s' "$NOME_SISTEMA" | tr -d "\"'\\\\<>\`\$")"
-
-    echo ""
-    echo "Qual e-mail vai ser o administrador do sistema (o dono)?"
-    echo -e "${cinza}A senha inicial será ${ADMIN_SENHA_PADRAO}. Troque depois de entrar.${reset}"
-    echo ""
+    local sub=0
     while :; do
-        local e
-        perguntar e "E-mail do administrador" "${ADMIN_EMAIL:-$LICENCA_EMAIL}" || return 1
-        e="${e,,}"
-        if ! [[ "$e" =~ ^[^@[:space:]\"\']+@[^@[:space:]\"\']+\.[^@[:space:]\"\']+$ ]]; then
-            falha "E-mail inválido."
+        cabecalho_passo 5 "SEU SISTEMA"
+        if [ "$sub" = 0 ]; then
+            texto "Qual nome você quer dar ao seu sistema?"
+            dica "Ele aparece nas telas e na aba do navegador. Dá para mudar depois no painel."
+            echo ""
+            perguntar NOME_SISTEMA "Nome do sistema" "${NOME_SISTEMA:-}" || return 1
+            NOME_SISTEMA="$(printf '%s' "$NOME_SISTEMA" | tr -d "\"'\\\\<>\`\$")"
+            sub=1
             continue
         fi
-        ADMIN_EMAIL="$e"
-        break
+        feito "Nome do sistema" "$NOME_SISTEMA"
+        echo ""
+        texto "Qual e-mail vai ser o ${branco}super administrador${reset} (o dono do sistema)?"
+        dica "A senha inicial será $ADMIN_SENHA_PADRAO. Troque depois de entrar."
+        echo ""
+        local e
+        while :; do
+            perguntar e "E-mail do administrador" "${ADMIN_EMAIL:-$LICENCA_EMAIL}" || { sub=0; continue 2; }
+            e="${e,,}"
+            if ! [[ "$e" =~ ^[^@[:space:]\"\']+@[^@[:space:]\"\']+\.[^@[:space:]\"\']+$ ]]; then
+                falha "E-mail inválido."
+                continue
+            fi
+            ADMIN_EMAIL="$e"
+            break
+        done
+        if [ -n "$(usuario_por_email "$ADMIN_EMAIL")" ]; then
+            ok "Esse e-mail já tem conta no sistema. A senha dele continua a mesma."
+            sleep 2
+        fi
+        return 0
     done
-    if [ -n "$(usuario_por_email "$ADMIN_EMAIL")" ]; then
-        ok "Esse e-mail já tem conta no sistema. A senha dele continua a mesma."
-        sleep 2
-    fi
 }
 
+## ---------------------------------------------------------------- Confirmação
 assistente() {
-    local passos=(passo_dominios passo_supabase_url passo_supabase_service passo_sql passo_licenca passo_acesso)
-    local i
+    local passos=(passo_dominios passo_supabase passo_sql passo_licenca passo_acesso)
+    local i r
     while :; do
         i=0
         while [ $i -lt ${#passos[@]} ]; do
@@ -845,22 +1007,25 @@ assistente() {
         done
 
         banner
-        echo -e "${branco}Confira os dados:${reset}"
+        trilha $((TOTAL_PASSOS + 1))
         echo ""
-        echo -e "${amarelo}SISTEMA${reset}        https://$APP_HOST"
-        echo -e "${amarelo}WHATSAPP${reset}       https://$EVO_HOST"
-        echo -e "${amarelo}ARQUIVOS${reset}       https://$S3_HOST"
-        echo -e "${amarelo}SUPABASE${reset}       $SUPABASE_URL"
-        echo -e "${amarelo}LICENÇA${reset}        $LICENCA_EMAIL"
-        echo -e "${amarelo}NOME${reset}           $NOME_SISTEMA"
-        echo -e "${amarelo}ADMINISTRADOR${reset}  $ADMIN_EMAIL"
+        titulo_caixa "CONFIRA OS DADOS" "$verde"
         echo ""
-        echo -e "${amarelo}====================================================================================${reset}"
-        local r
-        sim_nao "Está tudo certo? S = instalar  |  N = corrigir" S
+        abrir_bloco "ENDEREÇOS" "$azul"
+        item "Sistema" "https://$APP_HOST"
+        item "WhatsApp" "https://$EVO_HOST"
+        item "Arquivos" "https://$S3_HOST"
+        fechar_bloco
+        abrir_bloco "SEU SISTEMA" "$roxo"
+        item "Nome" "$NOME_SISTEMA"
+        item "Administrador" "$ADMIN_EMAIL"
+        item "Licença" "$LICENCA_EMAIL"
+        item "Supabase" "$SUPABASE_URL"
+        fechar_bloco
+        sim_nao "Está tudo certo? S = instalar  •  N = corrigir" S
         r=$?
         [ $r = 0 ] && return 0
-        echo -e "${cinza}Vamos refazer. Aperte Enter nas respostas que já estão certas.${reset}"
+        dica "Vamos refazer. Aperte Enter nas respostas que já estão certas."
         sleep 2
     done
 }
@@ -877,7 +1042,6 @@ verificacoes_iniciais() {
     }
     if ! command -v python3 >/dev/null 2>&1; then
         command -v apt-get >/dev/null 2>&1 || erro "Instale o python3 e rode de novo."
-        info "Instalando dependências..."
         apt-get update -qq && apt-get install -y -qq python3 >/dev/null
     fi
     local ram
@@ -888,20 +1052,25 @@ verificacoes_iniciais() {
     fi
 }
 
+instalar_docker_agora() {
+    apt-get update -qq || return 1
+    timedatectl set-timezone America/Sao_Paulo 2>/dev/null || true
+    curl -fsSL https://get.docker.com | sh
+}
+
+instalar_compose_agora() {
+    apt-get update -qq || return 1
+    apt-get install -y -qq docker-compose-plugin || apt-get install -y -qq docker-compose-v2
+}
+
 instalar_docker() {
     if ! command -v docker >/dev/null 2>&1; then
-        info "Preparando a VPS (pode levar alguns minutos)..."
         command -v apt-get >/dev/null 2>&1 || erro "Não encontrei o apt-get. Instale o Docker e rode de novo."
-        apt-get update -qq
-        timedatectl set-timezone America/Sao_Paulo 2>/dev/null || true
-        curl -fsSL https://get.docker.com | sh >/dev/null 2>&1 || erro "Não consegui instalar o Docker."
+        girar "Preparando a VPS (pode levar alguns minutos)" instalar_docker_agora || erro "Não consegui preparar a VPS (instalação do Docker)."
     fi
     systemctl enable --now docker >/dev/null 2>&1 || true
     if [ "$MODO_DEPLOY" = compose ] && ! docker compose version >/dev/null 2>&1; then
-        info "Preparando a VPS..."
-        apt-get update -qq
-        apt-get install -y -qq docker-compose-plugin >/dev/null 2>&1 || apt-get install -y -qq docker-compose-v2 >/dev/null 2>&1 \
-            || erro "Não consegui instalar o Docker Compose."
+        girar "Instalando componentes" instalar_compose_agora || erro "Não consegui instalar o Docker Compose."
     fi
     docker info >/dev/null 2>&1 || erro "O Docker não está rodando."
 }
@@ -1299,62 +1468,57 @@ container_de() {
     fi
 }
 
+baixar_imagens_stack() {
+    local img
+    for img in "$IMG_APP" "$IMG_REDIS" "$IMG_EVOLUTION" "$IMG_POSTGRES" "$IMG_MINIO"; do
+        docker pull -q "$img" || true
+    done
+}
+
 subir() {
-    info "Baixando o sistema (pode levar alguns minutos)..."
     cd "$DIR" || erro "Pasta $DIR não encontrada."
     if [ "$MODO_DEPLOY" = stack ]; then
-        local img
-        for img in "$IMG_APP" "$IMG_REDIS" "$IMG_EVOLUTION" "$IMG_POSTGRES" "$IMG_MINIO"; do
-            docker pull -q "$img" >/dev/null 2>&1 || aviso "Não consegui baixar $img agora (o Docker tenta de novo sozinho)."
-        done
-        info "Iniciando..."
-        docker stack deploy --prune --resolve-image always -c "$PROJETO.yml" "$PROJETO" >/dev/null \
-            || erro "Falha no docker stack deploy. Arquivo: $DIR/$PROJETO.yml"
+        girar "Baixando o sistema (pode levar alguns minutos)" baixar_imagens_stack
+        girar "Iniciando os serviços" docker stack deploy --prune --resolve-image always -c "$PROJETO.yml" "$PROJETO" \
+            || { tail -5 "$TMP/ultimo.log"; erro "Falha ao iniciar. Arquivo: $DIR/$PROJETO.yml"; }
     else
-        docker compose -f "$PROJETO.yml" pull -q || erro "Não consegui baixar as imagens. Confira a internet da VPS."
-        info "Iniciando..."
-        docker compose -f "$PROJETO.yml" up -d --remove-orphans || erro "Falha ao subir os serviços. Arquivo: $DIR/$PROJETO.yml"
+        girar "Baixando o sistema (pode levar alguns minutos)" docker compose -f "$PROJETO.yml" pull -q \
+            || { tail -5 "$TMP/ultimo.log"; erro "Não consegui baixar o sistema. Confira a internet da VPS."; }
+        girar "Iniciando os serviços" docker compose -f "$PROJETO.yml" up -d --remove-orphans \
+            || { tail -5 "$TMP/ultimo.log"; erro "Falha ao iniciar. Arquivo: $DIR/$PROJETO.yml"; }
     fi
+}
 
+minio_pronto() {
+    local cid
+    cid="$(container_de hublabel-minio)"
+    [ -n "$cid" ] && docker exec "$cid" mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
 }
 
 configurar_minio() {
-    info "Preparando o armazenamento de arquivos..."
-    local cid="" i
-    for i in $(seq 1 60); do
-        cid="$(container_de hublabel-minio)"
-        if [ -n "$cid" ] && docker exec "$cid" mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; then
-            break
-        fi
-        cid=""
-        sleep 3
-    done
-    [ -n "$cid" ] || { falha "O MinIO não respondeu. As mídias não vão funcionar até isso ser resolvido."; return 1; }
-
+    esperar "Preparando o armazenamento de arquivos" 180 minio_pronto \
+        || { falha "O armazenamento não respondeu. As mídias não vão funcionar até isso ser resolvido."; return 1; }
+    local cid
+    cid="$(container_de hublabel-minio)"
     docker exec "$cid" mc mb -p "local/$S3_BUCKET" >/dev/null 2>&1
     docker exec "$cid" mc anonymous set download "local/$S3_BUCKET" >/dev/null 2>&1 \
         || aviso "Não consegui deixar o bucket com leitura pública."
     docker exec "$cid" mc admin user add local "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1 \
-        || { falha "Não consegui criar a chave de acesso do S3."; return 1; }
+        || { falha "Não consegui criar a chave de acesso dos arquivos."; return 1; }
     docker exec "$cid" mc admin policy attach local readwrite --user "$S3_ACCESS_KEY" >/dev/null 2>&1 \
         || docker exec "$cid" mc admin policy set local readwrite "user=$S3_ACCESS_KEY" >/dev/null 2>&1 || true
-    ok "Armazenamento de arquivos pronto."
+}
+
+sistema_respondendo() {
+    local cid estado
+    cid="$(container_de hublabel-app)"
+    [ -n "$cid" ] || return 1
+    estado="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null)"
+    [ "$estado" = healthy ] || docker exec "$cid" wget -qO- http://127.0.0.1:3090/health
 }
 
 aguardar_sistema() {
-    info "Aguardando o sistema ficar pronto (até 5 minutos)..."
-    local i cid estado
-    for i in $(seq 1 100); do
-        cid="$(container_de hublabel-app)"
-        if [ -n "$cid" ]; then
-            estado="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null)"
-            if [ "$estado" = healthy ] || docker exec "$cid" wget -qO- http://127.0.0.1:3090/health >/dev/null 2>&1; then
-                ok "Sistema no ar."
-                return 0
-            fi
-        fi
-        sleep 3
-    done
+    esperar "Ligando o sistema (até 5 minutos)" 300 sistema_respondendo && return 0
     echo ""
     falha "O sistema não respondeu. Últimas linhas do log:"
     if [ "$MODO_DEPLOY" = stack ]; then
@@ -1368,23 +1532,21 @@ aguardar_sistema() {
     return 1
 }
 
+https_respondendo() {
+    [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$APP_HOST:443:127.0.0.1" "https://$APP_HOST/health")" = 200 ]
+}
+
 verificar_https() {
     [ "$MODO_ROTA" = manual ] && return 0
-    info "Conferindo o acesso em https://$APP_HOST ..."
-    local i codigo
-    for i in $(seq 1 20); do
-        codigo="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "$APP_HOST:443:127.0.0.1" "https://$APP_HOST/health")"
-        [ "$codigo" = "200" ] && { ok "Acesso funcionando."; return 0; }
-        sleep 6
-    done
-    aviso "O endereço https://$APP_HOST ainda não abriu."
-    aviso "Confira o apontamento do domínio. O cadeado (HTTPS) pode levar alguns minutos para sair."
+    esperar "Liberando o acesso em https://$APP_HOST" 150 https_respondendo && return 0
+    aviso "O endereço ainda não abriu. Confira o apontamento do domínio."
+    aviso "O cadeado (HTTPS) pode levar alguns minutos para sair."
     return 1
 }
 
 ## Cria o administrador (super admin, plano Ilimitado) e grava o nome do sistema.
 configurar_sistema() {
-    info "Criando seu acesso de administrador..."
+    printf '\r  %b%s%b Criando o super administrador' "$ciano" "${QUADROS[0]}" "$reset"
     ADMIN_SENHA="$ADMIN_SENHA_PADRAO" NOME_SISTEMA="${NOME_SISTEMA:-}" ADMIN_EMAIL="${ADMIN_EMAIL:-}" \
     SB_URL="$SUPABASE_URL" SB_KEY="$SUPABASE_SERVICE_ROLE_KEY" python3 -I - >"$TMP/admin" 2>&1 <<'PYEOF'
 import json, os, time, urllib.error, urllib.parse, urllib.request
@@ -1464,15 +1626,16 @@ if nome_sistema:
                     {"Prefer": "resolution=merge-duplicates,return=minimal"})
     print("OK_NOME" if 0 < cod < 300 else f"ERRO_NOME {r}")
 PYEOF
+    printf '\r\e[K'
     ADMIN_CRIADO="$(sed -n 's/^OK_ADMIN //p' "$TMP/admin" | head -1)"
     if [ -n "$ADMIN_CRIADO" ]; then
-        ok "Super administrador pronto: $ADMIN_EMAIL"
+        ok "Super administrador criado"
     elif [ -n "${ADMIN_EMAIL:-}" ]; then
         falha "Não consegui criar o administrador: $(sed -n 's/^ERRO_ADMIN //p' "$TMP/admin" | head -1)"
-        echo -e "${cinza}Rode o setup de novo e escolha \"Refazer a configuração\" para tentar outra vez.${reset}"
+        dica "Rode o setup de novo e escolha \"Refazer a configuração\" para tentar outra vez."
     fi
     if grep -q '^OK_NOME' "$TMP/admin"; then
-        ok "Nome do sistema: $NOME_SISTEMA"
+        ok "Nome do sistema aplicado"
     elif [ -n "${NOME_SISTEMA:-}" ]; then
         aviso "Não consegui gravar o nome do sistema. Ajuste depois no painel de administrador."
     fi
@@ -1484,57 +1647,64 @@ PYEOF
 
 resumo_final() {
     banner
-    echo -e "${verde}====================================================================================${reset}"
-    echo -e "${verde}                        INSTALAÇÃO CONCLUÍDA!${reset}"
-    echo -e "${verde}====================================================================================${reset}"
+    titulo_caixa "🎉  INSTALAÇÃO CONCLUÍDA!" "$verde"
     echo ""
-    echo -e "${amarelo}SISTEMA${reset}"
-    echo "  Acesso:             https://$APP_HOST${BACK_PATH:-}/login"
-    echo "  Webhook Meta:       https://$APP_HOST${BACK_PATH:-}/eventsmeta"
-    echo "  Webhook Evolution:  https://$APP_HOST${BACK_PATH:-}/agente-no-whatsapp"
-    echo "  Senha padrão:       $SENHA_PADRAO_INTEGRACAO  (usuários criados por integração)"
-    echo ""
+    abrir_bloco "ACESSE SEU SISTEMA" "$verde"
+    item "Endereço" "https://$APP_HOST${BACK_PATH:-}/login"
     if [ -n "${ADMIN_EMAIL:-}" ]; then
-        echo -e "${amarelo}SUPER ADMINISTRADOR${reset}"
-        echo "  E-mail:  $ADMIN_EMAIL"
+        item "E-mail" "$ADMIN_EMAIL"
         if [ "${ADMIN_CRIADO:-}" = novo ]; then
-            echo "  Senha:   $ADMIN_SENHA_PADRAO  (troque depois de entrar)"
+            item "Senha" "$ADMIN_SENHA_PADRAO  (troque depois de entrar)"
         else
-            echo "  Senha:   a mesma que você já usa nesse e-mail"
+            item "Senha" "a mesma que você já usa nesse e-mail"
         fi
-        echo ""
+        item "Perfil" "Super administrador"
     fi
-    echo -e "${amarelo}WHATSAPP (EVOLUTION API)${reset}"
-    echo "  URL:      https://$EVO_HOST"
-    echo "  Manager:  https://$EVO_HOST/manager"
-    echo "  API Key:  $EVOLUTION_API_KEY"
-    echo ""
-    echo -e "${amarelo}ARQUIVOS (S3)${reset}"
-    echo "  URL:         https://$S3_HOST"
-    echo "  Bucket:      $S3_BUCKET  (https://$S3_HOST/$S3_BUCKET)"
-    echo "  Access Key:  $S3_ACCESS_KEY"
-    echo "  Secret Key:  $S3_SECRET_KEY"
-    echo ""
-    echo -e "${amarelo}SUPABASE${reset}"
-    echo "  $SUPABASE_URL"
-    echo ""
+    fechar_bloco
+    abrir_bloco "WEBHOOKS" "$azul"
+    item "Meta" "https://$APP_HOST${BACK_PATH:-}/eventsmeta"
+    item "Evolution" "https://$APP_HOST${BACK_PATH:-}/agente-no-whatsapp"
+    item "Senha padrão" "$SENHA_PADRAO_INTEGRACAO  (usuários criados por integração)"
+    fechar_bloco
+    abrir_bloco "WHATSAPP (EVOLUTION API)" "$roxo"
+    item "Endereço" "https://$EVO_HOST"
+    item "Manager" "https://$EVO_HOST/manager"
+    item "API Key" "$EVOLUTION_API_KEY"
+    fechar_bloco
+    abrir_bloco "ARQUIVOS (S3)" "$roxo"
+    item "Endereço" "https://$S3_HOST"
+    item "Bucket" "$S3_BUCKET  (https://$S3_HOST/$S3_BUCKET)"
+    item "Access Key" "$S3_ACCESS_KEY"
+    item "Secret Key" "$S3_SECRET_KEY"
+    fechar_bloco
+    abrir_bloco "SUPABASE" "$cinza"
+    item "Projeto" "$SUPABASE_URL"
+    fechar_bloco
     if [ "$MODO_ROTA" = manual ]; then
-        echo -e "${amarelo}FALTA UM PASSO: CADASTRAR OS DOMÍNIOS NO SEU PAINEL (com HTTPS)${reset}"
-        echo "  https://$APP_HOST  →  http://127.0.0.1:$PORTA_APP"
-        echo "  https://$EVO_HOST  →  http://127.0.0.1:$PORTA_EVO"
-        echo "  https://$S3_HOST  →  http://127.0.0.1:$PORTA_S3"
-        echo ""
+        abrir_bloco "FALTA UM PASSO: CADASTRE OS DOMÍNIOS NO SEU PAINEL (COM HTTPS)" "$amarelo"
+        item "$APP_HOST" "→ http://127.0.0.1:$PORTA_APP"
+        item "$EVO_HOST" "→ http://127.0.0.1:$PORTA_EVO"
+        item "$S3_HOST" "→ http://127.0.0.1:$PORTA_S3"
+        fechar_bloco
     fi
-    echo -e "${amarelo}PARA ATUALIZAR${reset}"
-    echo "  Rode o mesmo comando de instalação de novo e escolha \"Atualizar\"."
-    echo ""
-    echo -e "${cinza}Anote estes dados em um lugar seguro.${reset}"
+    dica "Para atualizar: rode o mesmo comando de instalação e escolha \"Atualizar\"."
+    echo -e "  ${amarelo}Anote estes dados em um lugar seguro.${reset}"
     echo ""
 }
 
 ## ============================================================================
 ## FLUXOS
 ## ============================================================================
+
+## Título da fase de instalação
+cabecalho_instalacao() {
+    banner
+    trilha $((TOTAL_PASSOS + 1))
+    echo ""
+    titulo_caixa "INSTALANDO SEU SISTEMA" "$roxo"
+    dica "Pode levar alguns minutos. Não feche esta janela."
+    echo ""
+}
 
 instalar() {
     gerar_segredos
@@ -1551,27 +1721,32 @@ instalar() {
 menu_instalacao_existente() {
     carregar_config
     banner
-    echo -e "${branco}Já existe uma instalação do HubLabel nesta VPS${reset} (https://${APP_HOST:-?})."
+    titulo_caixa "JÁ EXISTE UMA INSTALAÇÃO NESTA VPS"
+    dica "https://${APP_HOST:-?}"
     echo ""
-    echo "  1) Atualizar para a versão mais nova (mantém tudo como está)"
-    echo "  2) Refazer a configuração (Enter mantém cada resposta atual)"
-    echo "  3) Sair"
+    echo -e "  ${ciano}${negrito}1${reset}  Atualizar para a versão mais nova ${cinza}(mantém tudo como está)${reset}"
+    echo -e "  ${ciano}${negrito}2${reset}  Refazer a configuração ${cinza}(Enter mantém cada resposta atual)${reset}"
+    echo -e "  ${ciano}${negrito}3${reset}  Sair"
     echo ""
     local op
     perguntar op "Escolha" "1" || op=3
     case "$op" in
         1)
+            banner
+            titulo_caixa "ATUALIZANDO SEU SISTEMA" "$roxo"
+            echo ""
             gerar_arquivo_deploy
             subir
             configurar_minio
             aguardar_sistema
             echo ""
-            ok "Atualização concluída."
+            ok "${negrito}Atualização concluída!${reset}"
             exit 0
             ;;
         2)
             BACK_PATH=""
             assistente
+            cabecalho_instalacao
             instalar
             exit 0
             ;;
@@ -1587,6 +1762,10 @@ main() {
     fi
 
     banner
+    titulo_caixa "BEM-VINDO! VAMOS INSTALAR O SEU SISTEMA"
+    echo ""
+    texto "São ${negrito}$TOTAL_PASSOS passos${reset} rápidos. Tenha em mãos o painel do seu domínio e o Supabase."
+    echo ""
     info "Analisando a VPS..."
     detectar_ambiente
     descrever_ambiente
@@ -1594,7 +1773,7 @@ main() {
 
     BACK_PATH=""
     assistente
-    banner
+    cabecalho_instalacao
     instalar_docker
     instalar
 }
