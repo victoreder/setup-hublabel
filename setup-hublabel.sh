@@ -9,6 +9,8 @@
 ##   - VPS zerada ............... Docker + Caddy (HTTPS automático)
 ##   - Traefik (Portainer, EasyPanel, Coolify, Dokploy...) ... usa o Traefik que já existe
 ##   - Outro proxy (nginx...) ... sobe sem proxy e mostra o que apontar
+##   - Versão antiga (v1.8: N8N no app.* + Disparador) ... oferece trocar pela nova:
+##     remove o N8N e o Disparador, mantém a Evolution e o MinIO e usa os dados deles
 ##
 ## COMANDO (como root):
 ##   bash <(curl -sSL https://raw.githubusercontent.com/victoreder/setup-hublabel/main/setup-hublabel.sh)
@@ -532,8 +534,8 @@ detectar_ambiente() {
     command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 && tem_docker=1
 
     if [ "$tem_docker" = 1 ]; then
-        ## Instalação antiga do HubLabel (v1.8 com N8N)
-        docker service ls --format '{{.Name}}' 2>/dev/null | grep -Eq '^(disparador_disparador-inbound|n8n_n8n_editor)$' && HUBLABEL_V18=1
+        ## Instalação antiga do HubLabel (v1.8: N8N no app.* e Disparador)
+        detectar_versao_antiga && HUBLABEL_V18=1
 
         ## Traefik rodando como serviço do Swarm?
         alvo="$(docker service ls --format '{{.Name}} {{.Image}}' 2>/dev/null | awk 'tolower($2) ~ /traefik/ {print $1; exit}')"
@@ -592,9 +594,276 @@ detectar_ambiente() {
 
 descrever_ambiente() {
     ok "Ambiente detectado: ${negrito}$PAINEL${reset}"
-    if [ "$HUBLABEL_V18" = 1 ]; then
-        aviso "Esta VPS já tem o HubLabel antigo. Use subdomínios e um Supabase diferentes dos atuais."
+}
+
+## ============================================================================
+## VERSÃO ANTIGA (v1.8: N8N + Disparador, com Evolution e MinIO em stacks)
+## ============================================================================
+## A migração remove o N8N (que atende o app.*) e o Disparador antigo e instala
+## o sistema novo no lugar. A Evolution e o MinIO antigos continuam rodando e o
+## sistema novo passa a usar os dois (WhatsApps conectados e arquivos ficam).
+
+MIGRACAO=0
+APP_HOST_ANTIGO=""; EVO_HOST_ANTIGO=""; S3_HOST_ANTIGO=""
+ANTIGO_N8N=(); ANTIGO_DISPARADOR=(); ANTIGO_CONTAINERS=()
+REMOVER_STACKS=(); REMOVER_SERVICOS=()
+EVO_EXTERNA=0; S3_EXTERNO=0; EVO_SERVICO_EXT=""; MINIO_SERVICO_EXT=""
+
+## Variável de ambiente de um serviço do Swarm ou container: env_de service|container NOME VAR
+env_de() {
+    local f
+    if [ "$1" = service ]; then
+        f='{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}'
+    else
+        f='{{range .Config.Env}}{{println .}}{{end}}'
     fi
+    docker "$1" inspect -f "$f" "$2" 2>/dev/null </dev/null | sed -n "s/^$3=//p" | head -1 | tr -d '\r'
+}
+
+## Só o host de uma URL: "https://App.x.com.br/webhook" → "app.x.com.br"
+host_de_url() {
+    local h="${1#*://}"
+    h="${h%%/*}"; h="${h%%:*}"
+    printf '%s' "${h,,}"
+}
+
+## Stack (namespace) de um serviço do Swarm
+ns_de() { docker service inspect -f '{{index .Spec.Labels "com.docker.stack.namespace"}}' "$1" 2>/dev/null </dev/null; }
+
+## Hosts que um serviço atende: regras Host(`...`) do Traefik e URLs do N8N
+hosts_do_servico() {
+    local v
+    {
+        docker service inspect -f '{{range $k, $v := .Spec.Labels}}{{println $v}}{{end}}' "$1" 2>/dev/null </dev/null \
+            | grep -o 'Host(`[^`]*`)' | sed 's/^Host(`//; s/`)$//'
+        for v in WEBHOOK_URL N8N_HOST N8N_EDITOR_BASE_URL; do
+            v="$(env_de service "$1" "$v")"
+            [ -n "$v" ] && echo "$(host_de_url "$v")"
+        done
+    } | tr 'A-Z' 'a-z' | awk 'NF && !visto[$0]++'
+}
+
+## Preenche VAR com o valor (só se VAR ainda estiver vazia)
+preencher() { [ -z "${!1:-}" ] && [ -n "$2" ] && printf -v "$1" '%s' "$2"; return 0; }
+
+## Procura o N8N do app.* e o Disparador antigo e lê o que der da instalação.
+## Retorna 0 se encontrou a versão antiga.
+detectar_versao_antiga() {
+    ANTIGO_N8N=(); ANTIGO_DISPARADOR=(); ANTIGO_CONTAINERS=()
+    EVO_SERVICO_EXT=""; MINIO_SERVICO_EXT=""
+    local nome img ns h v app="" candidatos_n8n=() proj svc tipo
+
+    docker service ls --format '{{.Name}} {{.Image}}' 2>/dev/null >"$TMP/servicos"
+    while read -r nome img; do
+        [ -n "$nome" ] || continue
+        ns="$(ns_de "$nome")"
+        [ "$ns" = "$PROJETO" ] && continue
+        case "${img,,}" in
+            *hublabel-disparador*) ANTIGO_DISPARADOR+=("$nome") ;;
+            *evolution-api*) [ -z "$EVO_SERVICO_EXT" ] && EVO_SERVICO_EXT="$nome" ;;
+            *minio*) [ -z "$MINIO_SERVICO_EXT" ] && MINIO_SERVICO_EXT="$nome" ;;
+            *n8n*) candidatos_n8n+=("$nome") ;;
+        esac
+    done <"$TMP/servicos"
+
+    ## Disparador rodando como container comum (fora do Swarm)
+    docker ps -a --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.swarm.service.name"}}' \
+        2>/dev/null >"$TMP/containers"
+    while IFS='|' read -r nome img proj svc; do
+        [ -n "$nome" ] && [ -z "$svc" ] && [ "$proj" != "$PROJETO" ] || continue
+        [[ "${img,,}" == *hublabel-disparador* ]] && ANTIGO_CONTAINERS+=("$nome")
+    done <"$TMP/containers"
+
+    ## Dados do Disparador antigo (Supabase, endereços e chaves)
+    for nome in "${ANTIGO_DISPARADOR[@]}" "${ANTIGO_CONTAINERS[@]}"; do
+        [[ " ${ANTIGO_DISPARADOR[*]} " == *" $nome "* ]] && tipo=service || tipo=container
+        v="$(env_de "$tipo" "$nome" BACK_URL)"
+        [ -n "$v" ] && [ -z "$app" ] && app="$(host_de_url "$v")"
+        preencher SUPABASE_URL "$(env_de "$tipo" "$nome" SUPABASE_URL)"
+        preencher SUPABASE_SERVICE_ROLE_KEY "$(env_de "$tipo" "$nome" SUPABASE_SERVICE_ROLE_KEY)"
+        preencher SUPABASE_ANON_KEY "$(env_de "$tipo" "$nome" SUPABASE_ANON_KEY)"
+        preencher LICENCA_EMAIL "$(env_de "$tipo" "$nome" LICENCA_EMAIL)"
+        v="$(env_de "$tipo" "$nome" EVOLUTION_BASE_URL)"; preencher EVO_HOST_ANTIGO "${v:+$(host_de_url "$v")}"
+        preencher EVOLUTION_API_KEY "$(env_de "$tipo" "$nome" EVOLUTION_API_KEY)"
+        v="$(env_de "$tipo" "$nome" S3_PUBLIC_BASE_URL)"; preencher S3_HOST_ANTIGO "${v:+$(host_de_url "$v")}"
+        preencher S3_ACCESS_KEY "$(env_de "$tipo" "$nome" S3_ACCESS_KEY_ID)"
+        preencher S3_SECRET_KEY "$(env_de "$tipo" "$nome" S3_SECRET_ACCESS_KEY)"
+    done
+
+    ## N8N que atende o endereço do sistema (app.*). Outro N8N do cliente fica intocado.
+    for nome in "${candidatos_n8n[@]}"; do
+        while read -r h; do
+            if { [ -n "$app" ] && [ "$h" = "$app" ]; } || { [ -z "$app" ] && [[ "$h" == app.* ]]; }; then
+                ANTIGO_N8N+=("$nome")
+                [ -z "$app" ] && app="$h"
+                break
+            fi
+        done < <(hosts_do_servico "$nome")
+    done
+
+    [ ${#ANTIGO_N8N[@]} -gt 0 ] || [ ${#ANTIGO_DISPARADOR[@]} -gt 0 ] || [ ${#ANTIGO_CONTAINERS[@]} -gt 0 ] || return 1
+
+    APP_HOST_ANTIGO="$app"
+    SUPABASE_URL="${SUPABASE_URL:+$(normalizar_supabase_url "$SUPABASE_URL")}"
+
+    ## Evolution antiga: continua rodando e o sistema novo usa ela
+    if [ -n "$EVO_SERVICO_EXT" ]; then
+        v="$(env_de service "$EVO_SERVICO_EXT" SERVER_URL)"
+        [ -n "$v" ] && EVO_HOST_ANTIGO="$(host_de_url "$v")"
+        v="$(env_de service "$EVO_SERVICO_EXT" AUTHENTICATION_API_KEY)"
+        [ -n "$v" ] && EVOLUTION_API_KEY="$v"
+        [ -n "${EVO_HOST_ANTIGO:-}" ] && EVO_EXTERNA=1
+    fi
+
+    ## MinIO antigo: continua rodando (mesmo bucket, links das mídias continuam valendo)
+    if [ -n "$MINIO_SERVICO_EXT" ]; then
+        v="$(env_de service "$MINIO_SERVICO_EXT" MINIO_SERVER_URL)"
+        [ -n "$v" ] && S3_HOST_ANTIGO="$(host_de_url "$v")"
+        MINIO_ROOT_USER="$(env_de service "$MINIO_SERVICO_EXT" MINIO_ROOT_USER)"
+        MINIO_ROOT_PASSWORD="$(env_de service "$MINIO_SERVICO_EXT" MINIO_ROOT_PASSWORD)"
+        if [ -f /root/dados_vps/dados_minio ]; then
+            preencher S3_ACCESS_KEY "$(sed -n 's/^Access Key: *//p' /root/dados_vps/dados_minio | head -1 | tr -d '\r')"
+            preencher S3_SECRET_KEY "$(sed -n 's/^Secret Key: *//p' /root/dados_vps/dados_minio | head -1 | tr -d '\r')"
+        fi
+        [ -n "${S3_HOST_ANTIGO:-}" ] && S3_EXTERNO=1
+    fi
+    ## Chave pela metade não serve: o setup cria uma nova no MinIO
+    if [ -z "${S3_ACCESS_KEY:-}" ] || [ -z "${S3_SECRET_KEY:-}" ]; then S3_ACCESS_KEY=""; S3_SECRET_KEY=""; fi
+
+    ## Endereços já conhecidos viram as respostas padrão do passo 1
+    if [ -n "$app" ]; then
+        APP_HOST="$app"
+        DOMINIO_BASE="${app#*.}"
+        SUB_APP="${app%%.*}"
+        EVO_HOST="${EVO_HOST_ANTIGO:-wpp.$DOMINIO_BASE}"
+        S3_HOST="${S3_HOST_ANTIGO:-s3.$DOMINIO_BASE}"
+        SUB_EVO="${EVO_HOST%%.*}"
+        SUB_S3="${S3_HOST%%.*}"
+    fi
+    return 0
+}
+
+## Tela de aviso: "Você tem a versão antiga do sistema. Deseja instalar a nova?"
+oferecer_migracao() {
+    banner
+    titulo_caixa "VOCÊ TEM A VERSÃO ANTIGA DO SISTEMA" "$amarelo"
+    echo ""
+    abrir_bloco "ENCONTREI NESTA VPS" "$amarelo"
+    [ ${#ANTIGO_N8N[@]} -gt 0 ] && item "N8N" "${APP_HOST_ANTIGO:-?}  (${ANTIGO_N8N[*]})"
+    [ ${#ANTIGO_DISPARADOR[@]} -gt 0 ] && item "Disparador" "${ANTIGO_DISPARADOR[*]}"
+    [ ${#ANTIGO_CONTAINERS[@]} -gt 0 ] && item "Disparador" "${ANTIGO_CONTAINERS[*]}"
+    [ "$EVO_EXTERNA" = 1 ] && item "WhatsApp" "$EVO_HOST_ANTIGO  (Evolution)"
+    [ "$S3_EXTERNO" = 1 ] && item "Arquivos" "$S3_HOST_ANTIGO  (MinIO)"
+    fechar_bloco
+    abrir_bloco "O QUE A NOVA VERSÃO FAZ" "$azul"
+    item "Remove" "o N8N e o Disparador antigo"
+    item "Instala" "o novo HubLabel em ${APP_HOST_ANTIGO:-app.seudominio}"
+    local mantem=""
+    [ "$EVO_EXTERNA" = 1 ] && mantem+="Evolution (WhatsApps conectados), "
+    [ "$S3_EXTERNO" = 1 ] && mantem+="MinIO (arquivos), "
+    item "Mantém" "${mantem}Portainer e o seu Supabase"
+    fechar_bloco
+    aviso "Os fluxos do N8N deixam de existir. Exporte antes o que quiser guardar."
+    echo ""
+    sim_nao "Deseja instalar a nova versão?" S
+    if [ $? != 0 ]; then
+        echo ""
+        info "Tudo bem, nada foi alterado na VPS."
+        exit 0
+    fi
+    MIGRACAO=1
+    BACK_PATH="/webhook"
+    if [ "$EVO_EXTERNA" = 1 ] && [ -z "${EVOLUTION_API_KEY:-}" ]; then
+        echo ""
+        texto "Não encontrei a API Key global da Evolution atual."
+        perguntar EVOLUTION_API_KEY "API Key da Evolution" || exit 0
+    fi
+}
+
+## Monta a lista do que remover: a stack inteira só quando ela tem apenas N8N, Redis e Disparador
+planejar_remocao() {
+    REMOVER_STACKS=(); REMOVER_SERVICOS=()
+    local s ns outros
+    for s in "${ANTIGO_N8N[@]}" "${ANTIGO_DISPARADOR[@]}"; do
+        ns="$(ns_de "$s")"
+        if [ -n "$ns" ]; then
+            outros="$(docker service ls --filter "label=com.docker.stack.namespace=$ns" --format '{{.Image}}' 2>/dev/null \
+                | grep -viE 'n8n|redis|hublabel-disparador')"
+            if [ -z "$outros" ]; then
+                [[ " ${REMOVER_STACKS[*]} " == *" $ns "* ]] || REMOVER_STACKS+=("$ns")
+                continue
+            fi
+        fi
+        REMOVER_SERVICOS+=("$s")
+    done
+}
+
+## Apaga as stacks também no Portainer (senão elas ficam lá e podem ser publicadas de novo)
+remover_stacks_portainer() {
+    [ -f /root/dados_vps/dados_portainer ] || return 0
+    python3 -I - "$@" <<'PYEOF'
+import json, re, ssl, sys, urllib.request
+
+txt = open("/root/dados_vps/dados_portainer", errors="ignore").read()
+
+def campo(nome):
+    m = re.search(rf"^{nome}:[ \t]*(.*)$", txt, re.M)
+    return m.group(1).strip() if m else ""
+
+host = re.sub(r"^https?://", "", campo("Dominio do portainer")).split("/")[0]
+usuario, senha = campo("Usuario"), campo("Senha")
+if not (host and usuario and senha):
+    sys.exit(0)
+ctx = ssl._create_unverified_context()
+
+def chamar(base, host_hdr, metodo, caminho, corpo=None, token=None):
+    h = {"Content-Type": "application/json"}
+    if host_hdr:
+        h["Host"] = host_hdr
+    if token:
+        h["Authorization"] = "Bearer " + token
+    dados = json.dumps(corpo).encode() if corpo is not None else None
+    req = urllib.request.Request(base + caminho, data=dados, method=metodo, headers=h)
+    with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
+        return json.loads(r.read().decode() or "null")
+
+for base, host_hdr in (("https://127.0.0.1", host), ("https://" + host, None)):
+    try:
+        token = chamar(base, host_hdr, "POST", "/api/auth", {"username": usuario, "password": senha})["jwt"]
+        pilhas = chamar(base, host_hdr, "GET", "/api/stacks", token=token) or []
+    except Exception:
+        continue
+    for p in pilhas:
+        if p.get("Name") in sys.argv[1:]:
+            try:
+                chamar(base, host_hdr, "DELETE", f"/api/stacks/{p['Id']}?endpointId={p.get('EndpointId')}", token=token)
+            except Exception:
+                pass
+    break
+PYEOF
+}
+
+antigos_removidos() {
+    local ns s
+    for ns in "${REMOVER_STACKS[@]}"; do
+        [ -z "$(docker service ls -q --filter "label=com.docker.stack.namespace=$ns" 2>/dev/null)" ] || return 1
+        [ -z "$(docker ps -q --filter "label=com.docker.stack.namespace=$ns" 2>/dev/null)" ] || return 1
+    done
+    for s in "${REMOVER_SERVICOS[@]}"; do
+        docker service inspect "$s" >/dev/null 2>&1 && return 1
+    done
+    return 0
+}
+
+remover_versao_antiga() {
+    local ns s
+    planejar_remocao
+    [ ${#REMOVER_STACKS[@]} -gt 0 ] && remover_stacks_portainer "${REMOVER_STACKS[@]}" >/dev/null 2>&1
+    for ns in "${REMOVER_STACKS[@]}"; do docker stack rm "$ns" >/dev/null 2>&1; done
+    for s in "${REMOVER_SERVICOS[@]}"; do docker service rm "$s" >/dev/null 2>&1; done
+    for s in "${ANTIGO_CONTAINERS[@]}"; do docker rm -f "$s" >/dev/null 2>&1; done
+    esperar "Removendo o N8N e o Disparador antigo" 180 antigos_removidos \
+        || aviso "Ainda tem partes da versão antiga saindo. Se o sistema não abrir, confira no Portainer."
 }
 
 ## ============================================================================
@@ -620,7 +889,55 @@ normalizar_sub() {
     printf '%s' "${d%%.*}"
 }
 
+## Migração: os endereços já vêm da instalação antiga. WhatsApp e arquivos ficam
+## presos aos da Evolution e do MinIO antigos, que continuam rodando.
+passo_dominios_migracao() {
+    local h
+    while :; do
+        cabecalho_passo 1 "DOMÍNIOS"
+        texto "Estes são os endereços da sua instalação atual:"
+        echo ""
+        abrir_bloco "ENDEREÇOS DO SEU SISTEMA" "$azul"
+        item "Sistema" "$APP_HOST"
+        item "WhatsApp" "$EVO_HOST"
+        item "Arquivos" "$S3_HOST"
+        fechar_bloco
+        dica "O novo sistema entra no lugar do N8N. WhatsApp e arquivos continuam onde já estão."
+        echo ""
+        sim_nao "Usar esses endereços?" S
+        case $? in
+            2) continue ;;
+            1)
+                echo ""
+                dica "Digite o endereço completo (ex.: app.suaempresa.com.br)."
+                perguntar h "Sistema" "$APP_HOST" || continue
+                APP_HOST="$(normalizar_dominio "$h")"
+                if [ "$EVO_EXTERNA" != 1 ]; then
+                    perguntar h "WhatsApp" "$EVO_HOST" || continue
+                    EVO_HOST="$(normalizar_dominio "$h")"
+                fi
+                if [ "$S3_EXTERNO" != 1 ]; then
+                    perguntar h "Arquivos" "$S3_HOST" || continue
+                    S3_HOST="$(normalizar_dominio "$h")"
+                fi
+                ;;
+        esac
+        if [ "$APP_HOST" = "$EVO_HOST" ] || [ "$APP_HOST" = "$S3_HOST" ] || [ "$EVO_HOST" = "$S3_HOST" ]; then
+            falha "Os três endereços precisam ser diferentes."
+            enter
+            continue
+        fi
+        DOMINIO_BASE="${APP_HOST#*.}"
+        SUB_APP="${APP_HOST%%.*}"; SUB_EVO="${EVO_HOST%%.*}"; SUB_S3="${S3_HOST%%.*}"
+        verificar_dns && return 0
+    done
+}
+
 passo_dominios() {
+    if [ "$MIGRACAO" = 1 ] && [ -n "${APP_HOST:-}" ]; then
+        passo_dominios_migracao
+        return
+    fi
     while :; do
         cabecalho_passo 1 "DOMÍNIOS"
         texto "Qual é o domínio da sua empresa?"
@@ -658,6 +975,9 @@ passo_dominios() {
         APP_HOST="$SUB_APP.$DOMINIO_BASE"
         EVO_HOST="$SUB_EVO.$DOMINIO_BASE"
         S3_HOST="$SUB_S3.$DOMINIO_BASE"
+        ## Evolution e MinIO antigos continuam nos endereços deles
+        [ "$EVO_EXTERNA" = 1 ] && EVO_HOST="$EVO_HOST_ANTIGO"
+        [ "$S3_EXTERNO" = 1 ] && S3_HOST="$S3_HOST_ANTIGO"
         if [ "$APP_HOST" = "$EVO_HOST" ] || [ "$APP_HOST" = "$S3_HOST" ] || [ "$EVO_HOST" = "$S3_HOST" ]; then
             falha "Os três endereços precisam ser diferentes."
             enter
@@ -821,11 +1141,17 @@ supabase_pedir_service() {
 }
 
 passo_supabase() {
-    local sub=0
+    local sub=0 aproveitar="$MIGRACAO"
+    ## Migração: a URL e a service_role vêm do Disparador antigo; a anon public precisa ser informada
+    if [ "$MIGRACAO" = 1 ] && [ -n "${SUPABASE_URL:-}" ] \
+        && [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$SUPABASE_URL/auth/v1/health")" != 000 ]; then
+        sub=1
+    fi
     while :; do
         cabecalho_passo 2 "SUPABASE"
         texto "Abra o seu projeto no ${branco}Supabase${reset} e vá em ${branco}Project Settings → API${reset}."
         dica "(ou clique no botão Connect, no topo da tela do projeto)"
+        [ "$MIGRACAO" = 1 ] && dica "Os dados que já estavam na instalação antiga aparecem preenchidos: só aperte Enter."
         echo ""
         [ "$sub" -gt 0 ] && feito "Project URL" "$SUPABASE_URL"
         [ "$sub" -gt 1 ] && feito "Chave anon public" "$(resumir_chave "$SUPABASE_ANON_KEY")"
@@ -834,6 +1160,16 @@ passo_supabase() {
             0) supabase_pedir_url || return 1; sub=1 ;;
             1) if supabase_pedir_anon; then sub=2; else sub=0; fi ;;
             2)
+                if [ "$aproveitar" = 1 ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ] \
+                    && [ "$(supabase_curl "$SUPABASE_SERVICE_ROLE_KEY" "$SUPABASE_URL/auth/v1/admin/users?page=1&per_page=1")" = 200 ]; then
+                    aproveitar=0
+                    feito "Chave service_role" "$(resumir_chave "$SUPABASE_SERVICE_ROLE_KEY")"
+                    echo ""
+                    ok "Supabase conectado!"
+                    sleep 1
+                    return 0
+                fi
+                aproveitar=0
                 if supabase_pedir_service; then
                     feito "Chave service_role" "$(resumir_chave "$SUPABASE_SERVICE_ROLE_KEY")"
                     echo ""
@@ -862,14 +1198,20 @@ passo_sql() {
     local falta resp
     info "Conferindo as tabelas no seu Supabase..."
     falta="$(tabelas_faltando)"
-    if [ -z "${falta// /}" ]; then
+    if [ "$MIGRACAO" = 1 ] && [ "${SQL_MIGRACAO_OK:-0}" = 0 ]; then
+        echo ""
+        aviso "Seu Supabase é da versão antiga: rode o SQL novo para atualizar as tabelas."
+        dica "Pode rodar sem medo: ele só cria o que falta e atualiza as funções. Seus dados ficam."
+        echo ""
+    elif [ -z "${falta// /}" ]; then
         ok "Tabelas do sistema encontradas!"
         sleep 1
         return 0
+    else
+        echo ""
+        falha "As tabelas do sistema ainda não existem no seu Supabase."
+        echo ""
     fi
-    echo ""
-    falha "As tabelas do sistema ainda não existem no seu Supabase."
-    echo ""
     texto "Siga o ${branco}vídeo de instalação${reset} para criar as tabelas:"
     echo ""
     instrucao "1." "Copie o ${branco}SQL${reset} que está na ${branco}descrição do vídeo${reset} ou neste link:"
@@ -884,6 +1226,7 @@ passo_sql() {
         info "Conferindo..."
         falta="$(tabelas_faltando)"
         if [ -z "${falta// /}" ]; then
+            SQL_MIGRACAO_OK=1
             ok "Tabelas criadas!"
             sleep 1
             return 0
@@ -1039,6 +1382,13 @@ assistente() {
         item "Licença" "$LICENCA_EMAIL"
         item "Supabase" "$SUPABASE_URL"
         fechar_bloco
+        if [ "$MIGRACAO" = 1 ]; then
+            abrir_bloco "VERSÃO ANTIGA" "$amarelo"
+            item "Remover" "N8N e Disparador antigo"
+            [ "$EVO_EXTERNA" = 1 ] && item "Manter" "Evolution em $EVO_HOST (WhatsApps conectados)"
+            [ "$S3_EXTERNO" = 1 ] && item "Manter" "MinIO em $S3_HOST (arquivos)"
+            fechar_bloco
+        fi
         sim_nao "Está tudo certo? S = instalar  •  N = corrigir" S
         r=$?
         [ $r = 0 ] && return 0
@@ -1100,7 +1450,8 @@ VARS_SALVAS=(MODO_DEPLOY MODO_ROTA PAINEL TRAEFIK_RESOLVER TRAEFIK_ENTRYPOINT TR
     TRAEFIK_PASTA_ARQUIVOS REDE_INTERNA PORTA_APP PORTA_EVO PORTA_S3
     DOMINIO_BASE SUB_APP SUB_EVO SUB_S3 APP_HOST EVO_HOST S3_HOST
     SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY LICENCA_EMAIL BACK_PATH NOME_SISTEMA ADMIN_EMAIL
-    EVOLUTION_API_KEY POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY)
+    EVOLUTION_API_KEY POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY
+    EVO_EXTERNA S3_EXTERNO MINIO_SERVICO_EXT)
 
 salvar_config() {
     mkdir -p "$DIR"
@@ -1125,8 +1476,11 @@ carregar_config() {
 gerar_segredos() {
     EVOLUTION_API_KEY="${EVOLUTION_API_KEY:-$(aleatorio 16)}"
     POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(aleatorio 16)}"
-    MINIO_ROOT_USER="${MINIO_ROOT_USER:-hublabel}"
-    MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$(aleatorio 16)}"
+    ## MinIO antigo: as credenciais de administrador são as dele (não inventa outras)
+    if [ "${S3_EXTERNO:-0}" != 1 ]; then
+        MINIO_ROOT_USER="${MINIO_ROOT_USER:-hublabel}"
+        MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-$(aleatorio 16)}"
+    fi
     S3_ACCESS_KEY="${S3_ACCESS_KEY:-$(head -c 200 /dev/urandom | tr -dc 'A-Z0-9' | head -c 20)}"
     S3_SECRET_KEY="${S3_SECRET_KEY:-$(head -c 400 /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 40)}"
     local cliente="${DOMINIO_BASE%%.*}"
@@ -1141,8 +1495,8 @@ gerar_segredos() {
     fi
     if [ "$MODO_ROTA" = manual ]; then
         PORTA_APP="${PORTA_APP:-$(porta_livre_a_partir_de 3090)}"
-        PORTA_EVO="${PORTA_EVO:-$(porta_livre_a_partir_de 8080)}"
-        PORTA_S3="${PORTA_S3:-$(porta_livre_a_partir_de 9000)}"
+        [ "${EVO_EXTERNA:-0}" != 1 ] && PORTA_EVO="${PORTA_EVO:-$(porta_livre_a_partir_de 8080)}"
+        [ "${S3_EXTERNO:-0}" != 1 ] && PORTA_S3="${PORTA_S3:-$(porta_livre_a_partir_de 9000)}"
     fi
 }
 
@@ -1211,6 +1565,10 @@ extras() {
 gerar_arquivo_deploy() {
     local f="$DIR/$PROJETO.yml"
     local cliente="${DOMINIO_BASE%%.*}"
+    local evo_ext="${EVO_EXTERNA:-0}" s3_ext="${S3_EXTERNO:-0}"
+    ## MinIO antigo fica em outra stack: o sistema fala com ele pelo endereço público (como o Disparador antigo)
+    local s3_endpoint="http://hublabel-minio:9000"
+    [ "$s3_ext" = 1 ] && s3_endpoint="https://$S3_HOST"
     {
         if [ "$MODO_DEPLOY" = stack ]; then
             echo 'version: "3.7"'
@@ -1240,7 +1598,7 @@ services:
       BACK_URL: "https://$APP_HOST${BACK_PATH:-}"
       EVOLUTION_BASE_URL: "https://$EVO_HOST"
       EVOLUTION_API_KEY: "$EVOLUTION_API_KEY"
-      S3_ENDPOINT: "http://hublabel-minio:9000"
+      S3_ENDPOINT: "$s3_endpoint"
       S3_ACCESS_KEY_ID: "$S3_ACCESS_KEY"
       S3_SECRET_ACCESS_KEY: "$S3_SECRET_KEY"
       S3_BUCKET: "$S3_BUCKET"
@@ -1256,7 +1614,9 @@ services:
       retries: 3
       start_period: 40s
 EOF
-        [ "$MODO_DEPLOY" = compose ] && echo "    depends_on: [hublabel-redis, hublabel-minio]"
+        if [ "$MODO_DEPLOY" = compose ]; then
+            [ "$s3_ext" = 1 ] && echo "    depends_on: [hublabel-redis]" || echo "    depends_on: [hublabel-redis, hublabel-minio]"
+        fi
         extras hublabel-app 1 hublabel_app "$APP_HOST" 3090 "${PORTA_APP:-}" 1024M
 
         cat <<EOF
@@ -1269,6 +1629,7 @@ EOF
 EOF
         extras hublabel-redis 0 "" "" "" "" 256M
 
+        if [ "$evo_ext" != 1 ]; then
         cat <<EOF
 
 ## --------------------------- EVOLUTION API --------------------------- ##
@@ -1357,7 +1718,9 @@ EOF
       - evolution_redis:/data
 EOF
         extras hublabel-evolution-redis 0 "" "" "" "" 256M
+        fi
 
+        if [ "$s3_ext" != 1 ]; then
         cat <<EOF
 
 ## --------------------------- MINIO (S3) --------------------------- ##
@@ -1375,6 +1738,7 @@ EOF
       - minio_data:/data
 EOF
         extras hublabel-minio 1 hublabel_s3 "$S3_HOST" 9000 "${PORTA_S3:-}" 512M
+        fi
 
         if [ "$MODO_ROTA" = caddy ]; then
             cat <<EOF
@@ -1397,10 +1761,12 @@ EOF
         echo ""
         echo "volumes:"
         echo "  hublabel_redis:"
-        echo "  evolution_instances:"
-        echo "  evolution_postgres:"
-        echo "  evolution_redis:"
-        echo "  minio_data:"
+        if [ "$evo_ext" != 1 ]; then
+            echo "  evolution_instances:"
+            echo "  evolution_postgres:"
+            echo "  evolution_redis:"
+        fi
+        [ "$s3_ext" != 1 ] && echo "  minio_data:"
         if [ "$MODO_ROTA" = caddy ]; then
             echo "  caddy_data:"
             echo "  caddy_config:"
@@ -1422,30 +1788,24 @@ EOF
     chmod 600 "$f"
 
     if [ "$MODO_ROTA" = caddy ]; then
-        cat >"$DIR/Caddyfile" <<EOF
-$APP_HOST {
-    encode gzip
-    reverse_proxy hublabel-app:3090
-}
-
-$EVO_HOST {
-    reverse_proxy hublabel-evolution:8080
-}
-
-$S3_HOST {
-    reverse_proxy hublabel-minio:9000
-}
-EOF
+        {
+            printf '%s {\n    encode gzip\n    reverse_proxy hublabel-app:3090\n}\n' "$APP_HOST"
+            [ "$evo_ext" != 1 ] && printf '\n%s {\n    reverse_proxy hublabel-evolution:8080\n}\n' "$EVO_HOST"
+            [ "$s3_ext" != 1 ] && printf '\n%s {\n    reverse_proxy hublabel-minio:9000\n}\n' "$S3_HOST"
+        } >"$DIR/Caddyfile"
     fi
 
     if [ "$MODO_ROTA" = file ]; then
-        local app evo s3
+        local app evo s3 rotas=()
         app="$(nome_dns hublabel-app)"; evo="$(nome_dns hublabel-evolution)"; s3="$(nome_dns hublabel-minio)"
+        rotas=("hublabel_app $APP_HOST")
+        [ "$evo_ext" != 1 ] && rotas+=("hublabel_evolution $EVO_HOST")
+        [ "$s3_ext" != 1 ] && rotas+=("hublabel_s3 $S3_HOST")
         {
             echo "## Gerado pelo setup HubLabel v$VERSAO"
             echo "http:"
             echo "  routers:"
-            for r in "hublabel_app $APP_HOST" "hublabel_evolution $EVO_HOST" "hublabel_s3 $S3_HOST"; do
+            for r in "${rotas[@]}"; do
                 set -- $r
                 echo "    $1:"
                 echo "      rule: \"Host(\`$2\`)\""
@@ -1462,12 +1822,16 @@ EOF
             echo "    hublabel_app:"
             echo "      loadBalancer:"
             echo "        servers: [{ url: \"http://$app:3090\" }]"
-            echo "    hublabel_evolution:"
-            echo "      loadBalancer:"
-            echo "        servers: [{ url: \"http://$evo:8080\" }]"
-            echo "    hublabel_s3:"
-            echo "      loadBalancer:"
-            echo "        servers: [{ url: \"http://$s3:9000\" }]"
+            if [ "$evo_ext" != 1 ]; then
+                echo "    hublabel_evolution:"
+                echo "      loadBalancer:"
+                echo "        servers: [{ url: \"http://$evo:8080\" }]"
+            fi
+            if [ "$s3_ext" != 1 ]; then
+                echo "    hublabel_s3:"
+                echo "      loadBalancer:"
+                echo "        servers: [{ url: \"http://$s3:9000\" }]"
+            fi
         } >"$TRAEFIK_PASTA_ARQUIVOS/hublabel-rotas.yml"
     fi
 }
@@ -1486,8 +1850,10 @@ container_de() {
 }
 
 baixar_imagens_stack() {
-    local img
-    for img in "$IMG_APP" "$IMG_REDIS" "$IMG_EVOLUTION" "$IMG_POSTGRES" "$IMG_MINIO"; do
+    local img imgs=("$IMG_APP" "$IMG_REDIS")
+    [ "${EVO_EXTERNA:-0}" != 1 ] && imgs+=("$IMG_EVOLUTION" "$IMG_POSTGRES")
+    [ "${S3_EXTERNO:-0}" != 1 ] && imgs+=("$IMG_MINIO")
+    for img in "${imgs[@]}"; do
         docker pull -q "$img" || true
     done
 }
@@ -1506,20 +1872,39 @@ subir() {
     fi
 }
 
+## Container do MinIO: o nosso ou o antigo (outra stack) que continua rodando
+minio_container() {
+    if [ "${S3_EXTERNO:-0}" = 1 ]; then
+        docker ps -q -f "label=com.docker.swarm.service.name=$MINIO_SERVICO_EXT" | head -1
+    else
+        container_de hublabel-minio
+    fi
+}
+
 minio_pronto() {
     local cid
-    cid="$(container_de hublabel-minio)"
+    cid="$(minio_container)"
     [ -n "$cid" ] && docker exec "$cid" mc alias set local http://127.0.0.1:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
 }
 
 configurar_minio() {
-    esperar "Preparando o armazenamento de arquivos" 180 minio_pronto \
+    local externo="${S3_EXTERNO:-0}" criado=0
+    if [ "$externo" = 1 ] && [ -z "${MINIO_ROOT_USER:-}" ]; then
+        ## Sem a senha de administrador do MinIO antigo: segue com a chave que o Disparador já usava
+        aviso "Não encontrei a senha de administrador do MinIO atual. Mantive a chave de acesso que já existia."
+        return 0
+    fi
+    esperar "Preparando o armazenamento de arquivos" "$([ "$externo" = 1 ] && echo 60 || echo 180)" minio_pronto \
         || { falha "O armazenamento não respondeu. As mídias não vão funcionar até isso ser resolvido."; return 1; }
     local cid
-    cid="$(container_de hublabel-minio)"
-    docker exec "$cid" mc mb -p "local/$S3_BUCKET" >/dev/null 2>&1
-    docker exec "$cid" mc anonymous set download "local/$S3_BUCKET" >/dev/null 2>&1 \
-        || aviso "Não consegui deixar o bucket com leitura pública."
+    cid="$(minio_container)"
+    docker exec "$cid" mc ls "local/$S3_BUCKET" >/dev/null 2>&1 \
+        || { docker exec "$cid" mc mb -p "local/$S3_BUCKET" >/dev/null 2>&1 && criado=1; }
+    ## No MinIO antigo a permissão do bucket que já existe fica como está
+    if [ "$externo" != 1 ] || [ "$criado" = 1 ]; then
+        docker exec "$cid" mc anonymous set download "local/$S3_BUCKET" >/dev/null 2>&1 \
+            || aviso "Não consegui deixar o bucket com leitura pública."
+    fi
     docker exec "$cid" mc admin user add local "$S3_ACCESS_KEY" "$S3_SECRET_KEY" >/dev/null 2>&1 \
         || { falha "Não consegui criar a chave de acesso dos arquivos."; return 1; }
     docker exec "$cid" mc admin policy attach local readwrite --user "$S3_ACCESS_KEY" >/dev/null 2>&1 \
@@ -1692,8 +2077,8 @@ resumo_final() {
     if [ "$MODO_ROTA" = manual ]; then
         abrir_bloco "FALTA UM PASSO: CADASTRE OS DOMÍNIOS NO SEU PAINEL (COM HTTPS)" "$amarelo"
         item "$APP_HOST" "→ http://127.0.0.1:$PORTA_APP"
-        item "$EVO_HOST" "→ http://127.0.0.1:$PORTA_EVO"
-        item "$S3_HOST" "→ http://127.0.0.1:$PORTA_S3"
+        [ "${EVO_EXTERNA:-0}" != 1 ] && item "$EVO_HOST" "→ http://127.0.0.1:$PORTA_EVO"
+        [ "${S3_EXTERNO:-0}" != 1 ] && item "$S3_HOST" "→ http://127.0.0.1:$PORTA_S3"
         fechar_bloco
     fi
     dica "Para atualizar: rode o mesmo comando de instalação e confirme com S."
@@ -1719,6 +2104,7 @@ instalar() {
     gerar_segredos
     salvar_config
     gerar_arquivo_deploy
+    [ "$MIGRACAO" = 1 ] && remover_versao_antiga
     subir
     configurar_minio
     configurar_sistema
@@ -1759,11 +2145,13 @@ main() {
     texto "São ${negrito}$TOTAL_PASSOS passos${reset} rápidos. Tenha em mãos o painel do seu domínio e o Supabase."
     echo ""
     info "Analisando a VPS..."
+    BACK_PATH=""
     detectar_ambiente
     descrever_ambiente
     sleep 2
+    ## Versão antiga (N8N + Disparador): oferece trocar pela nova
+    [ "$HUBLABEL_V18" = 1 ] && oferecer_migracao
 
-    BACK_PATH=""
     assistente
     cabecalho_instalacao
     instalar_docker
