@@ -12303,14 +12303,14 @@ create table if not exists public."SAAS_Personalizacao" (
   id               bigint primary key default 1 check (id = 1),
   nome             text,
   cor              text,          -- hex sem '#', ex.: 25D366
-  "telefoneSuporte" text,         -- só dígitos, ex.: 5548984549300
+  "telefoneSuporte" text,         -- só dígitos, ex.: 5511999998877
   "logoUrl"        text,          -- vazio = <SUPABASE_URL>/storage/v1/object/public/arquivos/LOGO%20PRINCIPAL.png
   "faviconUrl"     text,          -- vazio = <SUPABASE_URL>/storage/v1/object/public/arquivos/FAVICON.png
   updated_at       timestamptz not null default now()
 );
 
 insert into public."SAAS_Personalizacao" (id, nome, cor, "telefoneSuporte")
-values (1, 'Disparamator', '25D366', '5548984549300')
+values (1, 'Disparamator', '25D366', '5511999998877')
 on conflict (id) do nothing;
 
 -- Só o backend (service_role) lê/escreve; o navegador não acessa a tabela.
