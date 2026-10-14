@@ -772,7 +772,6 @@ oferecer_migracao() {
         exit 0
     fi
     MIGRACAO=1
-    BACK_PATH="/webhook"
     if [ "$EVO_EXTERNA" = 1 ] && [ -z "${EVOLUTION_API_KEY:-}" ]; then
         echo ""
         texto "Não encontrei a API Key global da Evolution atual."
