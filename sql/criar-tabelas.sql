@@ -9,6 +9,7 @@
 --      (SAAS_Personalizacao, SAAS_PaginaVendas e funções f_hub_*)
 --   3. scripts/pause-dispatch-on-last-disconnected-connection.sql do hublabel-disparador
 --      (swap_connection: pausa o disparo quando cai a última conexão)
+--   4. get_chat_lista (lista do chat numa chamada só) e índices de contatos
 -- =============================================================================
 
   -- =========================
@@ -1962,7 +1963,7 @@
   RETURNS JSONB
   LANGUAGE plpgsql
   STABLE
-  SECURITY DEFINER
+  SECURITY INVOKER
   SET search_path = public
   AS $$
   DECLARE
@@ -2280,6 +2281,8 @@
   GRANT EXECUTE ON FUNCTION public.get_chat_overview(UUID, TEXT, INTEGER, INTEGER, BIGINT[], BIGINT[], TEXT) TO authenticated;
 
   -- Versao otimizada: materializa candidatos uma vez e consulta mensagens apenas apos paginar.
+  -- SECURITY INVOKER: a lista e as contagens seguem a RLS de SAAS_Conversas_Agentes
+  -- (membro vê só as conversas dele, as do setor dele sem atendente e as sem setor e sem atendente).
   CREATE OR REPLACE FUNCTION public.get_chat_overview(
     p_conta_id UUID,
     p_status TEXT DEFAULT 'aberto',
@@ -2292,7 +2295,7 @@
   RETURNS JSONB
   LANGUAGE plpgsql
   STABLE
-  SECURITY DEFINER
+  SECURITY INVOKER
   SET search_path = public
   AS $$
   DECLARE
@@ -12368,5 +12371,187 @@ BEGIN
   END IF;
 END;
 $$;
+
+-- =============================================================================
+-- 4. Chat: lista de conversas numa chamada só (hublabel-disparador, chat.html)
+-- =============================================================================
+-- get_chat_lista: a página de conversas de uma aba + tudo que a lista mostra
+-- (contagens das 4 abas, última mensagem, etiquetas, CRM e foto do contato).
+-- Antes a tela fazia ~10 consultas por carga (lista, 4 contagens, última
+-- mensagem, etiquetas x2, CRM x3, fotos). Mesmas regras das consultas da tela:
+--   aberto     = statusAtendimento ILIKE 'aberto'
+--   aguardando = ILIKE 'aguardando' e sem agente
+--   fechado    = ILIKE 'fechado'
+--   agente-ia  = com agente e status diferente de 'aberto'
+-- SECURITY INVOKER: tudo passa pela RLS (membro vê as conversas dele, as do
+-- setor dele sem atendente e as sem setor e sem atendente; admin vê todas).
+-- Se a função não existir, a tela usa as consultas antigas.
+CREATE OR REPLACE FUNCTION public.get_chat_lista(
+  p_conta_id UUID,
+  p_status TEXT DEFAULT 'aberto',
+  p_limit INTEGER DEFAULT 20,
+  p_offset INTEGER DEFAULT 0,
+  p_conexao_ids BIGINT[] DEFAULT NULL,
+  p_setor_ids BIGINT[] DEFAULT NULL,
+  p_contato_ids BIGINT[] DEFAULT NULL,
+  p_search TEXT DEFAULT NULL,
+  p_somente_nao_lidas BOOLEAN DEFAULT false
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+STABLE
+SECURITY INVOKER
+SET search_path = public
+AS $$
+DECLARE
+  v_status TEXT := LOWER(TRIM(COALESCE(p_status, 'aberto')));
+  v_limit INTEGER := GREATEST(1, LEAST(COALESCE(p_limit, 20), 200));
+  v_offset INTEGER := GREATEST(0, COALESCE(p_offset, 0));
+  v_search TEXT := NULLIF(TRIM(COALESCE(p_search, '')), '');
+  v_like TEXT;
+  v_like_digitos TEXT;
+  v_resultado JSONB;
+BEGIN
+  IF p_conta_id IS NULL THEN
+    RETURN jsonb_build_object(
+      'counts', jsonb_build_object('aberto', 0, 'aguardando', 0, 'fechado', 0, 'agente_ia', 0),
+      'conversations', '[]'::jsonb, 'next_offset', 0, 'has_more', false
+    );
+  END IF;
+
+  IF v_search IS NOT NULL THEN
+    -- "contém", com % e _ digitados tratados como texto (igual à tela).
+    v_like := '%' || replace(replace(replace(LOWER(v_search), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+    IF regexp_replace(v_search, '\D', '', 'g') <> '' THEN
+      v_like_digitos := '%' || regexp_replace(v_search, '\D', '', 'g') || '%';
+    END IF;
+  END IF;
+
+  WITH base AS MATERIALIZED (
+    SELECT c.*
+    FROM public."SAAS_Conversas_Agentes" c
+    WHERE c."contaId" = p_conta_id
+      AND (p_conexao_ids IS NULL OR cardinality(p_conexao_ids) = 0 OR c."idConexao" = ANY(p_conexao_ids))
+      AND (p_setor_ids IS NULL OR cardinality(p_setor_ids) = 0 OR c."setorId" = ANY(p_setor_ids))
+      AND (p_contato_ids IS NULL OR cardinality(p_contato_ids) = 0 OR c."contatoId" = ANY(p_contato_ids))
+      AND (
+        v_like IS NULL
+        OR c.telefone ILIKE v_like
+        OR (v_like_digitos IS NOT NULL AND c.telefone ILIKE v_like_digitos)
+        OR c."contatoId" IN (
+          SELECT ct.id FROM public."SAAS_Contatos" ct
+          WHERE ct."contaId" = p_conta_id
+            AND (
+              ct.nome ILIKE v_like
+              OR ct.telefone ILIKE v_like
+              OR (v_like_digitos IS NOT NULL AND ct.telefone ILIKE v_like_digitos)
+            )
+        )
+      )
+  ),
+  contagens AS (
+    SELECT
+      COUNT(*) FILTER (WHERE "statusAtendimento" ILIKE 'aberto') AS aberto,
+      COUNT(*) FILTER (WHERE "statusAtendimento" ILIKE 'aguardando' AND "idAgente" IS NULL) AS aguardando,
+      COUNT(*) FILTER (WHERE "statusAtendimento" ILIKE 'fechado') AS fechado,
+      COUNT(*) FILTER (WHERE "idAgente" IS NOT NULL AND "statusAtendimento" NOT ILIKE 'aberto') AS agente_ia
+    FROM base
+  ),
+  pagina AS (
+    SELECT b.*
+    FROM base b
+    WHERE (
+        CASE v_status
+          WHEN 'aberto' THEN b."statusAtendimento" ILIKE 'aberto'
+          WHEN 'aguardando' THEN b."statusAtendimento" ILIKE 'aguardando' AND b."idAgente" IS NULL
+          WHEN 'agente-ia' THEN b."idAgente" IS NOT NULL AND b."statusAtendimento" NOT ILIKE 'aberto'
+          ELSE b."statusAtendimento" ILIKE v_status
+        END
+      )
+      AND (NOT COALESCE(p_somente_nao_lidas, false) OR b.lida = false)
+    ORDER BY b."ultimaMensagem" DESC NULLS LAST, b.id DESC
+    LIMIT v_limit + 1
+    OFFSET v_offset
+  ),
+  itens AS (
+    SELECT
+      p.id,
+      p."ultimaMensagem",
+      to_jsonb(p) || jsonb_build_object(
+        'atendente_usuario', (SELECT jsonb_build_object('nome', u.nome) FROM public."SAAS_Usuarios" u WHERE u.id = p.atendente),
+        'setor', (SELECT jsonb_build_object('nome', s.nome, 'cor', s.cor) FROM public."SAAS_Setores" s WHERE s.id = p."setorId"),
+        'contato', (SELECT jsonb_build_object('nome', ct.nome, 'fotoPerfil', ct."fotoPerfil") FROM public."SAAS_Contatos" ct WHERE ct.id = p."contatoId"),
+        'SAAS_AgentesIA', (
+          SELECT jsonb_build_object('id', a.id, 'nome', a.nome, 'pausarAtendimento', a."pausarAtendimento", 'ativo', a.ativo)
+          FROM public."SAAS_AgentesIA" a WHERE a.id = p."idAgente"
+        ),
+        'SAAS_Conexões', (
+          SELECT jsonb_build_object(
+            'idAgente', cx."idAgente", 'NomeConexao', cx."NomeConexao", 'Telefone', cx."Telefone", 'apiOficial', cx."apiOficial",
+            'SAAS_AgentesIA', (
+              SELECT jsonb_build_object('nome', a2.nome, 'pausarAtendimento', a2."pausarAtendimento", 'ativo', a2.ativo)
+              FROM public."SAAS_AgentesIA" a2 WHERE a2.id = cx."idAgente"
+            )
+          )
+          FROM public."SAAS_Conexões" cx WHERE cx.id = p."idConexao"
+        ),
+        'ultimaMensagemTexto', lm.mensagem,
+        'ultimaMensagemTipo', lm."tipoMensagem",
+        'ultimaMensagemData', lm.created_at,
+        'ultimaMensagemFromMe', lm."fromMe",
+        'etiquetasPreview', COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'nome', COALESCE(NULLIF(e.nome, ''), 'Sem nome'),
+            'cor', CASE WHEN BTRIM(COALESCE(e.cor, '')) ~* '^#[0-9a-f]{6}$' THEN BTRIM(e.cor) ELSE '#6b7280' END
+          ))
+          FROM public."SAAS_Contatos_Etiquetas" ce
+          JOIN public."SAAS_Etiquetas" e ON e.id = ce."etiquetaId" AND e."contaId" = p_conta_id
+          WHERE ce."contaId" = p_conta_id AND ce."contatoId" = p."contatoId"
+        ), '[]'::jsonb),
+        'crmPreview', COALESCE((
+          SELECT jsonb_agg(jsonb_build_object(
+            'quadroNome', CASE WHEN q.id IS NULL THEN 'Quadro' ELSE COALESCE(NULLIF(q.nome, ''), 'Quadro ' || q.id) END,
+            'etapaNome', CASE WHEN et.id IS NULL THEN 'Etapa' ELSE COALESCE(NULLIF(et.nome, ''), 'Etapa ' || et.id) END,
+            'etapaTipo', CASE WHEN BTRIM(et."tipoEtapa") IN ('venda', 'agendamento', 'perda') THEN BTRIM(et."tipoEtapa") END
+          ))
+          FROM public."SAAS_Cards_Quadros" cq
+          LEFT JOIN public."SAAS_Quadros" q ON q.id = cq."quadroId"
+          LEFT JOIN public."SAAS_Etapas_Quadros" et ON et.id = cq."etapaQuadroId"
+          WHERE cq."contatoId" = p."contatoId"
+        ), '[]'::jsonb)
+      ) AS item
+    FROM pagina p
+    LEFT JOIN LATERAL (
+      SELECT m.mensagem, m."tipoMensagem", m.created_at, m."fromMe"
+      FROM public."SAAS_Mensagens" m
+      WHERE m."conversaId" = p.id AND m.apagada = false
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT 1
+    ) lm ON true
+  )
+  SELECT jsonb_build_object(
+    'counts', (SELECT jsonb_build_object('aberto', aberto, 'aguardando', aguardando, 'fechado', fechado, 'agente_ia', agente_ia) FROM contagens),
+    'conversations', COALESCE((
+      SELECT jsonb_agg(i.item ORDER BY i."ultimaMensagem" DESC NULLS LAST, i.id DESC)
+      FROM (SELECT * FROM itens ORDER BY "ultimaMensagem" DESC NULLS LAST, id DESC LIMIT v_limit) i
+    ), '[]'::jsonb),
+    'has_more', (SELECT COUNT(*) > v_limit FROM pagina),
+    'next_offset', v_offset + LEAST(v_limit, (SELECT COUNT(*) FROM pagina)::INTEGER)
+  )
+  INTO v_resultado;
+
+  RETURN v_resultado;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.get_chat_lista(UUID, TEXT, INTEGER, INTEGER, BIGINT[], BIGINT[], BIGINT[], TEXT, BOOLEAN) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.get_chat_lista(UUID, TEXT, INTEGER, INTEGER, BIGINT[], BIGINT[], BIGINT[], TEXT, BOOLEAN) TO authenticated;
+
+-- Busca por telefone com "contém" nos contatos (chat e tela de contatos) e lista
+-- paginada da tela de contatos (mais novos primeiro).
+CREATE INDEX IF NOT EXISTS saas_contatos_telefone_trgm_idx
+  ON public."SAAS_Contatos" USING gin (telefone gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS saas_contatos_conta_created_idx
+  ON public."SAAS_Contatos" ("contaId", created_at DESC, id DESC);
+
 
 NOTIFY pgrst, 'reload schema';
