@@ -1696,7 +1696,7 @@ resumo_final() {
         item "$S3_HOST" "→ http://127.0.0.1:$PORTA_S3"
         fechar_bloco
     fi
-    dica "Para atualizar: rode o mesmo comando de instalação e escolha \"Atualizar\"."
+    dica "Para atualizar: rode o mesmo comando de instalação e confirme com S."
     echo -e "  ${amarelo}Anote estes dados em um lugar seguro.${reset}"
     echo ""
 }
@@ -1730,37 +1730,20 @@ instalar() {
 menu_instalacao_existente() {
     carregar_config
     banner
-    titulo_caixa "JÁ EXISTE UMA INSTALAÇÃO NESTA VPS"
+    titulo_caixa "VOCÊ JÁ TEM TUDO INSTALADO NESTA VPS"
     dica "https://${APP_HOST:-?}"
     echo ""
-    echo -e "  ${ciano}${negrito}1${reset}  Atualizar para a versão mais nova ${cinza}(mantém tudo como está)${reset}"
-    echo -e "  ${ciano}${negrito}2${reset}  Refazer a configuração ${cinza}(Enter mantém cada resposta atual)${reset}"
-    echo -e "  ${ciano}${negrito}3${reset}  Sair"
+    sim_nao "Deseja atualizar para a versão mais nova?" S || exit 0
+    banner
+    titulo_caixa "ATUALIZANDO SEU SISTEMA" "$roxo"
     echo ""
-    local op
-    perguntar op "Escolha" "1" || op=3
-    case "$op" in
-        1)
-            banner
-            titulo_caixa "ATUALIZANDO SEU SISTEMA" "$roxo"
-            echo ""
-            gerar_arquivo_deploy
-            subir
-            configurar_minio
-            aguardar_sistema
-            echo ""
-            ok "${negrito}Atualização concluída!${reset}"
-            exit 0
-            ;;
-        2)
-            BACK_PATH=""
-            assistente
-            cabecalho_instalacao
-            instalar
-            exit 0
-            ;;
-        *) exit 0 ;;
-    esac
+    gerar_arquivo_deploy
+    subir
+    configurar_minio
+    aguardar_sistema
+    echo ""
+    ok "${negrito}Atualização concluída!${reset}"
+    exit 0
 }
 
 main() {
