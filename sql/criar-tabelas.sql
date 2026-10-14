@@ -11,6 +11,8 @@
 --      (swap_connection: pausa o disparo quando cai a última conexão)
 --   4. get_chat_lista (lista do chat numa chamada só) e índices de contatos
 --   5. get_dashboard: tempo médio de abertura só com as mensagens da conta
+--   6. Histórico de etapa dos cards (trigger) e vendas/agendamentos da dashboard
+--      filtrados pela data em que o card entrou na etapa
 -- =============================================================================
 
   -- =========================
@@ -1673,8 +1675,29 @@
     END IF;
   END$$;
 
+  -- Data em que o card entrou na etapa: o último registro do historicoCRM com destino = etapa.
+  -- Aceita os formatos já gravados no histórico: tela/trigger (etapaDestinoId + data),
+  -- agente IA antigo (para + em) e criação do card (etapaId/etapa).
+  -- Sem registro (cards de antes do histórico) → p_padrao (created_at do card).
+  CREATE OR REPLACE FUNCTION public.f_crm_card_entrada_etapa(p_historico JSONB, p_etapa_id BIGINT, p_padrao TIMESTAMPTZ)
+  RETURNS TIMESTAMPTZ LANGUAGE sql STABLE AS $$
+    SELECT COALESCE(MAX(x.quando), p_padrao)
+    FROM (
+      SELECT (COALESCE(ev->>'data', ev->>'em'))::timestamptz AS quando
+      FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p_historico) = 'array' THEN p_historico ELSE '[]'::jsonb END) ev
+      WHERE jsonb_typeof(ev) = 'object'
+        AND COALESCE(ev->>'data', ev->>'em') ~ '^\d{4}-\d{2}-\d{2}'
+        AND COALESCE(
+          ev->>'etapaDestinoId',
+          ev->>'para',
+          CASE WHEN ev->>'tipo' = 'criacao' THEN COALESCE(ev->>'etapaId', ev->>'etapa') END
+        ) = p_etapa_id::text
+    ) x;
+  $$;
+
   -- get_dashboard e get_dashboard_crm: ambas usam p_user_id (valor = contaId)
-  -- Métricas: contatos no período; vendas/agendamentos = cards na etapa (tipoEtapa); faturamento = soma valor na etapa venda
+  -- Métricas: contatos no período; vendas/agendamentos = cards que entraram na etapa (tipoEtapa) dentro do período
+  -- (data da entrada vem do historicoCRM, ver f_crm_card_entrada_etapa); faturamento = soma do valor dessas vendas
   CREATE OR REPLACE FUNCTION public.get_dashboard(
     p_user_id       UUID,
     p_data_inicial  TIMESTAMPTZ,
@@ -1822,40 +1845,32 @@
       v_crm := jsonb_build_object('etapas', '[]'::jsonb, 'conversaoTotal', '0%', 'valorFechado', 'R$ 0');
     END IF;
 
-    -- Vendas / faturamento: cards atualmente em etapa tipo "venda"
-    SELECT COALESCE(SUM(c.valor), 0), COUNT(c.id)
-    INTO v_vendas_valor, v_vendas_qtd
-    FROM public."SAAS_Cards_Quadros" c
-    INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
-    INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
-    WHERE q."contaId" = p_user_id
-      AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'venda'
-      AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id);
-
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
-      'data', to_char(d, 'YYYY-MM-DD'),
-      'dataFormatada', to_char(d, 'DD/MM'),
-      'valor', COALESCE(valor, 0),
-      'quantidade', COALESCE(qtd, 0)
-    ) ORDER BY d), '[]'::jsonb) INTO v_vendas_por_dia
-    FROM (
-      SELECT LEAST(
-        (p_data_final AT TIME ZONE 'America/Sao_Paulo')::date,
-        GREATEST(
-          (p_data_inicial AT TIME ZONE 'America/Sao_Paulo')::date,
-          (c.created_at AT TIME ZONE 'America/Sao_Paulo')::date
-        )
-      ) AS d,
-        SUM(c.valor) AS valor,
-        COUNT(*)::bigint AS qtd
+    -- Vendas / faturamento: cards em etapa tipo "venda" que entraram nela dentro do período
+    WITH vendas AS (
+      SELECT c.valor,
+        public.f_crm_card_entrada_etapa(c."historicoCRM", c."etapaQuadroId", c.created_at) AS entrou_em
       FROM public."SAAS_Cards_Quadros" c
       INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
       INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
       WHERE q."contaId" = p_user_id
         AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'venda'
         AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id)
-      GROUP BY 1
-    ) sub;
+    ), no_periodo AS (
+      SELECT valor, (entrou_em AT TIME ZONE 'America/Sao_Paulo')::date AS d
+      FROM vendas
+      WHERE entrou_em >= p_data_inicial AND entrou_em <= p_data_final
+    )
+    SELECT
+      (SELECT COALESCE(SUM(valor), 0) FROM no_periodo),
+      (SELECT COUNT(*) FROM no_periodo),
+      (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'data', to_char(d, 'YYYY-MM-DD'),
+        'dataFormatada', to_char(d, 'DD/MM'),
+        'valor', COALESCE(valor, 0),
+        'quantidade', COALESCE(qtd, 0)
+      ) ORDER BY d), '[]'::jsonb)
+      FROM (SELECT d, SUM(valor) AS valor, COUNT(*)::bigint AS qtd FROM no_periodo GROUP BY d) sub)
+    INTO v_vendas_valor, v_vendas_qtd, v_vendas_por_dia;
 
     v_vendas := jsonb_build_object(
       'valorTotal', COALESCE(v_vendas_valor, 0),
@@ -1863,37 +1878,29 @@
       'porDia', COALESCE(v_vendas_por_dia, '[]'::jsonb)
     );
 
-    -- Agendamentos: cards atualmente em etapa tipo "agendamento"
-    SELECT COUNT(c.id) INTO v_agend_qtd
-    FROM public."SAAS_Cards_Quadros" c
-    INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
-    INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
-    WHERE q."contaId" = p_user_id
-      AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'agendamento'
-      AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id);
-
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
-      'data', to_char(d, 'YYYY-MM-DD'),
-      'dataFormatada', to_char(d, 'DD/MM'),
-      'quantidade', COALESCE(qtd, 0)
-    ) ORDER BY d), '[]'::jsonb) INTO v_agend_por_dia
-    FROM (
-      SELECT LEAST(
-        (p_data_final AT TIME ZONE 'America/Sao_Paulo')::date,
-        GREATEST(
-          (p_data_inicial AT TIME ZONE 'America/Sao_Paulo')::date,
-          (c.created_at AT TIME ZONE 'America/Sao_Paulo')::date
-        )
-      ) AS d,
-        COUNT(*)::bigint AS qtd
+    -- Agendamentos: cards em etapa tipo "agendamento" que entraram nela dentro do período
+    WITH agend AS (
+      SELECT public.f_crm_card_entrada_etapa(c."historicoCRM", c."etapaQuadroId", c.created_at) AS entrou_em
       FROM public."SAAS_Cards_Quadros" c
       INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
       INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
       WHERE q."contaId" = p_user_id
         AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'agendamento'
         AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id)
-      GROUP BY 1
-    ) sub;
+    ), no_periodo AS (
+      SELECT (entrou_em AT TIME ZONE 'America/Sao_Paulo')::date AS d
+      FROM agend
+      WHERE entrou_em >= p_data_inicial AND entrou_em <= p_data_final
+    )
+    SELECT
+      (SELECT COUNT(*) FROM no_periodo),
+      (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'data', to_char(d, 'YYYY-MM-DD'),
+        'dataFormatada', to_char(d, 'DD/MM'),
+        'quantidade', COALESCE(qtd, 0)
+      ) ORDER BY d), '[]'::jsonb)
+      FROM (SELECT d, COUNT(*)::bigint AS qtd FROM no_periodo GROUP BY d) sub)
+    INTO v_agend_qtd, v_agend_por_dia;
 
     v_agendamentos := jsonb_build_object(
       'quantidadeTotal', COALESCE(v_agend_qtd, 0),
@@ -2562,7 +2569,8 @@
   GRANT EXECUTE ON FUNCTION public.get_dashboard_crm(UUID, BIGINT) TO authenticated, anon;
 
   -- Gráficos do dashboard: vendas (etapa venda) e agendamentos (etapa agendamento)
-  -- Totais = cards na etapa; porDia = mesmos cards, data clampada ao período do filtro
+  -- Contam os cards que entraram na etapa dentro do período (data da entrada no historicoCRM);
+  -- porDia agrupa pela mesma data.
   CREATE OR REPLACE FUNCTION public.get_dashboard_vendas(
     p_user_id UUID,
     p_data_inicial TIMESTAMPTZ,
@@ -2577,39 +2585,32 @@
       RETURN jsonb_build_object('valorTotal', 0, 'quantidade', 0, 'porDia', '[]'::jsonb);
     END IF;
 
-    SELECT COALESCE(SUM(c.valor), 0), COUNT(c.id)
-    INTO v_valor, v_qtd
-    FROM public."SAAS_Cards_Quadros" c
-    INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
-    INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
-    WHERE q."contaId" = p_user_id
-      AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'venda'
-      AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id);
-
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
-      'data', to_char(d, 'YYYY-MM-DD'),
-      'dataFormatada', to_char(d, 'DD/MM'),
-      'valor', COALESCE(valor, 0),
-      'quantidade', COALESCE(qtd, 0)
-    ) ORDER BY d), '[]'::jsonb) INTO v_por_dia
-    FROM (
-      SELECT LEAST(
-        (p_data_final AT TIME ZONE 'America/Sao_Paulo')::date,
-        GREATEST(
-          (p_data_inicial AT TIME ZONE 'America/Sao_Paulo')::date,
-          (c.created_at AT TIME ZONE 'America/Sao_Paulo')::date
-        )
-      ) AS d,
-        SUM(c.valor) AS valor,
-        COUNT(*)::bigint AS qtd
+    -- Vendas / faturamento: cards em etapa tipo "venda" que entraram nela dentro do período
+    WITH vendas AS (
+      SELECT c.valor,
+        public.f_crm_card_entrada_etapa(c."historicoCRM", c."etapaQuadroId", c.created_at) AS entrou_em
       FROM public."SAAS_Cards_Quadros" c
       INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
       INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
       WHERE q."contaId" = p_user_id
         AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'venda'
         AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id)
-      GROUP BY 1
-    ) sub;
+    ), no_periodo AS (
+      SELECT valor, (entrou_em AT TIME ZONE 'America/Sao_Paulo')::date AS d
+      FROM vendas
+      WHERE entrou_em >= p_data_inicial AND entrou_em <= p_data_final
+    )
+    SELECT
+      (SELECT COALESCE(SUM(valor), 0) FROM no_periodo),
+      (SELECT COUNT(*) FROM no_periodo),
+      (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'data', to_char(d, 'YYYY-MM-DD'),
+        'dataFormatada', to_char(d, 'DD/MM'),
+        'valor', COALESCE(valor, 0),
+        'quantidade', COALESCE(qtd, 0)
+      ) ORDER BY d), '[]'::jsonb)
+      FROM (SELECT d, SUM(valor) AS valor, COUNT(*)::bigint AS qtd FROM no_periodo GROUP BY d) sub)
+    INTO v_valor, v_qtd, v_por_dia;
 
     RETURN jsonb_build_object(
       'valorTotal', COALESCE(v_valor, 0),
@@ -2633,36 +2634,29 @@
       RETURN jsonb_build_object('quantidadeTotal', 0, 'porDia', '[]'::jsonb);
     END IF;
 
-    SELECT COUNT(c.id) INTO v_qtd
-    FROM public."SAAS_Cards_Quadros" c
-    INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
-    INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
-    WHERE q."contaId" = p_user_id
-      AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'agendamento'
-      AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id);
-
-    SELECT COALESCE(jsonb_agg(jsonb_build_object(
-      'data', to_char(d, 'YYYY-MM-DD'),
-      'dataFormatada', to_char(d, 'DD/MM'),
-      'quantidade', COALESCE(qtd, 0)
-    ) ORDER BY d), '[]'::jsonb) INTO v_por_dia
-    FROM (
-      SELECT LEAST(
-        (p_data_final AT TIME ZONE 'America/Sao_Paulo')::date,
-        GREATEST(
-          (p_data_inicial AT TIME ZONE 'America/Sao_Paulo')::date,
-          (c.created_at AT TIME ZONE 'America/Sao_Paulo')::date
-        )
-      ) AS d,
-        COUNT(*)::bigint AS qtd
+    -- Agendamentos: cards em etapa tipo "agendamento" que entraram nela dentro do período
+    WITH agend AS (
+      SELECT public.f_crm_card_entrada_etapa(c."historicoCRM", c."etapaQuadroId", c.created_at) AS entrou_em
       FROM public."SAAS_Cards_Quadros" c
       INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
       INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
       WHERE q."contaId" = p_user_id
         AND LOWER(TRIM(COALESCE(e."tipoEtapa", ''))) = 'agendamento'
         AND (p_quadro_id IS NULL OR c."quadroId" = p_quadro_id)
-      GROUP BY 1
-    ) sub;
+    ), no_periodo AS (
+      SELECT (entrou_em AT TIME ZONE 'America/Sao_Paulo')::date AS d
+      FROM agend
+      WHERE entrou_em >= p_data_inicial AND entrou_em <= p_data_final
+    )
+    SELECT
+      (SELECT COUNT(*) FROM no_periodo),
+      (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+        'data', to_char(d, 'YYYY-MM-DD'),
+        'dataFormatada', to_char(d, 'DD/MM'),
+        'quantidade', COALESCE(qtd, 0)
+      ) ORDER BY d), '[]'::jsonb)
+      FROM (SELECT d, COUNT(*)::bigint AS qtd FROM no_periodo GROUP BY d) sub)
+    INTO v_qtd, v_por_dia;
 
     RETURN jsonb_build_object(
       'quantidadeTotal', COALESCE(v_qtd, 0),
@@ -2695,14 +2689,18 @@
     v_ini := (date_trunc('day', now() AT TIME ZONE 'America/Sao_Paulo') - interval '29 days') AT TIME ZONE 'America/Sao_Paulo';
     v_fim := ((date_trunc('day', now() AT TIME ZONE 'America/Sao_Paulo') + interval '1 day') AT TIME ZONE 'America/Sao_Paulo') - interval '1 microsecond';
 
-    SELECT COALESCE(SUM(c.valor), 0), COUNT(c.id)
+    -- Vendas dos últimos 30 dias pela data em que o card entrou na etapa de venda
+    SELECT COALESCE(SUM(v.valor), 0), COUNT(*)
     INTO v_faturamento, v_vendas_qtd
-    FROM public."SAAS_Cards_Quadros" c
-    INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
-    INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
-    WHERE q."contaId" = p_user_id
-      AND e."tipoEtapa" = 'venda'
-      AND c.created_at >= v_ini AND c.created_at <= v_fim;
+    FROM (
+      SELECT c.valor, public.f_crm_card_entrada_etapa(c."historicoCRM", c."etapaQuadroId", c.created_at) AS entrou_em
+      FROM public."SAAS_Cards_Quadros" c
+      INNER JOIN public."SAAS_Etapas_Quadros" e ON e.id = c."etapaQuadroId"
+      INNER JOIN public."SAAS_Quadros" q ON q.id = c."quadroId"
+      WHERE q."contaId" = p_user_id
+        AND e."tipoEtapa" = 'venda'
+    ) v
+    WHERE v.entrou_em >= v_ini AND v.entrou_em <= v_fim;
 
     SELECT COUNT(c.id) INTO v_agendamentos_qtd
     FROM public."SAAS_Cards_Quadros" c
@@ -5096,6 +5094,54 @@
   DROP TRIGGER IF EXISTS trg_reordenar_etapas_quadro ON public."SAAS_Etapas_Quadros";
   CREATE TRIGGER trg_reordenar_etapas_quadro BEFORE UPDATE OF ordem ON public."SAAS_Etapas_Quadros"
   FOR EACH ROW WHEN (OLD.ordem IS DISTINCT FROM NEW.ordem) EXECUTE FUNCTION public.f_reordenar_etapas_quadro();
+
+  -- Toda mudança de etapa do card (arrastar no Kanban, chat, contatos, agente IA, API) entra no
+  -- historicoCRM com a data. É dessa data que a dashboard tira quando a venda/agendamento aconteceu.
+  -- Se quem moveu já gravou a movimentação na mesma escrita (ex.: agente IA), não duplica.
+  CREATE OR REPLACE FUNCTION public.f_cards_historico_etapa()
+  RETURNS TRIGGER LANGUAGE plpgsql SET search_path = public AS $$
+  DECLARE
+    v_hist JSONB; v_ult JSONB; v_qtd_antes INT := 0; v_origem_nome TEXT; v_destino_nome TEXT;
+  BEGIN
+    IF NEW."etapaQuadroId" IS NULL THEN RETURN NEW; END IF;
+    IF TG_OP = 'UPDATE' AND NEW."etapaQuadroId" IS NOT DISTINCT FROM OLD."etapaQuadroId" THEN RETURN NEW; END IF;
+
+    v_hist := CASE WHEN jsonb_typeof(NEW."historicoCRM") = 'array' THEN NEW."historicoCRM" ELSE '[]'::jsonb END;
+    IF TG_OP = 'UPDATE' AND jsonb_typeof(OLD."historicoCRM") = 'array' THEN
+      v_qtd_antes := jsonb_array_length(OLD."historicoCRM");
+    END IF;
+    SELECT nome INTO v_destino_nome FROM public."SAAS_Etapas_Quadros" WHERE id = NEW."etapaQuadroId";
+    IF TG_OP = 'UPDATE' AND OLD."etapaQuadroId" IS NOT NULL THEN
+      SELECT nome INTO v_origem_nome FROM public."SAAS_Etapas_Quadros" WHERE id = OLD."etapaQuadroId";
+    END IF;
+
+    IF jsonb_array_length(v_hist) > v_qtd_antes THEN
+      v_ult := v_hist -> -1;
+      IF COALESCE(v_ult->>'etapaDestinoId', v_ult->>'para', v_ult->>'etapaId', v_ult->>'etapa') = NEW."etapaQuadroId"::text THEN
+        -- Já registrado por quem moveu: só completa os nomes das etapas (o que já veio prevalece).
+        NEW."historicoCRM" := (v_hist - -1) || jsonb_build_array(
+          jsonb_strip_nulls(jsonb_build_object('etapaOrigemNome', v_origem_nome, 'etapaDestinoNome', v_destino_nome)) || v_ult
+        );
+        RETURN NEW;
+      END IF;
+    END IF;
+
+    NEW."historicoCRM" := v_hist || jsonb_build_array(jsonb_strip_nulls(jsonb_build_object(
+      'tipo', CASE WHEN TG_OP = 'INSERT' THEN 'criacao' ELSE 'movimentacao' END,
+      'titulo', CASE WHEN TG_OP = 'INSERT' THEN 'Card criado em ' || COALESCE(v_destino_nome, 'etapa ' || NEW."etapaQuadroId") END,
+      'etapaOrigemId', CASE WHEN TG_OP = 'UPDATE' THEN OLD."etapaQuadroId" END,
+      'etapaOrigemNome', v_origem_nome,
+      'etapaDestinoId', NEW."etapaQuadroId",
+      'etapaDestinoNome', v_destino_nome,
+      'data', to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+    )));
+    RETURN NEW;
+  END;
+  $$;
+
+  DROP TRIGGER IF EXISTS trg_cards_historico_etapa ON public."SAAS_Cards_Quadros";
+  CREATE TRIGGER trg_cards_historico_etapa BEFORE INSERT OR UPDATE OF "etapaQuadroId" ON public."SAAS_Cards_Quadros"
+  FOR EACH ROW EXECUTE FUNCTION public.f_cards_historico_etapa();
 
   DROP TRIGGER IF EXISTS trg_reordenar_cards_quadro ON public."SAAS_Cards_Quadros";
   CREATE TRIGGER trg_reordenar_cards_quadro BEFORE UPDATE OF ordem ON public."SAAS_Cards_Quadros"
