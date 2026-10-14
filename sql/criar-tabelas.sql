@@ -10,6 +10,7 @@
 --   3. scripts/pause-dispatch-on-last-disconnected-connection.sql do hublabel-disparador
 --      (swap_connection: pausa o disparo quando cai a última conexão)
 --   4. get_chat_lista (lista do chat numa chamada só) e índices de contatos
+--   5. get_dashboard: tempo médio de abertura só com as mensagens da conta
 -- =============================================================================
 
   -- =========================
@@ -1717,9 +1718,15 @@
     WHERE c."contaId" = p_user_id AND (p_conexao_ids IS NULL OR c."idConexao" = ANY(p_conexao_ids))
       AND m.created_at >= p_data_inicial AND m.created_at <= p_data_final;
 
+    -- Primeira mensagem enviada de cada conversa da conta, buscada conversa a conversa pelo
+    -- índice de "conversaId" (antes agrupava as mensagens enviadas de todas as contas do banco).
     SELECT ROUND(AVG(EXTRACT(EPOCH FROM (prim.primeira_msg - c.created_at)) / 60.0)::numeric, 0) INTO v_tempo_abrir
     FROM public."SAAS_Conversas_Agentes" c
-    INNER JOIN (SELECT "conversaId", MIN(created_at) AS primeira_msg FROM public."SAAS_Mensagens" WHERE "fromMe" = true GROUP BY "conversaId") prim ON prim."conversaId" = c.id
+    CROSS JOIN LATERAL (
+      SELECT MIN(m.created_at) AS primeira_msg
+      FROM public."SAAS_Mensagens" m
+      WHERE m."conversaId" = c.id AND m."fromMe" = true
+    ) prim
     WHERE c."contaId" = p_user_id AND (p_conexao_ids IS NULL OR c."idConexao" = ANY(p_conexao_ids))
       AND prim.primeira_msg >= p_data_inicial AND prim.primeira_msg <= p_data_final;
 
@@ -1928,10 +1935,16 @@
             'tempoMedioFechamentoHoras', ROUND((AVG(EXTRACT(EPOCH FROM (c."dataFechamento" - c.created_at)) / 3600.0) FILTER (WHERE c."dataFechamento" IS NOT NULL))::numeric, 1)
           ) AS stats
         FROM public."SAAS_Conversas_Agentes" c
-        INNER JOIN (SELECT "conversaId", MIN(created_at) AS primeira_msg FROM public."SAAS_Mensagens" WHERE "fromMe" = true GROUP BY "conversaId") prim ON prim."conversaId" = c.id
+        -- Igual ao tempo de abertura acima: só as conversas da conta, com pelo menos uma mensagem enviada.
+        CROSS JOIN LATERAL (
+          SELECT MIN(m.created_at) AS primeira_msg, COUNT(*) AS enviadas
+          FROM public."SAAS_Mensagens" m
+          WHERE m."conversaId" = c.id AND m."fromMe" = true
+        ) prim
         WHERE c."contaId" = p_user_id AND (p_conexao_ids IS NULL OR c."idConexao" = ANY(p_conexao_ids))
           AND c.created_at >= p_data_inicial AND c.created_at <= p_data_final
           AND c.atendente IS NOT NULL
+          AND prim.enviadas > 0
         GROUP BY c.atendente
       ) s ON s.atendente = u.id
       WHERE u."contaId" = p_user_id
