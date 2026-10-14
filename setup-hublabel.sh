@@ -424,6 +424,7 @@ d = json.load(open(arq))[0]
 
 if tipo == "service":
     cs = d["Spec"]["TaskTemplate"]["ContainerSpec"]
+    imagem = cs.get("Image") or ""
     args = (cs.get("Command") or []) + (cs.get("Args") or [])
     mounts = [(m.get("Source"), m.get("Target")) for m in (cs.get("Mounts") or []) if m.get("Type") == "bind"]
     redes = []
@@ -436,6 +437,7 @@ if tipo == "service":
         if nome:
             redes.append(nome)
 else:
+    imagem = (d.get("Config") or {}).get("Image") or ""
     args = [d.get("Path", "")] + (d.get("Args") or [])
     mounts = [(m.get("Source"), m.get("Destination")) for m in (d.get("Mounts") or []) if m.get("Type") == "bind"]
     redes = list((d.get("NetworkSettings") or {}).get("Networks", {}).keys())
@@ -498,6 +500,32 @@ if not rede:
             rede = r
             break
 
+def versao_traefik():
+    """Versão principal do Traefik: pela tag da imagem ou perguntando ao próprio Traefik."""
+    m = re.search(r":v?(\d+)(?:\.|$|@|-)", imagem.split("/")[-1])
+    if m:
+        return int(m.group(1))
+    try:
+        if tipo == "service":
+            cid = subprocess.run(["docker", "ps", "-q", "-f", f"label=com.docker.swarm.service.name={d['Spec']['Name']}"],
+                                 capture_output=True, text=True, timeout=10).stdout.split()
+        else:
+            cid = [d.get("Id", "")]
+        if cid and cid[0]:
+            saida = subprocess.run(["docker", "exec", cid[0], "traefik", "version"],
+                                   capture_output=True, text=True, timeout=15).stdout
+            m = re.search(r"Version:\s*v?(\d+)\.", saida)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+## Traefik v2 não tem o provedor "swarm" (Swarm é o docker com swarmMode): com a label
+## traefik.swarm.network ele recusa as labels e ignora o serviço inteiro (404)
+if versao_traefik() == 2:
+    swarm = False
+
 if swarm:
     rota, label = "labels", "traefik.swarm.network"
 elif docker:
@@ -507,7 +535,7 @@ elif pasta:
 else:
     ## Sem nada declarado: o padrão do Traefik em Swarm (v3) ou container
     rota = "labels"
-    label = "traefik.swarm.network" if tipo == "service" else "traefik.docker.network"
+    label = "traefik.swarm.network" if tipo == "service" and versao_traefik() != 2 else "traefik.docker.network"
 
 pasta_host = no_host(pasta) if pasta else ""
 
