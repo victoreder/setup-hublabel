@@ -10,7 +10,8 @@
 ##   - Traefik (Portainer, EasyPanel, Coolify, Dokploy...) ... usa o Traefik que já existe
 ##   - Outro proxy (nginx...) ... sobe sem proxy e mostra o que apontar
 ##   - Versão antiga (v1.8: N8N no app.* + Disparador) ... oferece trocar pela nova:
-##     remove o N8N e o Disparador, mantém a Evolution e o MinIO e usa os dados deles
+##     remove o Disparador (e o N8N, ou mantém o N8N só em app.*/webhook/... com os
+##     fluxos [SAAS] HUBLABEL desativados), mantém a Evolution e o MinIO e usa os dados deles
 ##
 ## COMANDO (como root):
 ##   bash <(curl -sSL https://raw.githubusercontent.com/victoreder/setup-hublabel/main/setup-hublabel.sh)
@@ -608,6 +609,11 @@ APP_HOST_ANTIGO=""; EVO_HOST_ANTIGO=""; S3_HOST_ANTIGO=""
 ANTIGO_N8N=(); ANTIGO_DISPARADOR=(); ANTIGO_CONTAINERS=()
 REMOVER_STACKS=(); REMOVER_SERVICOS=()
 EVO_EXTERNA=0; S3_EXTERNO=0; EVO_SERVICO_EXT=""; MINIO_SERVICO_EXT=""
+## Manter o N8N: ele sai do app.* (fica só em app.*/webhook/...) e os fluxos [SAAS] HUBLABEL são desativados
+MANTER_N8N=0; N8N_TRAEFIK_WEBHOOK=""; N8N_TRAEFIK_EDITOR=""
+N8N_SERVICO_WEBHOOK=""; N8N_SERVICO_EDITOR=""; N8N_ROUTER_WEBHOOK=""; N8N_TEM_MIDDLEWARE=0
+## Prefixo dos fluxos do HubLabel antigo no N8N: "[SAAS] HUBLABEL - <versão>"
+PREFIXO_FLUXOS_SAAS="[SAAS] HUBLABEL"
 
 ## Variável de ambiente de um serviço do Swarm ou container: env_de service|container NOME VAR
 env_de() {
@@ -642,6 +648,9 @@ hosts_do_servico() {
         done
     } | tr 'A-Z' 'a-z' | awk 'NF && !visto[$0]++'
 }
+
+## Labels de um serviço do Swarm, uma por linha: chave=valor
+labels_de() { docker service inspect -f '{{range $k, $v := .Spec.Labels}}{{$k}}={{$v}}{{println}}{{end}}' "$1" 2>/dev/null </dev/null; }
 
 ## Preenche VAR com o valor (só se VAR ainda estiver vazia)
 preencher() { [ -z "${!1:-}" ] && [ -n "$2" ] && printf -v "$1" '%s' "$2"; return 0; }
@@ -703,6 +712,22 @@ detectar_versao_antiga() {
 
     [ ${#ANTIGO_N8N[@]} -gt 0 ] || [ ${#ANTIGO_DISPARADOR[@]} -gt 0 ] || [ ${#ANTIGO_CONTAINERS[@]} -gt 0 ] || return 1
 
+    ## Nomes do N8N no Traefik: o serviço com o roteador do app.* é o de webhook; o outro é o editor
+    local r t
+    for nome in "${ANTIGO_N8N[@]}"; do
+        labels_de "$nome" >"$TMP/labels"
+        t="$(sed -n 's/^traefik\.http\.services\.\([^.]*\)\.loadbalancer\.server\.port=.*/\1/p' "$TMP/labels" | head -1)"
+        [ -n "$t" ] || continue
+        r="$(awk -v h="Host(\`$app\`)" 'index($0, "traefik.http.routers.") == 1 && $0 ~ /^[^=]*\.rule=/ && index($0, h) {
+                split($0, p, "."); print p[4]; exit }' "$TMP/labels")"
+        if [ -n "$r" ] && [ -z "$N8N_TRAEFIK_WEBHOOK" ]; then
+            N8N_TRAEFIK_WEBHOOK="$t"; N8N_SERVICO_WEBHOOK="$nome"; N8N_ROUTER_WEBHOOK="$r"
+            grep -q "^traefik\.http\.routers\.$r\.middlewares=" "$TMP/labels" && N8N_TEM_MIDDLEWARE=1
+        elif [ -z "$r" ] && [ -z "$N8N_TRAEFIK_EDITOR" ]; then
+            N8N_TRAEFIK_EDITOR="$t"; N8N_SERVICO_EDITOR="$nome"
+        fi
+    done
+
     APP_HOST_ANTIGO="$app"
     SUPABASE_URL="${SUPABASE_URL:+$(normalizar_supabase_url "$SUPABASE_URL")}"
 
@@ -756,15 +781,13 @@ oferecer_migracao() {
     [ "$S3_EXTERNO" = 1 ] && item "Arquivos" "$S3_HOST_ANTIGO  (MinIO)"
     fechar_bloco
     abrir_bloco "O QUE A NOVA VERSÃO FAZ" "$azul"
-    item "Remove" "o N8N e o Disparador antigo"
+    item "Remove" "o Disparador antigo"
     item "Instala" "o novo HubLabel em ${APP_HOST_ANTIGO:-app.seudominio}"
     local mantem=""
     [ "$EVO_EXTERNA" = 1 ] && mantem+="Evolution (WhatsApps conectados), "
     [ "$S3_EXTERNO" = 1 ] && mantem+="MinIO (arquivos), "
     item "Mantém" "${mantem}Portainer e o seu Supabase"
     fechar_bloco
-    aviso "Os fluxos do N8N deixam de existir. Exporte antes o que quiser guardar."
-    echo ""
     sim_nao "Deseja instalar a nova versão?" S
     if [ $? != 0 ]; then
         echo ""
@@ -772,6 +795,22 @@ oferecer_migracao() {
         exit 0
     fi
     MIGRACAO=1
+    if [ ${#ANTIGO_N8N[@]} -gt 0 ]; then
+        echo ""
+        texto "E o ${branco}N8N${reset}? Ele é usado para outros fluxos, além do HubLabel?"
+        if [ -n "$N8N_TRAEFIK_WEBHOOK" ] && [ "$MODO_ROTA" = labels ]; then
+            dica "S = manter: os fluxos \"$PREFIXO_FLUXOS_SAAS - ...\" são desativados e os outros continuam,"
+            dica "    com o link de webhook em https://$APP_HOST_ANTIGO/webhook/..."
+            dica "N = remover o N8N (os fluxos deixam de existir; exporte antes o que quiser guardar)"
+            echo ""
+            sim_nao "Manter o N8N?" S
+            [ $? != 1 ] && MANTER_N8N=1
+        else
+            aviso "Não consegui separar o N8N do novo sistema nesta VPS: ele será removido."
+            aviso "Os fluxos do N8N deixam de existir. Exporte antes o que quiser guardar."
+            enter "Aperte Enter para continuar (ou Ctrl+C para cancelar)..."
+        fi
+    fi
     if [ "$EVO_EXTERNA" = 1 ] && [ -z "${EVOLUTION_API_KEY:-}" ]; then
         echo ""
         texto "Não encontrei a API Key global da Evolution atual."
@@ -782,8 +821,9 @@ oferecer_migracao() {
 ## Monta a lista do que remover: a stack inteira só quando ela tem apenas N8N, Redis e Disparador
 planejar_remocao() {
     REMOVER_STACKS=(); REMOVER_SERVICOS=()
-    local s ns outros
-    for s in "${ANTIGO_N8N[@]}" "${ANTIGO_DISPARADOR[@]}"; do
+    local s ns outros alvos=("${ANTIGO_DISPARADOR[@]}")
+    [ "$MANTER_N8N" = 1 ] || alvos+=("${ANTIGO_N8N[@]}")
+    for s in "${alvos[@]}"; do
         ns="$(ns_de "$s")"
         if [ -n "$ns" ]; then
             outros="$(docker service ls --filter "label=com.docker.stack.namespace=$ns" --format '{{.Image}}' 2>/dev/null \
@@ -861,8 +901,82 @@ remover_versao_antiga() {
     for ns in "${REMOVER_STACKS[@]}"; do docker stack rm "$ns" >/dev/null 2>&1; done
     for s in "${REMOVER_SERVICOS[@]}"; do docker service rm "$s" >/dev/null 2>&1; done
     for s in "${ANTIGO_CONTAINERS[@]}"; do docker rm -f "$s" >/dev/null 2>&1; done
-    esperar "Removendo o N8N e o Disparador antigo" 180 antigos_removidos \
+    esperar "Removendo $([ "$MANTER_N8N" = 1 ] || echo "o N8N e ")o Disparador antigo" 180 antigos_removidos \
         || aviso "Ainda tem partes da versão antiga saindo. Se o sistema não abrir, confira no Portainer."
+}
+
+## ---------------------------------------------------------------- Manter o N8N
+## Comando do N8N dentro do container dele (usa o banco configurado no próprio container)
+n8n_cli() { docker exec "$N8N_CID" n8n "$@" </dev/null; }
+
+## Fluxos ativos do HubLabel antigo, um por linha: id|nome
+fluxos_saas_ativos() {
+    n8n_cli list:workflow --active=true 2>/dev/null \
+        | awk -v pre="$PREFIXO_FLUXOS_SAAS" -F'|' 'NF >= 2 && $1 ~ /^[A-Za-z0-9]+$/ && index(toupper(substr($0, length($1) + 2)), toupper(pre)) == 1'
+}
+
+## n8n 2.x usa unpublish; versões anteriores, update --active=false
+desativar_fluxos() {
+    local id
+    for id in "$@"; do
+        n8n_cli unpublish:workflow --id="$id" >/dev/null 2>&1 \
+            || n8n_cli update:workflow --id="$id" --active=false >/dev/null 2>&1
+    done
+    return 0
+}
+
+## Reinicia o N8N para valer a mudança dos fluxos; no serviço de webhook tira também o
+## middleware que acrescentava /webhook (o link volta a ser o padrão: app.*/webhook/...)
+reiniciar_n8n() {
+    local ns s img extra
+    ns="$(ns_de "$N8N_SERVICO_WEBHOOK")"
+    if [ -n "$ns" ]; then
+        docker service ls --filter "label=com.docker.stack.namespace=$ns" --format '{{.Name}} {{.Image}}' >"$TMP/n8n_servicos"
+    else
+        printf '%s n8n\n' "${ANTIGO_N8N[@]}" >"$TMP/n8n_servicos"
+    fi
+    while read -r s img; do
+        [[ "${img,,}" == *n8n* ]] || continue
+        extra=()
+        [ "$s" = "$N8N_SERVICO_WEBHOOK" ] && [ "$N8N_TEM_MIDDLEWARE" = 1 ] \
+            && extra=(--label-rm "traefik.http.routers.$N8N_ROUTER_WEBHOOK.middlewares")
+        docker service update --detach --force "${extra[@]}" "$s" >/dev/null 2>&1 </dev/null || return 1
+    done <"$TMP/n8n_servicos"
+}
+
+ajustar_n8n_mantido() {
+    local svc ids=() lista restantes
+    svc="${N8N_SERVICO_EDITOR:-$N8N_SERVICO_WEBHOOK}"
+    N8N_CID="$(docker ps -q -f "label=com.docker.swarm.service.name=$svc" | head -1)"
+    if [ -z "$N8N_CID" ]; then
+        aviso "O N8N não está rodando: desative à mão os fluxos \"$PREFIXO_FLUXOS_SAAS - ...\"."
+    else
+        girar "Procurando os fluxos \"$PREFIXO_FLUXOS_SAAS\" no N8N" fluxos_saas_ativos
+        lista="$(cat "$TMP/ultimo.log")"
+        if [ -n "$lista" ]; then
+            mapfile -t ids < <(printf '%s\n' "$lista" | cut -d'|' -f1)
+            girar "Desativando ${#ids[@]} fluxo(s) do HubLabel antigo" desativar_fluxos "${ids[@]}"
+            restantes="$(fluxos_saas_ativos)"
+            if [ -n "$restantes" ]; then
+                aviso "Não consegui desativar estes fluxos. Desative no editor do N8N:"
+                printf '%s\n' "$restantes" | cut -d'|' -f2- | sed 's/^/      - /'
+            fi
+        else
+            ok "Nenhum fluxo \"$PREFIXO_FLUXOS_SAAS\" ativo"
+        fi
+    fi
+    girar "Reiniciando o N8N" reiniciar_n8n || aviso "Não consegui reiniciar o N8N. Reinicie a stack dele no Portainer."
+}
+
+## O N8N responde a webhook que não existe com "The requested webhook ... is not registered"
+n8n_no_ar() {
+    curl -sk --max-time 10 --resolve "$APP_HOST:443:127.0.0.1" "https://$APP_HOST/webhook/hublabel-teste-de-rota" \
+        | grep -qi 'is not registered\|requested webhook'
+}
+
+verificar_rota_n8n() {
+    esperar "Conferindo os webhooks do N8N em https://$APP_HOST/webhook/" 120 n8n_no_ar && return 0
+    aviso "O N8N ainda não respondeu em https://$APP_HOST/webhook/. Confira a stack dele no Portainer."
 }
 
 ## ============================================================================
@@ -1383,7 +1497,12 @@ assistente() {
         fechar_bloco
         if [ "$MIGRACAO" = 1 ]; then
             abrir_bloco "VERSÃO ANTIGA" "$amarelo"
-            item "Remover" "N8N e Disparador antigo"
+            if [ "$MANTER_N8N" = 1 ]; then
+                item "Remover" "Disparador antigo"
+                item "Manter" "N8N em https://$APP_HOST/webhook/... (fluxos $PREFIXO_FLUXOS_SAAS desativados)"
+            else
+                item "Remover" "N8N e Disparador antigo"
+            fi
             [ "$EVO_EXTERNA" = 1 ] && item "Manter" "Evolution em $EVO_HOST (WhatsApps conectados)"
             [ "$S3_EXTERNO" = 1 ] && item "Manter" "MinIO em $S3_HOST (arquivos)"
             fechar_bloco
@@ -1450,7 +1569,7 @@ VARS_SALVAS=(MODO_DEPLOY MODO_ROTA PAINEL TRAEFIK_RESOLVER TRAEFIK_ENTRYPOINT TR
     DOMINIO_BASE SUB_APP SUB_EVO SUB_S3 APP_HOST EVO_HOST S3_HOST
     SUPABASE_URL SUPABASE_ANON_KEY SUPABASE_SERVICE_ROLE_KEY LICENCA_EMAIL BACK_PATH NOME_SISTEMA ADMIN_EMAIL
     EVOLUTION_API_KEY POSTGRES_PASSWORD MINIO_ROOT_USER MINIO_ROOT_PASSWORD S3_ACCESS_KEY S3_SECRET_KEY
-    EVO_EXTERNA S3_EXTERNO MINIO_SERVICO_EXT)
+    EVO_EXTERNA S3_EXTERNO MINIO_SERVICO_EXT MANTER_N8N N8N_TRAEFIK_WEBHOOK N8N_TRAEFIK_EDITOR)
 
 salvar_config() {
     mkdir -p "$DIR"
@@ -1517,6 +1636,24 @@ labels_traefik() { # labels_traefik ROUTER HOST PORTA INDENT
     printf '%s- traefik.http.services.%s.loadbalancer.server.port=%s\n' "$ind" "$n" "$p"
     printf '%s- traefik.http.services.%s.loadbalancer.passhostheader=true\n' "$ind" "$n"
     [ -n "$TRAEFIK_LABEL_REDE" ] && printf '%s- %s=%s\n' "$ind" "$TRAEFIK_LABEL_REDE" "$TRAEFIK_REDE"
+    if [ "$n" = hublabel_app ] && [ "${MANTER_N8N:-0}" = 1 ]; then
+        ## N8N mantido: o app.* é do sistema (acima do roteador antigo do N8N) e só /webhook... vai para o N8N
+        printf '%s- traefik.http.routers.%s.priority=100\n' "$ind" "$n"
+        rota_n8n hublabel_n8n 'PathPrefix(`/webhook/`) || PathPrefix(`/webhook-waiting/`)' "$N8N_TRAEFIK_WEBHOOK" "$h" "$ind"
+        ## URL de teste fica no editor (processo principal do N8N)
+        rota_n8n hublabel_n8n_teste 'PathPrefix(`/webhook-test/`)' "${N8N_TRAEFIK_EDITOR:-$N8N_TRAEFIK_WEBHOOK}" "$h" "$ind"
+    fi
+}
+
+## Roteador do sistema que aponta para um serviço do N8N (definido na stack dele)
+rota_n8n() { # rota_n8n ROUTER CAMINHOS SERVICO HOST INDENT
+    local n="$1" caminhos="$2" s="$3" h="$4" ind="$5"
+    printf '%s- traefik.http.routers.%s.rule=Host(`%s`) && (%s)\n' "$ind" "$n" "$h" "$caminhos"
+    printf '%s- traefik.http.routers.%s.entrypoints=%s\n' "$ind" "$n" "$TRAEFIK_ENTRYPOINT"
+    printf '%s- traefik.http.routers.%s.priority=1000\n' "$ind" "$n"
+    printf '%s- traefik.http.routers.%s.tls=true\n' "$ind" "$n"
+    [ -n "$TRAEFIK_RESOLVER" ] && printf '%s- traefik.http.routers.%s.tls.certresolver=%s\n' "$ind" "$n" "$TRAEFIK_RESOLVER"
+    printf '%s- traefik.http.routers.%s.service=%s\n' "$ind" "$n" "$s"
 }
 
 ## Bloco final de cada serviço: redes, portas, labels e deploy/restart.
@@ -2073,6 +2210,12 @@ resumo_final() {
     abrir_bloco "SUPABASE" "$azul"
     item "Projeto" "$SUPABASE_URL"
     fechar_bloco
+    if [ "${MANTER_N8N:-0}" = 1 ]; then
+        abrir_bloco "N8N (MANTIDO)" "$roxo"
+        item "Webhooks" "https://$APP_HOST/webhook/..."
+        item "Atenção" "links de webhook dos seus fluxos agora têm /webhook"
+        fechar_bloco
+    fi
     if [ "$MODO_ROTA" = manual ]; then
         abrir_bloco "FALTA UM PASSO: CADASTRE OS DOMÍNIOS NO SEU PAINEL (COM HTTPS)" "$amarelo"
         item "$APP_HOST" "→ http://127.0.0.1:$PORTA_APP"
@@ -2104,11 +2247,13 @@ instalar() {
     salvar_config
     gerar_arquivo_deploy
     [ "$MIGRACAO" = 1 ] && remover_versao_antiga
+    [ "$MANTER_N8N" = 1 ] && ajustar_n8n_mantido
     subir
     configurar_minio
     configurar_sistema
     aguardar_sistema
     verificar_https
+    [ "$MANTER_N8N" = 1 ] && verificar_rota_n8n
     resumo_final
 }
 
