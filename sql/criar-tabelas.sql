@@ -70,7 +70,8 @@
       menu_ocultar JSONB DEFAULT '[]'::jsonb,
       "apiNaoOficial" TEXT NOT NULL DEFAULT 'evolution',
       "liberarApiOficial" BOOLEAN NOT NULL DEFAULT false,
-      "liberarEmail" BOOLEAN NOT NULL DEFAULT false
+      "liberarEmail" BOOLEAN NOT NULL DEFAULT false,
+      "iaChaveCliente" BOOLEAN NOT NULL DEFAULT false
     );
 
     CREATE TABLE IF NOT EXISTS public."SAAS_Contas" (
@@ -557,6 +558,8 @@
     ) THEN
       ALTER TABLE public."SAAS_Planos" ADD COLUMN "liberarEmail" BOOLEAN NOT NULL DEFAULT false;
     END IF;
+    -- true: a conta usa a própria chave de IA (Configurações) e não tem limite de créditos
+    ALTER TABLE public."SAAS_Planos" ADD COLUMN IF NOT EXISTS "iaChaveCliente" BOOLEAN NOT NULL DEFAULT false;
   END$$;
 
   -- Planos existentes: mantém comportamento anterior (libera API oficial, exceto Free)
@@ -2963,6 +2966,17 @@
     BEFORE INSERT OR UPDATE ON public."SAAS_Contas"
     FOR EACH ROW EXECUTE FUNCTION public.trg_contas_data_validade();
 
+  -- Plano com "iaChaveCliente": a conta paga a própria OpenAI, então não acumula créditos.
+  CREATE OR REPLACE FUNCTION public.f_conta_usa_chave_ia_cliente(p_conta_id uuid)
+  RETURNS boolean LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+    SELECT COALESCE((
+      SELECT p."iaChaveCliente"
+      FROM public."SAAS_Contas" c
+      JOIN public."SAAS_Planos" p ON p.id = c.plano
+      WHERE c.id = p_conta_id
+    ), false);
+  $$;
+
   -- Funções de disparo (p_user_id = contaId)
   CREATE OR REPLACE FUNCTION public.f_add_tokens_usuario_por_agente(p_id_agente bigint, p_qnt_tokens numeric)
   RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
@@ -2971,6 +2985,9 @@
     SELECT a."contaId" INTO v_conta_id FROM public."SAAS_AgentesIA" a WHERE a.id = p_id_agente LIMIT 1;
     IF v_conta_id IS NULL THEN
       RETURN jsonb_build_object('ok', false, 'error', 'Agente não encontrado', 'id_agente_informado', p_id_agente);
+    END IF;
+    IF public.f_conta_usa_chave_ia_cliente(v_conta_id) THEN
+      RETURN jsonb_build_object('ok', true, 'id_agente', p_id_agente, 'contaId', v_conta_id, 'ignorado', true, 'motivo', 'chave_ia_cliente');
     END IF;
     SELECT COALESCE(c.tokens, 0) INTO v_atual FROM public."SAAS_Contas" c WHERE c.id = v_conta_id;
     v_novo := v_atual + p_qnt_tokens;
@@ -4165,6 +4182,9 @@
     IF p_qnt_tokens IS NULL OR p_qnt_tokens <= 0 THEN
       RETURN jsonb_build_object('ok', true, 'contaId', p_conta_id, 'ignorado', true);
     END IF;
+    IF public.f_conta_usa_chave_ia_cliente(p_conta_id) THEN
+      RETURN jsonb_build_object('ok', true, 'contaId', p_conta_id, 'ignorado', true, 'motivo', 'chave_ia_cliente');
+    END IF;
     SELECT COALESCE(c.tokens, 0) INTO v_atual FROM public."SAAS_Contas" c WHERE c.id = p_conta_id;
     IF NOT FOUND THEN
       RETURN jsonb_build_object('ok', false, 'error', 'Conta não encontrada', 'contaId', p_conta_id);
@@ -5266,10 +5286,10 @@
   CREATE OR REPLACE VIEW public."vw_Planos_Usuarios_Count" WITH (security_invoker = true) AS
   SELECT p.id, p.created_at, p.nome, p.preco, p."qntConexoes", p."qntContatos", p."qntDisparos",
     COUNT(c.id) AS total_usuarios, p."qntUsuarios", p."qntQuadros", p."qntAgentesIa", p."qntCreditosIa", p.menu_ocultar,
-    p."apiNaoOficial", p."liberarApiOficial", p."liberarEmail", p."diasValidade"
+    p."apiNaoOficial", p."liberarApiOficial", p."liberarEmail", p."diasValidade", p."iaChaveCliente"
   FROM public."SAAS_Planos" p
   LEFT JOIN public."SAAS_Contas" c ON c.plano = p.id
-  GROUP BY p.id, p.created_at, p.nome, p.preco, p."qntConexoes", p."qntContatos", p."qntDisparos", p."qntUsuarios", p."qntQuadros", p."qntAgentesIa", p."qntCreditosIa", p.menu_ocultar, p."apiNaoOficial", p."liberarApiOficial", p."liberarEmail", p."diasValidade";
+  GROUP BY p.id, p.created_at, p.nome, p.preco, p."qntConexoes", p."qntContatos", p."qntDisparos", p."qntUsuarios", p."qntQuadros", p."qntAgentesIa", p."qntCreditosIa", p.menu_ocultar, p."apiNaoOficial", p."liberarApiOficial", p."liberarEmail", p."diasValidade", p."iaChaveCliente";
 
   -- vw_Detalhes_Completo: modelo novo (etiquetas) - grupos são contatos com tipo='grupo'
   DROP VIEW IF EXISTS public."vw_Detalhes_Completo" CASCADE;
@@ -5295,10 +5315,13 @@
     CASE WHEN COALESCE(c.status, false) THEN p."qntDisparos" ELSE 0 END AS "plano_qntDisparos",
     CASE WHEN COALESCE(c.status, false) THEN p."qntQuadros" ELSE 0 END AS "plano_qntQuadros",
     CASE WHEN COALESCE(c.status, false) THEN p."qntAgentesIa" ELSE 0 END AS "planoQntAgentes",
-    CASE WHEN COALESCE(c.status, false) THEN p."qntCreditosIa" ELSE 0 END AS "planoQntCreditos",
+    CASE WHEN NOT COALESCE(c.status, false) THEN 0
+         WHEN COALESCE(p."iaChaveCliente", false) THEN NULL
+         ELSE p."qntCreditosIa" END AS "planoQntCreditos",
     COALESCE(p."apiNaoOficial", 'evolution') AS "apiNaoOficial",
     COALESCE(p."liberarApiOficial", false) AS "liberarApiOficial",
     COALESCE(p."liberarEmail", false) AS "liberarEmail",
+    COALESCE(p."iaChaveCliente", false) AS "iaChaveCliente",
     COALESCE(cx.total_conexoes, 0::bigint) AS total_conexoes,
     COALESCE(ct.total_contatos, 0::bigint) AS total_contatos, COALESCE(dd.total_disparos, 0::bigint) AS total_disparos,
     COALESCE(qd.total_quadros, 0::bigint) AS total_quadros,
@@ -5356,7 +5379,7 @@
     a."aparecerDigitando", a."pausarAtendimento", a."qntMsgHistorico", a."agruparMensagens", a."intervaloEntreMensagens",
     COALESCE(cnv.conversas_atendimento, 0::bigint) AS "conversasAtendimento",
     COALESCE(cnv.conversas_pausadas, 0::bigint) AS "ConversasPausadas",
-    CASE WHEN p."qntCreditosIa" IS NULL THEN false
+    CASE WHEN p."qntCreditosIa" IS NULL OR COALESCE(p."iaChaveCliente", false) THEN false
         ELSE COALESCE(uc.total_creditos, 0::bigint) >= p."qntCreditosIa"
     END AS "limiteAtingido",
     a."CRM"
@@ -5729,6 +5752,22 @@
     CREATE POLICY "insert_config_ia" ON public."SAAS_Config_IA" FOR INSERT TO authenticated WITH CHECK ((SELECT public.rls_eh_super_admin()));
     CREATE POLICY "update_config_ia" ON public."SAAS_Config_IA" FOR UPDATE TO authenticated USING ((SELECT public.rls_eh_super_admin())) WITH CHECK ((SELECT public.rls_eh_super_admin()));
   END$$;
+
+  -- Chave de IA da própria conta (planos com "iaChaveCliente" = true).
+  -- Só o backend (service_role) lê/grava: a tela de Configurações salva pela rota
+  -- /config-ia-conta e nunca recebe a chave de volta (só os últimos dígitos).
+  CREATE TABLE IF NOT EXISTS public."SAAS_Contas_Config_IA" (
+    "contaId" UUID PRIMARY KEY REFERENCES public."SAAS_Contas"(id) ON UPDATE CASCADE ON DELETE CASCADE,
+    "tipoIA" TEXT NOT NULL DEFAULT 'openai',
+    apikey TEXT,
+    updated_at TIMESTAMPTZ DEFAULT now(),
+    CONSTRAINT contas_config_ia_tipo_check CHECK ("tipoIA" IN ('openai'))
+  );
+
+  ALTER TABLE public."SAAS_Contas_Config_IA" ENABLE ROW LEVEL SECURITY;
+  REVOKE ALL ON public."SAAS_Contas_Config_IA" FROM anon, authenticated;
+  DROP POLICY IF EXISTS "service_role_full_access" ON public."SAAS_Contas_Config_IA";
+  CREATE POLICY "service_role_full_access" ON public."SAAS_Contas_Config_IA" TO service_role USING (true) WITH CHECK (true);
 
   -- =========================
   -- Vídeos da Central de Ajuda (ajuda.html + aba Personalização no admin)
