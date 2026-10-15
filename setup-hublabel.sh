@@ -2297,7 +2297,7 @@ menu_instalacao_existente() {
     echo ""
     gerar_arquivo_deploy
     subir
-    configurar_minio
+    ## O MinIO já foi configurado na instalação: a chave salva continua valendo
     aguardar_sistema
     echo ""
     ok "${negrito}Atualização concluída!${reset}"
