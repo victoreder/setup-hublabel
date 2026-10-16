@@ -2293,6 +2293,18 @@ menu_instalacao_existente() {
     echo ""
     sim_nao "Deseja atualizar para a versão mais nova?" S || exit 0
     banner
+    titulo_caixa "ANTES DE ATUALIZAR: RODE O SQL NOVO"
+    echo ""
+    texto "A versão nova pode trazer ajustes nas tabelas do seu Supabase."
+    dica "Pode rodar sem medo: ele só cria o que falta e atualiza as funções. Seus dados ficam."
+    echo ""
+    instrucao "1." "Copie o ${branco}SQL${reset} deste link:"
+    echo -e "      ${verde}$SQL_URL${reset}"
+    instrucao "2." "Abra o ${branco}SQL Editor${reset} do seu Supabase e cole o SQL"
+    instrucao "3." "Clique em ${branco}Run${reset} e espere aparecer ${branco}Success${reset}"
+    echo ""
+    enter "Aperte Enter depois de rodar o SQL para continuar..."
+    banner
     titulo_caixa "ATUALIZANDO SEU SISTEMA" "$roxo"
     echo ""
     gerar_arquivo_deploy
