@@ -1448,12 +1448,25 @@ passo_licenca() {
 }
 
 ## ---------------------------------------------------------------- Passo 5: seu sistema
-## Busca um usuário do sistema pelo e-mail → imprime o id (vazio se não existe)
+## Busca o login (Supabase Auth) pelo e-mail → imprime o id (vazio se não existe)
+## É o Auth que define se a pessoa já tem senha; a tabela SAAS_Usuarios pode ter sobras.
 usuario_por_email() {
-    local q
-    q="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1")"
-    supabase_curl "$SUPABASE_SERVICE_ROLE_KEY" "$SUPABASE_URL/rest/v1/SAAS_Usuarios?select=id&Email=eq.$q&limit=1" >/dev/null
-    sed -n 's/.*"id" *: *"\([^"]*\)".*/\1/p' "$TMP/resp"
+    local pagina=1 achou
+    while [ "$pagina" -le 100 ]; do
+        [ "$(supabase_curl "$SUPABASE_SERVICE_ROLE_KEY" "$SUPABASE_URL/auth/v1/admin/users?page=$pagina&per_page=1000")" = 200 ] || return 0
+        achou="$(python3 -I -c '
+import json, sys
+r = json.load(open(sys.argv[1]))
+lista = r.get("users", []) if isinstance(r, dict) else r
+for a in lista:
+    if (a.get("email") or "").lower() == sys.argv[2].lower():
+        print(a["id"]); break
+else:
+    print("" if len(lista) < 1000 else "+")
+' "$TMP/resp" "$1" 2>/dev/null)"
+        [ "$achou" = "+" ] || { printf '%s' "$achou"; return 0; }
+        pagina=$((pagina + 1))
+    done
 }
 
 passo_acesso() {
@@ -2118,7 +2131,7 @@ configurar_sistema() {
 import json, os, time, urllib.error, urllib.parse, urllib.request
 
 url, chave = os.environ["SB_URL"], os.environ["SB_KEY"]
-email, senha = os.environ["ADMIN_EMAIL"], os.environ["ADMIN_SENHA"]
+email, senha = os.environ["ADMIN_EMAIL"].strip().lower(), os.environ["ADMIN_SENHA"]
 nome_sistema = os.environ["NOME_SISTEMA"]
 ## Sem nome informado: o nome do usuário é o próprio e-mail
 nome_admin = email
@@ -2145,8 +2158,25 @@ def chamar(metodo, caminho, corpo=None, extra=None):
         return 0, str(e)
 
 
-def usuario():
-    _, r = chamar("GET", f'/rest/v1/SAAS_Usuarios?select=id,auth_user_id,"contaId"&Email=eq.{q(email)}&limit=1')
+def auth_usuario():
+    """Procura o e-mail no Auth do Supabase (a fonte da verdade do login)."""
+    pagina = 1
+    while pagina <= 100:
+        cod, r = chamar("GET", f"/auth/v1/admin/users?page={pagina}&per_page=1000")
+        if cod != 200:
+            return None, f"não consegui consultar os usuários do Auth (HTTP {cod})"
+        lista = r.get("users", []) if isinstance(r, dict) else (r if isinstance(r, list) else [])
+        for a in lista:
+            if (a.get("email") or "").lower() == email:
+                return a, None
+        if len(lista) < 1000:
+            return None, None
+        pagina += 1
+    return None, None
+
+
+def usuario(auth_id):
+    _, r = chamar("GET", f'/rest/v1/SAAS_Usuarios?select=id,auth_user_id,"contaId"&auth_user_id=eq.{auth_id}&limit=1')
     return r[0] if isinstance(r, list) and r else None
 
 
@@ -2155,36 +2185,66 @@ def plano_ilimitado():
     return r[0]["id"] if isinstance(r, list) and r else None
 
 
+def erro(cod, r):
+    msg = (r.get("msg") or r.get("message") or r.get("error_description") or r.get("error")) if isinstance(r, dict) else r
+    return f"{msg or 'sem resposta'} (HTTP {cod})"
+
+
 if email:
-    u = usuario()
-    senha_usada = False
-    if not u and senha:
-        senha_usada = True
+    plano = plano_ilimitado()
+    situacao, falhou = None, None
+    a, falhou = auth_usuario()
+    if a:
+        situacao = "existente"
+    elif not falhou:
         meta = {"nome": nome_admin}
-        plano = plano_ilimitado()
         if plano:
             meta["planoId"] = str(plano)
         cod, r = chamar("POST", "/auth/v1/admin/users",
                         {"email": email, "password": senha, "email_confirm": True, "user_metadata": meta})
-        if cod >= 300 or cod == 0:
-            msg = (r.get("msg") or r.get("message") or r.get("error_description")) if isinstance(r, dict) else r
-            print("ERRO_ADMIN", msg)
+        if 0 < cod < 300 and isinstance(r, dict) and r.get("id"):
+            a, situacao = r, "novo"
+        else:
+            ## Já existia no Auth (a busca não achou): confirma antes de dizer que é a mesma senha
+            a, _ = auth_usuario()
+            if a:
+                situacao = "existente"
+            else:
+                falhou = "o Supabase recusou criar o usuário: " + erro(cod, r)
+
+    u = None
+    if a:
+        ## O trigger do banco cria (ou religa) a conta e o usuário do sistema
         for _ in range(10):
-            u = usuario()
+            u = usuario(a["id"])
             if u:
                 break
             time.sleep(1)
+        if not u:
+            ## Linha antiga com o mesmo e-mail (usuário apagado do Auth): religa ao login atual
+            _, r = chamar("PATCH", f'/rest/v1/SAAS_Usuarios?Email=eq.{q(email)}', {"auth_user_id": a["id"]})
+            u = r[0] if isinstance(r, list) and r else None
+        if not u:
+            ## Sem trigger: cria a conta e o usuário na mão
+            _, c = chamar("POST", "/rest/v1/SAAS_Contas", {"status": True, "plano": plano, "email": email})
+            if isinstance(c, list) and c:
+                _, r = chamar("POST", "/rest/v1/SAAS_Usuarios",
+                              {"contaId": c[0]["id"], "nome": nome_admin, "Email": email,
+                               "auth_user_id": a["id"], "funcao": "admin"})
+                u = r[0] if isinstance(r, list) and r else None
+        if not u:
+            falhou = "o login foi criado, mas o usuário não apareceu na tabela SAAS_Usuarios (confira se o SQL foi rodado)"
+
     if u:
         chamar("PATCH", f'/rest/v1/SAAS_Usuarios?id=eq.{u["id"]}', {"super_admin": True, "funcao": "admin"})
         if u.get("contaId"):
             corpo = {"status": True, "dataValidade": None}
-            plano = plano_ilimitado()
             if plano:
                 corpo["plano"] = plano
             chamar("PATCH", f'/rest/v1/SAAS_Contas?id=eq.{u["contaId"]}', corpo)
-        print("OK_ADMIN", "novo" if senha_usada else "existente")
+        print("OK_ADMIN", situacao)
     else:
-        print("ERRO_ADMIN o usuário não apareceu no sistema")
+        print("ERRO_ADMIN", falhou or "motivo desconhecido")
 
 if nome_sistema:
     agora = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -2194,10 +2254,15 @@ if nome_sistema:
 PYEOF
     printf '\r\e[K'
     ADMIN_CRIADO="$(sed -n 's/^OK_ADMIN //p' "$TMP/admin" | head -1)"
-    if [ -n "$ADMIN_CRIADO" ]; then
+    ADMIN_ERRO=""
+    if [ "$ADMIN_CRIADO" = novo ]; then
         ok "Super administrador criado"
+    elif [ "$ADMIN_CRIADO" = existente ]; then
+        ok "Super administrador configurado (o e-mail já tinha login)"
     elif [ -n "${ADMIN_EMAIL:-}" ]; then
-        falha "Não consegui criar o administrador: $(sed -n 's/^ERRO_ADMIN //p' "$TMP/admin" | head -1)"
+        ADMIN_ERRO="$(sed -n 's/^ERRO_ADMIN //p' "$TMP/admin" | head -1)"
+        [ -n "$ADMIN_ERRO" ] || ADMIN_ERRO="$(tail -1 "$TMP/admin")"
+        falha "Não consegui criar o administrador: $ADMIN_ERRO"
         dica "Rode o setup de novo e escolha \"Refazer a configuração\" para tentar outra vez."
     fi
     if grep -q '^OK_NOME' "$TMP/admin"; then
@@ -2219,12 +2284,18 @@ resumo_final() {
     item "Endereço" "https://$APP_HOST${BACK_PATH:-}/login"
     if [ -n "${ADMIN_EMAIL:-}" ]; then
         item "E-mail" "$ADMIN_EMAIL"
-        if [ "${ADMIN_CRIADO:-}" = novo ]; then
-            item "Senha" "$ADMIN_SENHA_PADRAO  (troque depois de entrar)"
-        else
-            item "Senha" "a mesma que você já usa nesse e-mail"
-        fi
-        item "Perfil" "Super administrador"
+        case "${ADMIN_CRIADO:-}" in
+            novo)
+                item "Senha" "$ADMIN_SENHA_PADRAO  (troque depois de entrar)"
+                item "Perfil" "Super administrador" ;;
+            existente)
+                item "Senha" "a mesma que você já usa nesse e-mail"
+                item "Perfil" "Super administrador" ;;
+            *)
+                item "Atenção" "o administrador NÃO foi criado"
+                item "Motivo" "${ADMIN_ERRO:-desconhecido}"
+                item "Solução" "rode o setup de novo e escolha \"Refazer a configuração\"" ;;
+        esac
     fi
     fechar_bloco
     abrir_bloco "WHATSAPP (EVOLUTION API)" "$roxo"
