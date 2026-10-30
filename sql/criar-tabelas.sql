@@ -8269,6 +8269,10 @@
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'SAAS_Mensagens' AND column_name = 'metaStatus') THEN
       ALTER TABLE public."SAAS_Mensagens" ADD COLUMN "metaStatus" TEXT;
     END IF;
+    -- Motivo da recusa da Meta (ex.: "(#132012) ..."), gravado pelo backend quando o envio falha.
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'SAAS_Mensagens' AND column_name = 'metaErro') THEN
+      ALTER TABLE public."SAAS_Mensagens" ADD COLUMN "metaErro" TEXT;
+    END IF;
   END$$;
 
   CREATE UNIQUE INDEX IF NOT EXISTS saas_mensagens_conversa_meta_message_unique
