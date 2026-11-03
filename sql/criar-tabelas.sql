@@ -12959,4 +12959,101 @@ REVOKE ALL ON FUNCTION public.f_meta_resumo_cobrancas(BIGINT, TIMESTAMPTZ, TIMES
 GRANT EXECUTE ON FUNCTION public.f_meta_resumo_cobrancas(BIGINT, TIMESTAMPTZ, TIMESTAMPTZ, BIGINT) TO service_role;
 
 
+-- =============================================================================
+-- REALTIME do chat (lista lateral de conversas) — bloco final
+-- Roda no fim porque algumas tabelas (ex.: SAAS_Contatos_Etiquetas) só são criadas
+-- depois do bloco REALTIME lá de cima; em instalação nova elas ficavam fora da
+-- publicação e a etiqueta não aparecia na hora na lista.
+-- =============================================================================
+
+-- 1) Tabelas que a lista do chat escuta por postgres_changes.
+DO $$
+DECLARE
+  t TEXT;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+    RETURN;
+  END IF;
+  FOREACH t IN ARRAY ARRAY['SAAS_Conversas_Agentes', 'SAAS_Mensagens', 'SAAS_Contatos_Etiquetas'] LOOP
+    IF to_regclass(format('public.%I', t)) IS NULL THEN CONTINUE; END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_publication_tables
+      WHERE pubname = 'supabase_realtime' AND schemaname = 'public' AND tablename = t
+    ) THEN
+      EXECUTE format('ALTER PUBLICATION supabase_realtime ADD TABLE public.%I', t);
+    END IF;
+    EXECUTE format('ALTER TABLE public.%I REPLICA IDENTITY FULL', t);
+  END LOOP;
+END$$;
+
+-- 2) Aviso por Broadcast quando a conversa muda de dono/setor/status ou é apagada.
+-- postgres_changes só entrega o UPDATE a quem ainda pode ver a linha depois da mudança:
+-- quem perdia a conversa (transferida para outro atendente/setor) continuava com ela na
+-- lista até dar F5. O aviso vai para o tópico privado "chat-conta:<contaId>" e leva só
+-- id e contaId; a tela recarrega a lista (que respeita a RLS).
+CREATE OR REPLACE FUNCTION public.f_realtime_conversa_alterada()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_row RECORD;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    v_row := OLD;
+  ELSE
+    v_row := NEW;
+    IF TG_OP = 'UPDATE'
+      AND NEW.atendente IS NOT DISTINCT FROM OLD.atendente
+      AND NEW."setorId" IS NOT DISTINCT FROM OLD."setorId"
+      AND NEW."statusAtendimento" IS NOT DISTINCT FROM OLD."statusAtendimento"
+      AND NEW."contaId" IS NOT DISTINCT FROM OLD."contaId" THEN
+      RETURN NULL;
+    END IF;
+  END IF;
+  IF v_row."contaId" IS NULL THEN RETURN NULL; END IF;
+  BEGIN
+    PERFORM realtime.send(
+      jsonb_build_object('table', TG_TABLE_NAME, 'eventType', TG_OP, 'id', v_row.id, 'contaId', v_row."contaId"),
+      'conversa_alterada',
+      'chat-conta:' || v_row."contaId"::text,
+      true
+    );
+  EXCEPTION WHEN OTHERS THEN
+    -- Realtime fora do ar ou sem realtime.send: nunca travar a gravação da conversa.
+    NULL;
+  END;
+  RETURN NULL;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.f_realtime_conversa_alterada() FROM PUBLIC, anon, authenticated;
+
+DO $$
+BEGIN
+  IF to_regclass('public."SAAS_Conversas_Agentes"') IS NULL THEN RETURN; END IF;
+  DROP TRIGGER IF EXISTS trg_realtime_conversa_alterada ON public."SAAS_Conversas_Agentes";
+  IF to_regprocedure('realtime.send(jsonb,text,text,boolean)') IS NULL THEN RETURN; END IF;
+  CREATE TRIGGER trg_realtime_conversa_alterada
+    AFTER UPDATE OR DELETE ON public."SAAS_Conversas_Agentes"
+    FOR EACH ROW EXECUTE FUNCTION public.f_realtime_conversa_alterada();
+END$$;
+
+-- Quem pode ouvir o tópico privado "chat-conta:<contaId>": usuários dessa conta.
+DO $$
+BEGIN
+  IF to_regclass('realtime.messages') IS NULL OR to_regprocedure('realtime.topic()') IS NULL THEN RETURN; END IF;
+  DROP POLICY IF EXISTS "hublabel_chat_conta_broadcast_select" ON realtime.messages;
+  CREATE POLICY "hublabel_chat_conta_broadcast_select" ON realtime.messages
+    FOR SELECT TO authenticated
+    USING (
+      realtime.messages.extension = 'broadcast'
+      AND (SELECT realtime.topic()) LIKE 'chat-conta:%'
+      AND substr((SELECT realtime.topic()), length('chat-conta:') + 1) IN (
+        SELECT c::text FROM public.rls_conta_ids() c
+      )
+    );
+END$$;
+
+
 NOTIFY pgrst, 'reload schema';
