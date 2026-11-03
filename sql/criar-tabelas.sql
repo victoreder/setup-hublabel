@@ -12366,6 +12366,12 @@ insert into public."SAAS_Personalizacao" (id, nome, cor, "telefoneSuporte")
 values (1, 'Disparamator', '25D366', '5511999998877')
 on conflict (id) do nothing;
 
+-- Botão "Cancelar assinatura" (Configurações → Plano e Uso), configurado no admin
+-- (Integração de pagamento → Configurar link de cancelamento). Sem tipo = botão escondido.
+alter table public."SAAS_Personalizacao" add column if not exists "cancelamentoTipo"     text; -- 'link' | 'whatsapp'
+alter table public."SAAS_Personalizacao" add column if not exists "cancelamentoLink"     text; -- página de cancelamento da plataforma
+alter table public."SAAS_Personalizacao" add column if not exists "cancelamentoTelefone" text; -- só dígitos (wa.me com mensagem pronta)
+
 -- Só o backend (service_role) lê/escreve; o navegador não acessa a tabela.
 alter table public."SAAS_Personalizacao" enable row level security;
 
