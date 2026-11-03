@@ -696,7 +696,7 @@ detectar_versao_antiga() {
         ns="$(ns_de "$nome")"
         [ "$ns" = "$PROJETO" ] && continue
         case "${img,,}" in
-            *hublabel-disparador*) ANTIGO_DISPARADOR+=("$nome") ;;
+            *hublabel-disparador*) roda_sistema_novo service "$nome" || ANTIGO_DISPARADOR+=("$nome") ;;
             *evolution-api*) [ -z "$EVO_SERVICO_EXT" ] && EVO_SERVICO_EXT="$nome" ;;
             *minio*) [ -z "$MINIO_SERVICO_EXT" ] && MINIO_SERVICO_EXT="$nome" ;;
             *n8n*) candidatos_n8n+=("$nome") ;;
@@ -708,7 +708,7 @@ detectar_versao_antiga() {
         2>/dev/null >"$TMP/containers"
     while IFS='|' read -r nome img proj svc; do
         [ -n "$nome" ] && [ -z "$svc" ] && [ "$proj" != "$PROJETO" ] || continue
-        [[ "${img,,}" == *hublabel-disparador* ]] && ANTIGO_CONTAINERS+=("$nome")
+        [[ "${img,,}" == *hublabel-disparador* ]] && ! roda_sistema_novo container "$nome" && ANTIGO_CONTAINERS+=("$nome")
     done <"$TMP/containers"
 
     ## Dados do Disparador antigo (Supabase, endereços e chaves)
@@ -2363,18 +2363,7 @@ menu_instalacao_existente() {
     dica "https://${APP_HOST:-?}"
     echo ""
     sim_nao "Deseja atualizar para a versão mais nova?" S || exit 0
-    banner
-    titulo_caixa "ANTES DE ATUALIZAR: RODE O SQL NOVO"
-    echo ""
-    texto "A versão nova pode trazer ajustes nas tabelas do seu Supabase."
-    dica "Pode rodar sem medo: ele só cria o que falta e atualiza as funções. Seus dados ficam."
-    echo ""
-    instrucao "1." "Copie o ${branco}SQL${reset} deste link:"
-    echo -e "      ${verde}$SQL_URL${reset}"
-    instrucao "2." "Abra o ${branco}SQL Editor${reset} do seu Supabase e cole o SQL"
-    instrucao "3." "Clique em ${branco}Run${reset} e espere aparecer ${branco}Success${reset}"
-    echo ""
-    enter "Aperte Enter depois de rodar o SQL para continuar..."
+    tela_sql_atualizacao
     banner
     titulo_caixa "ATUALIZANDO SEU SISTEMA" "$roxo"
     echo ""
@@ -2387,12 +2376,167 @@ menu_instalacao_existente() {
     exit 0
 }
 
+## Pede para rodar o SQL novo no Supabase antes de atualizar
+tela_sql_atualizacao() {
+    banner
+    titulo_caixa "ANTES DE ATUALIZAR: RODE O SQL NOVO"
+    echo ""
+    texto "A versão nova pode trazer ajustes nas tabelas do seu Supabase."
+    dica "Pode rodar sem medo: ele só cria o que falta e atualiza as funções. Seus dados ficam."
+    echo ""
+    instrucao "1." "Copie o ${branco}SQL${reset} deste link:"
+    echo -e "      ${verde}$SQL_URL${reset}"
+    instrucao "2." "Abra o ${branco}SQL Editor${reset} do seu Supabase e cole o SQL"
+    instrucao "3." "Clique em ${branco}Run${reset} e espere aparecer ${branco}Success${reset}"
+    echo ""
+    enter "Aperte Enter depois de rodar o SQL para continuar..."
+}
+
+## ---------------------------------------------------------------- Sistema sem /opt/hublabel/.env
+## O sistema novo pode estar rodando sem a configuração do setup: stack criada pelo Portainer,
+## instalação feita à mão ou pasta /opt/hublabel apagada. Sem isso o setup achava que a VPS
+## estava vazia e oferecia instalar de novo (e o deploy por cima derrubaria a stack que existe).
+APP_EXISTENTE=""; APP_EXISTENTE_TIPO=""
+
+## O serviço/container roda o sistema novo (tudo em um: node src/all.js)?
+roda_sistema_novo() { # roda_sistema_novo service|container NOME
+    local f
+    if [ "$1" = service ]; then
+        f='{{json .Spec.TaskTemplate.ContainerSpec.Command}} {{json .Spec.TaskTemplate.ContainerSpec.Args}}'
+    else
+        f='{{json .Config.Entrypoint}} {{json .Config.Cmd}}'
+    fi
+    docker "$1" inspect -f "$f" "$2" 2>/dev/null </dev/null | grep -q 'all\.js'
+}
+
+## Procura o sistema novo rodando no Docker. Retorna 0 se encontrou.
+encontrar_sistema_existente() {
+    APP_EXISTENTE=""; APP_EXISTENTE_TIPO=""
+    command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || return 1
+    local nome img proj svc
+    ## Serviço do Swarm: na stack "hublabel" (a versão antiga nunca usou esse nome) ou rodando o all.js
+    while read -r nome img; do
+        [[ "${img,,}" == *hublabel-disparador* ]] || continue
+        if [ "$(ns_de "$nome")" = "$PROJETO" ] || roda_sistema_novo service "$nome"; then
+            APP_EXISTENTE="$nome"; APP_EXISTENTE_TIPO=service
+            return 0
+        fi
+    done < <(docker service ls --format '{{.Name}} {{.Image}}' 2>/dev/null </dev/null)
+    ## Container comum (docker compose / docker run)
+    while IFS='|' read -r nome img proj svc; do
+        [ -n "$nome" ] && [ -z "$svc" ] || continue
+        [[ "${img,,}" == *hublabel-disparador* ]] || continue
+        if [ "$proj" = "$PROJETO" ] || roda_sistema_novo container "$nome"; then
+            APP_EXISTENTE="$nome"; APP_EXISTENTE_TIPO=container
+            return 0
+        fi
+    done < <(docker ps -a --format '{{.Names}}|{{.Image}}|{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.swarm.service.name"}}' 2>/dev/null </dev/null)
+    return 1
+}
+
+## Container do sistema encontrado (o mais novo, no caso de serviço do Swarm)
+container_existente() {
+    if [ "$APP_EXISTENTE_TIPO" = service ]; then
+        docker ps -q -f "label=com.docker.swarm.service.name=$APP_EXISTENTE" | head -1
+    else
+        docker ps -q -f "name=^/${APP_EXISTENTE}\$" | head -1
+    fi
+}
+
+sistema_existente_respondendo() {
+    local cid estado
+    cid="$(container_existente)"
+    [ -n "$cid" ] || return 1
+    estado="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null)"
+    [ "$estado" = healthy ] || docker exec "$cid" wget -qO- http://127.0.0.1:3090/health
+}
+
+## Atualiza só a imagem do sistema, no lugar: não mexe na stack, nas outras partes nem nos dados
+atualizar_imagem_existente() {
+    docker pull -q "$IMG_APP" || return 1
+    if [ "$APP_EXISTENTE_TIPO" = service ]; then
+        ## Todos os serviços do sistema na mesma stack (se houver mais de um)
+        local ns nome img alvos=()
+        ns="$(ns_de "$APP_EXISTENTE")"
+        if [ -n "$ns" ]; then
+            while read -r nome img; do
+                [[ "${img,,}" == *hublabel-disparador* ]] && alvos+=("$nome")
+            done < <(docker service ls --filter "label=com.docker.stack.namespace=$ns" --format '{{.Name}} {{.Image}}' </dev/null)
+        fi
+        [ ${#alvos[@]} -gt 0 ] || alvos=("$APP_EXISTENTE")
+        for nome in "${alvos[@]}"; do
+            timeout 600 docker service update --force --with-registry-auth --image "$IMG_APP" "$nome" </dev/null || return 1
+        done
+        return 0
+    fi
+    local proj arquivos pasta servico lista
+    proj="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$APP_EXISTENTE" 2>/dev/null)"
+    arquivos="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$APP_EXISTENTE" 2>/dev/null)"
+    pasta="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$APP_EXISTENTE" 2>/dev/null)"
+    servico="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$APP_EXISTENTE" 2>/dev/null)"
+    [ -n "$proj" ] && [ -n "$arquivos" ] && [ -n "$servico" ] || return 2
+    local args=() f
+    IFS=',' read -ra lista <<<"$arquivos"
+    for f in "${lista[@]}"; do
+        [ -f "$f" ] || return 2
+        args+=(-f "$f")
+    done
+    (cd "${pasta:-/}" && docker compose -p "$proj" "${args[@]}" up -d --no-deps --force-recreate "$servico")
+}
+
+menu_sistema_sem_config() {
+    local v
+    v="$(env_de "$APP_EXISTENTE_TIPO" "$APP_EXISTENTE" BACK_URL)"
+    APP_HOST="$(host_de_url "$v")"
+    banner
+    titulo_caixa "VOCÊ JÁ TEM O SISTEMA INSTALADO NESTA VPS"
+    [ -n "$APP_HOST" ] && dica "https://$APP_HOST"
+    echo ""
+    abrir_bloco "ENCONTREI NESTA VPS" "$azul"
+    item "Sistema" "$APP_EXISTENTE"
+    v="$(ns_de "$APP_EXISTENTE")"
+    [ "$APP_EXISTENTE_TIPO" = service ] && [ -n "$v" ] && item "Stack" "$v"
+    fechar_bloco
+    dica "Ele não foi instalado por este setup (ou a pasta $DIR foi apagada)."
+    dica "A atualização troca só a imagem do sistema: a stack, o WhatsApp e os dados ficam como estão."
+    echo ""
+    sim_nao "Deseja atualizar para a versão mais nova?" S || exit 0
+    tela_sql_atualizacao
+    banner
+    titulo_caixa "ATUALIZANDO SEU SISTEMA" "$roxo"
+    echo ""
+    girar "Baixando e trocando a versão do sistema (pode levar alguns minutos)" atualizar_imagem_existente
+    case $? in
+        0) ;;
+        2) erro "Não consegui atualizar este container automaticamente. Atualize pelo painel onde ele foi criado." ;;
+        *) tail -5 "$TMP/ultimo.log"; erro "Falha ao atualizar o sistema ($APP_EXISTENTE)." ;;
+    esac
+    if ! esperar "Ligando o sistema (até 5 minutos)" 300 sistema_existente_respondendo; then
+        echo ""
+        falha "O sistema não respondeu. Últimas linhas do log:"
+        if [ "$APP_EXISTENTE_TIPO" = service ]; then
+            docker service logs --tail 30 "$APP_EXISTENTE" 2>&1 | tail -30
+        else
+            docker logs --tail 30 "$APP_EXISTENTE" 2>&1 | tail -30
+        fi
+        exit 1
+    fi
+    if [ "$APP_EXISTENTE_TIPO" = service ] && [ -n "$v" ]; then
+        echo ""
+        aviso "Se a stack \"$v\" for editada no Portainer, marque \"Re-pull image\" ao salvar."
+    fi
+    echo ""
+    ok "${negrito}Atualização concluída!${reset}"
+    exit 0
+}
+
 main() {
     verificacoes_iniciais
 
     if [ -f "$ENV_FILE" ]; then
         menu_instalacao_existente
     fi
+    encontrar_sistema_existente && menu_sistema_sem_config
 
     banner
     titulo_caixa "BEM-VINDO! VAMOS INSTALAR O SEU SISTEMA"
