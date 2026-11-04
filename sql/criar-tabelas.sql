@@ -9250,32 +9250,26 @@
       END;
     END IF;
 
+    -- Templates: só existem no sistema os criados pela tela de templates. Os eventos da
+    -- Meta apenas ATUALIZAM um template já salvo; template criado direto na Meta é
+    -- ignorado (antes era inserido sem estrutura e aparecia "Sincronizar template").
     IF v_field = 'message_template_status_update' THEN
       v_template_nome := v_value->>'message_template_name';
       v_template_idioma := COALESCE(v_value->>'message_template_language', 'pt_BR');
       v_motivo := COALESCE(v_value->>'reason', v_value#>>'{rejection_info,reason}');
 
-      INSERT INTO public."SAAS_Templates_Meta" (
-        "conexaoId", "wabaId", "metaTemplateId", nome, idioma, categoria, status,
-        "motivoRejeicao", "statusUpdatedAt"
-      ) VALUES (
-        v_conexao.id,
-        v_waba_id,
-        COALESCE(v_value->>'message_template_id', NULL),
-        v_template_nome,
-        v_template_idioma,
-        v_value->>'message_template_category',
-        v_value->>'event',
-        NULLIF(v_motivo, 'NONE'),
-        v_now
-      )
-      ON CONFLICT ("conexaoId", nome, idioma) DO UPDATE SET
-        "metaTemplateId" = COALESCE(EXCLUDED."metaTemplateId", public."SAAS_Templates_Meta"."metaTemplateId"),
-        categoria = COALESCE(EXCLUDED.categoria, public."SAAS_Templates_Meta".categoria),
-        status = EXCLUDED.status,
-        "motivoRejeicao" = EXCLUDED."motivoRejeicao",
-        "statusUpdatedAt" = EXCLUDED."statusUpdatedAt",
-        updated_at = v_now;
+      UPDATE public."SAAS_Templates_Meta" t SET
+        "metaTemplateId" = COALESCE(NULLIF(v_value->>'message_template_id', ''), t."metaTemplateId"),
+        categoria = COALESCE(v_value->>'message_template_category', t.categoria),
+        status = v_value->>'event',
+        "motivoRejeicao" = NULLIF(v_motivo, 'NONE'),
+        "statusUpdatedAt" = v_now,
+        updated_at = v_now
+      WHERE t."conexaoId" = v_conexao.id
+        AND (
+          (NULLIF(v_value->>'message_template_id', '') IS NOT NULL AND t."metaTemplateId" = v_value->>'message_template_id')
+          OR (t.nome = v_template_nome AND t.idioma = v_template_idioma)
+        );
 
       RETURN jsonb_build_object('ok', true, 'field', v_field, 'conexaoId', v_conexao.id, 'template', v_template_nome);
     END IF;
@@ -9284,22 +9278,16 @@
       v_template_nome := v_value->>'message_template_name';
       v_template_idioma := COALESCE(v_value->>'message_template_language', 'pt_BR');
 
-      INSERT INTO public."SAAS_Templates_Meta" (
-        "conexaoId", "wabaId", "metaTemplateId", nome, idioma, qualidade, "qualidadeUpdatedAt"
-      ) VALUES (
-        v_conexao.id,
-        v_waba_id,
-        COALESCE(v_value->>'message_template_id', NULL),
-        v_template_nome,
-        v_template_idioma,
-        v_value->>'new_quality_score',
-        v_now
-      )
-      ON CONFLICT ("conexaoId", nome, idioma) DO UPDATE SET
-        "metaTemplateId" = COALESCE(EXCLUDED."metaTemplateId", public."SAAS_Templates_Meta"."metaTemplateId"),
-        qualidade = EXCLUDED.qualidade,
-        "qualidadeUpdatedAt" = EXCLUDED."qualidadeUpdatedAt",
-        updated_at = v_now;
+      UPDATE public."SAAS_Templates_Meta" t SET
+        "metaTemplateId" = COALESCE(NULLIF(v_value->>'message_template_id', ''), t."metaTemplateId"),
+        qualidade = v_value->>'new_quality_score',
+        "qualidadeUpdatedAt" = v_now,
+        updated_at = v_now
+      WHERE t."conexaoId" = v_conexao.id
+        AND (
+          (NULLIF(v_value->>'message_template_id', '') IS NOT NULL AND t."metaTemplateId" = v_value->>'message_template_id')
+          OR (t.nome = v_template_nome AND t.idioma = v_template_idioma)
+        );
 
       RETURN jsonb_build_object('ok', true, 'field', v_field, 'conexaoId', v_conexao.id, 'template', v_template_nome);
     END IF;
@@ -9308,21 +9296,15 @@
       v_template_nome := v_value->>'message_template_name';
       v_template_idioma := COALESCE(v_value->>'message_template_language', 'pt_BR');
 
-      INSERT INTO public."SAAS_Templates_Meta" (
-        "conexaoId", "wabaId", "metaTemplateId", nome, idioma, categoria, "categoriaUpdatedAt"
-      ) VALUES (
-        v_conexao.id,
-        v_waba_id,
-        COALESCE(v_value->>'message_template_id', NULL),
-        v_template_nome,
-        v_template_idioma,
-        COALESCE(v_value->>'new_category', v_value->>'message_template_category'),
-        v_now
-      )
-      ON CONFLICT ("conexaoId", nome, idioma) DO UPDATE SET
-        categoria = EXCLUDED.categoria,
-        "categoriaUpdatedAt" = EXCLUDED."categoriaUpdatedAt",
-        updated_at = v_now;
+      UPDATE public."SAAS_Templates_Meta" t SET
+        categoria = COALESCE(v_value->>'new_category', v_value->>'message_template_category', t.categoria),
+        "categoriaUpdatedAt" = v_now,
+        updated_at = v_now
+      WHERE t."conexaoId" = v_conexao.id
+        AND (
+          (NULLIF(v_value->>'message_template_id', '') IS NOT NULL AND t."metaTemplateId" = v_value->>'message_template_id')
+          OR (t.nome = v_template_nome AND t.idioma = v_template_idioma)
+        );
 
       RETURN jsonb_build_object('ok', true, 'field', v_field, 'conexaoId', v_conexao.id, 'template', v_template_nome);
     END IF;
@@ -9659,6 +9641,13 @@
       ) THEN
         ALTER TABLE public."SAAS_Templates_Meta" ADD COLUMN "variaveisCampos" JSONB NOT NULL DEFAULT '{}'::jsonb;
       END IF;
+
+      -- Remove os templates "fantasma": criados pelo webhook da Meta para templates feitos
+      -- direto na Meta, só com nome/status e sem estrutura. Todo template criado pelo
+      -- sistema grava `componentes`, então só sobram os que vieram de fora.
+      DELETE FROM public."SAAS_Templates_Meta"
+      WHERE (componentes IS NULL OR componentes = 'null'::jsonb)
+        AND COALESCE("variaveisCampos", '{}'::jsonb) = '{}'::jsonb;
     END IF;
 
     -- Métrica de leitura (webhook Meta status=read → eventsmeta)
