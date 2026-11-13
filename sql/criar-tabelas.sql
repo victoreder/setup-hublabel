@@ -12484,6 +12484,7 @@ $$;
 -- =============================================================================
 -- get_chat_lista: a página de conversas de uma aba + tudo que a lista mostra
 -- (contagens das 4 abas, última mensagem, etiquetas, CRM e foto do contato).
+-- Com p_somente_nao_lidas as contagens também contam só as não lidas.
 -- Antes a tela fazia ~10 consultas por carga (lista, 4 contagens, última
 -- mensagem, etiquetas x2, CRM x3, fotos). Mesmas regras das consultas da tela:
 --   aberto     = statusAtendimento ILIKE 'aberto'
@@ -12541,6 +12542,8 @@ BEGIN
       AND (p_conexao_ids IS NULL OR cardinality(p_conexao_ids) = 0 OR c."idConexao" = ANY(p_conexao_ids))
       AND (p_setor_ids IS NULL OR cardinality(p_setor_ids) = 0 OR c."setorId" = ANY(p_setor_ids))
       AND (p_contato_ids IS NULL OR cardinality(p_contato_ids) = 0 OR c."contatoId" = ANY(p_contato_ids))
+      -- "Somente não lidas" vale para a lista e para as contagens das abas.
+      AND (NOT COALESCE(p_somente_nao_lidas, false) OR c.lida = false)
       AND (
         v_like IS NULL
         OR c.telefone ILIKE v_like
@@ -12575,7 +12578,6 @@ BEGIN
           ELSE b."statusAtendimento" ILIKE v_status
         END
       )
-      AND (NOT COALESCE(p_somente_nao_lidas, false) OR b.lida = false)
     ORDER BY b."ultimaMensagem" DESC NULLS LAST, b.id DESC
     LIMIT v_limit + 1
     OFFSET v_offset
